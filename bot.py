@@ -283,49 +283,37 @@ async def translate_text(text: str, retries: int = 3) -> str:
 
 # ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ИСПРАВЛЕНО) =====
 async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
-    """Создаёт анонимную статью на Telegraph и возвращает URL."""
-    # Преобразуем HTML в формат Telegraph (массив нод)
+    """Создаёт анонимную статью на Telegraph, корректно разбивая на абзацы."""
+    # Разбираем HTML и создаём массив узлов для Telegraph
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
 
-    for elem in soup.contents:
-        if elem.name == 'p':
-            children = []
-            for child in elem.children:
-                if child.name is None:  # текст
-                    children.append(child.string)
-                elif child.name == 'br':
-                    children.append({"tag": "br"})
-            nodes.append({"tag": "p", "children": children})
-        elif elem.name is None and elem.string and elem.string.strip():
-            nodes.append({"tag": "p", "children": [elem.string.strip()]})
+    # Ищем все теги <p> в нашем HTML
+    for p in soup.find_all('p'):
+        # Извлекаем текст параграфа
+        text = p.get_text().strip()
+        if text:  # пропускаем пустые
+            nodes.append({"tag": "p", "children": [text]})
 
+    # Если не нашли параграфы, создаём один узел со всем содержимым
     if not nodes:
         nodes = [{"tag": "p", "children": [content_html]}]
 
     async with aiohttp.ClientSession() as session:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        # Поле access_token не указываем – для анонимных страниц
         async with session.post(
             "https://api.telegra.ph/createPage",
             json={
                 "title": title,
                 "author_name": author,
                 "content": nodes
-            },
-            headers=headers
+                # Без access_token — для анонимных страниц
+            }
         ) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error(f"Telegraph HTTP {resp.status}: {text}")
-                raise Exception(f"Telegraph HTTP error {resp.status}")
             data = await resp.json()
             if data["ok"]:
                 return data["result"]["url"]
             else:
-                logger.error(f"Telegraph API error: {data}")
+                logger.error(f"Telegraph error: {data}")
                 raise Exception(f"Telegraph error: {data.get('error')}")
 
 
