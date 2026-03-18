@@ -2,4 +2,3 @@ aiogram
 beautifulsoup4
 playwright
 aiohttp
-telegraph
