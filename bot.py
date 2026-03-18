@@ -125,59 +125,32 @@ async def fetch_html(url: str) -> str:
 
 # ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ (ИСПРАВЛЕНО) =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы со страницы с улучшенным ожиданием."""
-    async with async_playwright() as p:
-        # Запускаем браузер с более реалистичным User-Agent
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        )
-        page = await context.new_page()
+    """Загружает текст главы с несколькими попытками и ожиданием только DOM."""
+    for attempt in range(3):
         try:
-            # Увеличиваем таймаут до 120 секунд
-            await page.goto(url, timeout=120000)
-
-            # Список возможных селекторов контента главы (ранобес часто использует chapter-content)
-            content_selectors = [
-                'div.chapter-content',
-                'div.entry-content',
-                'article',
-                'div.text',
-                'div.content',
-                'div.chapter-text',
-                'div#chapter-content',
-                'div.chapter'
-            ]
-
-            content = None
-            for selector in content_selectors:
-                try:
-                    # Ждём появления элемента, но не больше 10 секунд на селектор
-                    await page.wait_for_selector(selector, timeout=10000)
-                    content = await page.text_content(selector)
-                    if content and len(content.strip()) > 200:  # проверяем, что есть содержательный текст
-                        logger.info(f"Контент найден по селектору: {selector}")
-                        break
-                except:
-                    continue
-
-            # Если ничего не нашли, берём весь body
-            if not content:
-                content = await page.text_content('body')
-                logger.warning("Контент не найден по известным селекторам, взят body")
-
-            return content.strip() if content else "[Текст не найден]"
-
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                )
+                page = await context.new_page()
+                # Ждём только загрузки DOM, не всех ресурсов
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # Ждём появления контента
+                await page.wait_for_selector('div.chapter-content, div.entry-content, article', timeout=30000)
+                content = await page.text_content('div.chapter-content') or \
+                          await page.text_content('div.entry-content') or \
+                          await page.text_content('article') or \
+                          await page.text_content('body')
+                await browser.close()
+                if content and len(content.strip()) > 200:
+                    return content.strip()
+                else:
+                    logger.warning(f"Попытка {attempt+1}: контент слишком короткий или пустой")
         except Exception as e:
-            logger.error(f"Ошибка загрузки главы {url}: {e}")
-            # Пробуем получить хотя бы частичный контент
-            try:
-                content = await page.content()
-                return f"[Ошибка загрузки, но получен частичный HTML: {content[:500]}...]"
-            except:
-                return f"[Ошибка загрузки: {e}]"
-        finally:
-            await browser.close()
+            logger.warning(f"Попытка {attempt+1} загрузки {url} не удалась: {e}")
+        await asyncio.sleep(5)  # пауза перед следующей попыткой
+    return "[Ошибка загрузки главы после нескольких попыток]"
 
 
 # ===== ПАРСИНГ СПИСКА ГЛАВ =====
@@ -324,20 +297,28 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
         nodes = [{"tag": "p", "children": [content_html]}]
 
     async with aiohttp.ClientSession() as session:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         async with session.post(
             "https://api.telegra.ph/createPage",
             json={
                 "title": title,
                 "author_name": author,
-                "content": nodes
-                # access_token не указываем
-            }
+                "content": nodes,
+                "access_token": ""  # явно указываем пустой токен для анонимного доступа
+            },
+            headers=headers
         ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.error(f"Telegraph HTTP {resp.status}: {text}")
+                raise Exception(f"Telegraph HTTP error {resp.status}")
             data = await resp.json()
             if data["ok"]:
                 return data["result"]["url"]
             else:
-                logger.error(f"Telegraph error: {data}")
+                logger.error(f"Telegraph API error: {data}")
                 raise Exception(f"Telegraph error: {data.get('error')}")
 
 
@@ -488,7 +469,7 @@ async def cmd_translate_last(message: types.Message):
         return
     try:
         n = int(parts[1])
-        if n <= 0 or n > 10:  # ограничение, чтобы не перегружать
+        if n <= 0 or n > 10:
             await message.answer("Количество от 1 до 10.")
             return
     except ValueError:
