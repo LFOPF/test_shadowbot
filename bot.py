@@ -280,10 +280,12 @@ async def translate_text(text: str, retries: int = 3) -> str:
 
 # ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ИСПРАВЛЕНО через библиотеку) =====
 async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
-    """Создаёт анонимную страницу на Telegra.ph, используя библиотеку telegraph."""
+    """Создаёт анонимную страницу на Telegra.ph, используя новый экземпляр Telegraph."""
     loop = asyncio.get_event_loop()
     def _create():
-        response = telegraph.create_page(
+        # Создаём новый анонимный экземпляр для каждого запроса
+        local_telegraph = Telegraph(access_token=None)
+        response = local_telegraph.create_page(
             title,
             html_content=content_html,
             author_name=author
