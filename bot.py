@@ -9,7 +9,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-from telegraph import Telegraph
 
 # ===== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -23,7 +22,7 @@ TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
 LAST_CHAPTER_FILE = "last_chapter.txt"
 SUBSCRIBERS_FILE = "subscribers.json"
-SITE_URL = "https://t.me/YourBot"  # замените на что-то своё
+SITE_URL = "https://t.me/YourBot"
 SITE_NAME = "ShadowSlaveTranslator"
 # =============================================
 
@@ -33,19 +32,14 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Инициализация Telegraph (анонимная)
-telegraph = Telegraph()
-
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 def clean_title(raw_title: str) -> str:
-    """Удаляет временную метку из названия главы."""
     cleaned = re.sub(r'\d+\s*(?:minutes?|hours?|days?)\s*ago$', '', raw_title, flags=re.IGNORECASE)
     return cleaned.strip()
 
 
 def format_chapter_count(n: int) -> str:
-    """Правильное склонение слова 'глава'."""
     if n % 10 == 1 and n % 100 != 11:
         return f"{n} главу"
     elif 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20):
@@ -54,15 +48,19 @@ def format_chapter_count(n: int) -> str:
         return f"{n} глав"
 
 
-def text_to_html(text: str) -> str:
-    """Преобразует обычный текст в HTML с абзацами."""
-    paragraphs = text.split('\n\n')
-    html_paragraphs = []
-    for p in paragraphs:
-        p = p.replace('\n', '<br>')
-        if p.strip():
-            html_paragraphs.append(f"<p>{p}</p>")
-    return ''.join(html_paragraphs)
+def split_text(text: str, max_len: int = 4096) -> list[str]:
+    """Разбивает текст на части по max_len символов, стараясь не резать слова."""
+    parts = []
+    while len(text) > max_len:
+        # Ищем последний пробел в пределах max_len
+        split_pos = text.rfind(' ', 0, max_len)
+        if split_pos == -1:
+            split_pos = max_len
+        parts.append(text[:split_pos].strip())
+        text = text[split_pos:].strip()
+    if text:
+        parts.append(text)
+    return parts
 
 
 # ===== РАБОТА С ПОДПИСЧИКАМИ =====
@@ -127,9 +125,9 @@ async def fetch_html(url: str) -> str:
         return html
 
 
-# ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ (ИСПРАВЛЕНО) =====
+# ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы, собирая все абзацы из div#arrticle."""
+    """Загружает текст главы из div.text#arrticle."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -152,7 +150,6 @@ async def fetch_chapter_text(url: str) -> str:
             else:
                 content = await page.text_content('div.text#arrticle')
                 return content.strip() if content else "[Текст не найден]"
-
         except Exception as e:
             logger.warning(f"Ошибка загрузки {url}: {e}")
             return f"[Ошибка загрузки: {e}]"
@@ -222,7 +219,6 @@ async def get_latest_chapters(n: int) -> list[dict]:
 
 # ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER =====
 async def translate_text(text: str, retries: int = 3) -> str:
-    """Переводит текст через OpenRouter (бесплатная модель)."""
     if len(text) > 120000:
         text = text[:120000] + "\n... [текст обрезан для перевода]"
 
@@ -236,7 +232,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
     }
 
     payload = {
-        "model": "stepfun/step-3.5-flash:free",  # бесплатная модель
+        "model": "stepfun/step-3.5-flash:free",
         "messages": [
             {"role": "system", "content": "Ты профессиональный переводчик художественной литературы. Переводи точно и сохраняй стиль."},
             {"role": "user", "content": prompt}
@@ -276,22 +272,6 @@ async def translate_text(text: str, retries: int = 3) -> str:
             logger.exception(f"Исключение при переводе: {e}")
             return f"[Ошибка соединения. Оригинал:\n{text[:500]}...]"
     return "[Неизвестная ошибка перевода]"
-
-
-# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ИСПРАВЛЕНО через библиотеку) =====
-async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
-    """Создаёт анонимную страницу на Telegra.ph, используя новый экземпляр Telegraph."""
-    loop = asyncio.get_event_loop()
-    def _create():
-        # Создаём новый анонимный экземпляр для каждого запроса
-        local_telegraph = Telegraph(access_token=None)
-        response = local_telegraph.create_page(
-            title,
-            html_content=content_html,
-            author_name=author
-        )
-        return response['url']
-    return await loop.run_in_executor(None, _create)
 
 
 # ===== РАССЫЛКА ВСЕМ ПОДПИСЧИКАМ =====
@@ -398,7 +378,7 @@ async def cmd_last(message: types.Message):
 
 @dp.message(Command("tr2"))
 async def cmd_translate_last2(message: types.Message):
-    """Перевести 2 последние главы и отправить ссылки на Telegraph."""
+    """Перевести 2 последние главы и отправить перевод в Telegram."""
     await message.answer("🔄 Загружаю и перевожу 2 последние главы...")
     try:
         chapters = await get_latest_chapters(2)
@@ -414,18 +394,15 @@ async def cmd_translate_last2(message: types.Message):
 
             translated = await translate_text(chapter_text)
 
-            html_content = text_to_html(translated)
-
-            await status.edit_text(f"📄 Создаю статью для главы {idx}...")
-
-            page_url = await create_telegraph_page(ch['title'], html_content)
-
-            await message.answer(
-                f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
-                parse_mode="HTML"
-            )
             await status.delete()
-            await asyncio.sleep(1)
+
+            # Отправляем перевод с заголовком
+            header = f"📖 <b>{ch['title']} (перевод)</b>\n\n"
+            full_message = header + translated
+            parts = split_text(full_message)
+            for part in parts:
+                await message.answer(part, parse_mode="HTML")
+                await asyncio.sleep(0.3)  # небольшая пауза между частями
 
     except Exception as e:
         logger.exception(f"Ошибка /tr2: {e}")
@@ -434,7 +411,7 @@ async def cmd_translate_last2(message: types.Message):
 
 @dp.message(Command("tr"))
 async def cmd_translate_last(message: types.Message):
-    """Перевести N последних глав и отправить ссылки на Telegraph."""
+    """Перевести N последних глав и отправить перевод в Telegram."""
     parts = message.text.split()
     if len(parts) != 2:
         await message.answer("Укажите количество. Пример: /tr 5")
@@ -460,15 +437,14 @@ async def cmd_translate_last(message: types.Message):
             chapter_text = await fetch_chapter_text(ch['link'])
             await status.edit_text(f"🔄 Глава {idx} из {n}: перевод...")
             translated = await translate_text(chapter_text)
-            html_content = text_to_html(translated)
-            await status.edit_text(f"📄 Глава {idx} из {n}: создание статьи...")
-            page_url = await create_telegraph_page(ch['title'], html_content)
-            await message.answer(
-                f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
-                parse_mode="HTML"
-            )
             await status.delete()
-            await asyncio.sleep(1)
+
+            header = f"📖 <b>{ch['title']} (перевод)</b>\n\n"
+            full_message = header + translated
+            parts = split_text(full_message)
+            for part in parts:
+                await message.answer(part, parse_mode="HTML")
+                await asyncio.sleep(0.3)
 
     except Exception as e:
         logger.exception(f"Ошибка /tr: {e}")
