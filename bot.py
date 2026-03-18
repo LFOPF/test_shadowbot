@@ -125,32 +125,34 @@ async def fetch_html(url: str) -> str:
 
 # ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ (ИСПРАВЛЕНО) =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы с несколькими попытками и ожиданием только DOM."""
-    for attempt in range(3):
+    """Загружает текст главы, собирая все значимые абзацы."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = await context.new_page()
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
-                page = await context.new_page()
-                # Ждём только загрузки DOM, не всех ресурсов
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                # Ждём появления контента
-                await page.wait_for_selector('div.chapter-content, div.entry-content, article', timeout=30000)
-                content = await page.text_content('div.chapter-content') or \
-                          await page.text_content('div.entry-content') or \
-                          await page.text_content('article') or \
-                          await page.text_content('body')
-                await browser.close()
-                if content and len(content.strip()) > 200:
-                    return content.strip()
-                else:
-                    logger.warning(f"Попытка {attempt+1}: контент слишком короткий или пустой")
+            # Ждём загрузки DOM
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Ждём появления абзацев
+            await page.wait_for_selector('p', timeout=30000)
+            # Получаем все абзацы длиной более 100 символов (чтобы отсечь меню)
+            paragraphs = await page.evaluate('''() => {
+                const paragraphs = Array.from(document.querySelectorAll('p'));
+                return paragraphs.map(p => p.innerText).filter(text => text.length > 100);
+            }''')
+            if paragraphs:
+                return '\n\n'.join(paragraphs)
+            else:
+                # Если абзацев нет, берём весь текст body
+                content = await page.text_content('body')
+                return content.strip()
         except Exception as e:
-            logger.warning(f"Попытка {attempt+1} загрузки {url} не удалась: {e}")
-        await asyncio.sleep(5)  # пауза перед следующей попыткой
-    return "[Ошибка загрузки главы после нескольких попыток]"
+            logger.warning(f"Ошибка загрузки {url}: {e}")
+            return f"[Ошибка загрузки: {e}]"
+        finally:
+            await browser.close()
 
 
 # ===== ПАРСИНГ СПИСКА ГЛАВ =====
@@ -300,13 +302,13 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
+        # Поле access_token не указываем – для анонимных страниц
         async with session.post(
             "https://api.telegra.ph/createPage",
             json={
                 "title": title,
                 "author_name": author,
-                "content": nodes,
-                "access_token": ""  # явно указываем пустой токен для анонимного доступа
+                "content": nodes
             },
             headers=headers
         ) as resp:
