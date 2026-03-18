@@ -50,33 +50,15 @@ def format_chapter_count(n: int) -> str:
         return f"{n} глав"
 
 
-def split_message(text: str, max_length: int = 4000) -> list[str]:
-    """Разбивает длинный текст на части, стараясь не резать абзацы."""
-    if len(text) <= max_length:
-        return [text]
-    parts = []
-    current = ""
+def text_to_html(text: str) -> str:
+    """Преобразует обычный текст в HTML с абзацами."""
     paragraphs = text.split('\n\n')
+    html_paragraphs = []
     for p in paragraphs:
-        if len(current) + len(p) + 4 <= max_length:
-            if current:
-                current += "\n\n" + p
-            else:
-                current = p
-        else:
-            if current:
-                parts.append(current)
-            # Если один абзац слишком длинный, режем его принудительно
-            if len(p) > max_length:
-                # режем по предложениям? для простоты режем по символам
-                for i in range(0, len(p), max_length):
-                    parts.append(p[i:i+max_length])
-                current = ""
-            else:
-                current = p
-    if current:
-        parts.append(current)
-    return parts
+        p = p.replace('\n', '<br>')
+        if p.strip():
+            html_paragraphs.append(f"<p>{p}</p>")
+    return ''.join(html_paragraphs)
 
 
 # ===== РАБОТА С ПОДПИСЧИКАМИ =====
@@ -292,6 +274,37 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Неизвестная ошибка перевода]"
 
 
+# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ПРЯМОЙ API) =====
+async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
+    """Создаёт анонимную страницу на Telegra.ph через прямой API."""
+    # Разбираем HTML и создаём массив узлов для Telegraph
+    soup = BeautifulSoup(content_html, 'html.parser')
+    nodes = []
+    for p in soup.find_all('p'):
+        text = p.get_text().strip()
+        if text:
+            nodes.append({"tag": "p", "children": [text]})
+    if not nodes:
+        # Если параграфов нет, создаём один узел со всем содержимым
+        nodes = [{"tag": "p", "children": [content_html]}]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.telegra.ph/createPage",
+            json={
+                "title": title,
+                "author_name": author,
+                "content": nodes
+            }
+        ) as resp:
+            data = await resp.json()
+            if data["ok"]:
+                return data["result"]["url"]
+            else:
+                logger.error(f"Telegraph API error: {data}")
+                raise Exception(f"Telegraph error: {data.get('error')}")
+
+
 # ===== РАССЫЛКА ВСЕМ ПОДПИСЧИКАМ =====
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML"):
     subscribers = load_subscribers()
@@ -396,7 +409,7 @@ async def cmd_last(message: types.Message):
 
 @dp.message(Command("tr2"))
 async def cmd_translate_last2(message: types.Message):
-    """Перевести 2 последние главы и отправить красиво."""
+    """Перевести 2 последние главы и отправить ссылки на Telegraph."""
     await message.answer("🔄 Загружаю и перевожу 2 последние главы...")
     try:
         chapters = await get_latest_chapters(2)
@@ -406,30 +419,21 @@ async def cmd_translate_last2(message: types.Message):
 
         for idx, ch in enumerate(chapters, 1):
             status = await message.answer(f"📥 Глава {idx}: загрузка...")
-
             chapter_text = await fetch_chapter_text(ch['link'])
             await status.edit_text(f"🔄 Глава {idx}: перевод...")
-
             translated = await translate_text(chapter_text)
 
-            # Формируем красивый заголовок
-            header = f"📖 <b>{ch['title']}</b>\n🔗 <a href='{ch['link']}'>Оригинал</a>\n\n━━━━━━━━━━━━━━\n\n"
-            full_text = header + translated
+            # Преобразуем в HTML для Telegraph
+            html_content = text_to_html(translated)
 
-            # Разбиваем на части
-            parts = split_message(full_text)
-            total = len(parts)
+            await status.edit_text(f"📄 Глава {idx}: создание статьи...")
+            page_url = await create_telegraph_page(ch['title'], html_content)
 
-            for part_num, part in enumerate(parts, 1):
-                if total > 1:
-                    part_header = f"📖 <b>{ch['title']}</b> (часть {part_num}/{total})\n🔗 <a href='{ch['link']}'>Оригинал</a>\n\n━━━━━━━━━━━━━━\n\n"
-                    if part_num == 1:
-                        part_text = part  # первая часть уже содержит заголовок? надо аккуратно
-                        # можно проще: для первой части используем full_text, для остальных просто текст
-                    # упростим: для первой части отправляем full_text, для остальных только текст с пометкой
-                await message.answer(part, parse_mode="HTML")
-                await asyncio.sleep(0.5)
-
+            # Отправляем ссылку
+            await message.answer(
+                f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
+                parse_mode="HTML"
+            )
             await status.delete()
             await asyncio.sleep(1)
 
@@ -440,7 +444,7 @@ async def cmd_translate_last2(message: types.Message):
 
 @dp.message(Command("tr"))
 async def cmd_translate_last(message: types.Message):
-    """Перевести N последних глав и отправить красиво."""
+    """Перевести N последних глав и отправить ссылки на Telegraph."""
     parts = message.text.split()
     if len(parts) != 2:
         await message.answer("Укажите количество. Пример: /tr 5")
@@ -467,16 +471,15 @@ async def cmd_translate_last(message: types.Message):
             await status.edit_text(f"🔄 Глава {idx} из {n}: перевод...")
             translated = await translate_text(chapter_text)
 
-            # Формируем красивый заголовок
-            header = f"📖 <b>{ch['title']}</b>\n🔗 <a href='{ch['link']}'>Оригинал</a>\n\n━━━━━━━━━━━━━━\n\n"
-            full_text = header + translated
+            html_content = text_to_html(translated)
 
-            # Разбиваем на части
-            message_parts = split_message(full_text)
-            for part in message_parts:
-                await message.answer(part, parse_mode="HTML")
-                await asyncio.sleep(0.5)
+            await status.edit_text(f"📄 Глава {idx} из {n}: создание статьи...")
+            page_url = await create_telegraph_page(ch['title'], html_content)
 
+            await message.answer(
+                f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
+                parse_mode="HTML"
+            )
             await status.delete()
             await asyncio.sleep(1)
 
