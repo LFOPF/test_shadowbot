@@ -22,7 +22,7 @@ TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
 LAST_CHAPTER_FILE = "last_chapter.txt"
 SUBSCRIBERS_FILE = "subscribers.json"
-SITE_URL = "https://t.me/YourBot"
+SITE_URL = "https://t.me/YourBot"  # замените на что-то своё
 SITE_NAME = "ShadowSlaveTranslator"
 # =============================================
 
@@ -35,11 +35,13 @@ dp = Dispatcher()
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 def clean_title(raw_title: str) -> str:
+    """Удаляет временную метку из названия главы."""
     cleaned = re.sub(r'\d+\s*(?:minutes?|hours?|days?)\s*ago$', '', raw_title, flags=re.IGNORECASE)
     return cleaned.strip()
 
 
 def format_chapter_count(n: int) -> str:
+    """Правильное склонение слова 'глава'."""
     if n % 10 == 1 and n % 100 != 11:
         return f"{n} главу"
     elif 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20):
@@ -48,18 +50,32 @@ def format_chapter_count(n: int) -> str:
         return f"{n} глав"
 
 
-def split_text(text: str, max_len: int = 4096) -> list[str]:
-    """Разбивает текст на части по max_len символов, стараясь не резать слова."""
+def split_message(text: str, max_length: int = 4000) -> list[str]:
+    """Разбивает длинный текст на части, стараясь не резать абзацы."""
+    if len(text) <= max_length:
+        return [text]
     parts = []
-    while len(text) > max_len:
-        # Ищем последний пробел в пределах max_len
-        split_pos = text.rfind(' ', 0, max_len)
-        if split_pos == -1:
-            split_pos = max_len
-        parts.append(text[:split_pos].strip())
-        text = text[split_pos:].strip()
-    if text:
-        parts.append(text)
+    current = ""
+    paragraphs = text.split('\n\n')
+    for p in paragraphs:
+        if len(current) + len(p) + 4 <= max_length:
+            if current:
+                current += "\n\n" + p
+            else:
+                current = p
+        else:
+            if current:
+                parts.append(current)
+            # Если один абзац слишком длинный, режем его принудительно
+            if len(p) > max_length:
+                # режем по предложениям? для простоты режем по символам
+                for i in range(0, len(p), max_length):
+                    parts.append(p[i:i+max_length])
+                current = ""
+            else:
+                current = p
+    if current:
+        parts.append(current)
     return parts
 
 
@@ -127,7 +143,7 @@ async def fetch_html(url: str) -> str:
 
 # ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы из div.text#arrticle."""
+    """Загружает текст главы, собирая все абзацы из div#arrticle."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -150,6 +166,7 @@ async def fetch_chapter_text(url: str) -> str:
             else:
                 content = await page.text_content('div.text#arrticle')
                 return content.strip() if content else "[Текст не найден]"
+
         except Exception as e:
             logger.warning(f"Ошибка загрузки {url}: {e}")
             return f"[Ошибка загрузки: {e}]"
@@ -219,6 +236,7 @@ async def get_latest_chapters(n: int) -> list[dict]:
 
 # ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER =====
 async def translate_text(text: str, retries: int = 3) -> str:
+    """Переводит текст через OpenRouter (бесплатная модель)."""
     if len(text) > 120000:
         text = text[:120000] + "\n... [текст обрезан для перевода]"
 
@@ -232,7 +250,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
     }
 
     payload = {
-        "model": "stepfun/step-3.5-flash:free",
+        "model": "stepfun/step-3.5-flash:free",  # бесплатная модель
         "messages": [
             {"role": "system", "content": "Ты профессиональный переводчик художественной литературы. Переводи точно и сохраняй стиль."},
             {"role": "user", "content": prompt}
@@ -378,7 +396,7 @@ async def cmd_last(message: types.Message):
 
 @dp.message(Command("tr2"))
 async def cmd_translate_last2(message: types.Message):
-    """Перевести 2 последние главы и отправить перевод в Telegram."""
+    """Перевести 2 последние главы и отправить красиво."""
     await message.answer("🔄 Загружаю и перевожу 2 последние главы...")
     try:
         chapters = await get_latest_chapters(2)
@@ -387,22 +405,33 @@ async def cmd_translate_last2(message: types.Message):
             return
 
         for idx, ch in enumerate(chapters, 1):
-            status = await message.answer(f"📥 Загружаю главу {idx}...")
+            status = await message.answer(f"📥 Глава {idx}: загрузка...")
 
             chapter_text = await fetch_chapter_text(ch['link'])
-            await status.edit_text(f"🔄 Перевожу главу {idx}...")
+            await status.edit_text(f"🔄 Глава {idx}: перевод...")
 
             translated = await translate_text(chapter_text)
 
-            await status.delete()
+            # Формируем красивый заголовок
+            header = f"📖 <b>{ch['title']}</b>\n🔗 <a href='{ch['link']}'>Оригинал</a>\n\n━━━━━━━━━━━━━━\n\n"
+            full_text = header + translated
 
-            # Отправляем перевод с заголовком
-            header = f"📖 <b>{ch['title']} (перевод)</b>\n\n"
-            full_message = header + translated
-            parts = split_text(full_message)
-            for part in parts:
+            # Разбиваем на части
+            parts = split_message(full_text)
+            total = len(parts)
+
+            for part_num, part in enumerate(parts, 1):
+                if total > 1:
+                    part_header = f"📖 <b>{ch['title']}</b> (часть {part_num}/{total})\n🔗 <a href='{ch['link']}'>Оригинал</a>\n\n━━━━━━━━━━━━━━\n\n"
+                    if part_num == 1:
+                        part_text = part  # первая часть уже содержит заголовок? надо аккуратно
+                        # можно проще: для первой части используем full_text, для остальных просто текст
+                    # упростим: для первой части отправляем full_text, для остальных только текст с пометкой
                 await message.answer(part, parse_mode="HTML")
-                await asyncio.sleep(0.3)  # небольшая пауза между частями
+                await asyncio.sleep(0.5)
+
+            await status.delete()
+            await asyncio.sleep(1)
 
     except Exception as e:
         logger.exception(f"Ошибка /tr2: {e}")
@@ -411,7 +440,7 @@ async def cmd_translate_last2(message: types.Message):
 
 @dp.message(Command("tr"))
 async def cmd_translate_last(message: types.Message):
-    """Перевести N последних глав и отправить перевод в Telegram."""
+    """Перевести N последних глав и отправить красиво."""
     parts = message.text.split()
     if len(parts) != 2:
         await message.answer("Укажите количество. Пример: /tr 5")
@@ -437,14 +466,19 @@ async def cmd_translate_last(message: types.Message):
             chapter_text = await fetch_chapter_text(ch['link'])
             await status.edit_text(f"🔄 Глава {idx} из {n}: перевод...")
             translated = await translate_text(chapter_text)
-            await status.delete()
 
-            header = f"📖 <b>{ch['title']} (перевод)</b>\n\n"
-            full_message = header + translated
-            parts = split_text(full_message)
-            for part in parts:
+            # Формируем красивый заголовок
+            header = f"📖 <b>{ch['title']}</b>\n🔗 <a href='{ch['link']}'>Оригинал</a>\n\n━━━━━━━━━━━━━━\n\n"
+            full_text = header + translated
+
+            # Разбиваем на части
+            message_parts = split_message(full_text)
+            for part in message_parts:
                 await message.answer(part, parse_mode="HTML")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
+
+            await status.delete()
+            await asyncio.sleep(1)
 
     except Exception as e:
         logger.exception(f"Ошибка /tr: {e}")
