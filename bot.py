@@ -276,33 +276,31 @@ async def translate_text(text: str, retries: int = 3) -> str:
 
 # ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ПРЯМОЙ API) =====
 async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
-    """Создаёт анонимную страницу на Telegra.ph через прямой API."""
-    # Разбираем HTML и создаём массив узлов для Telegraph
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
+
     for p in soup.find_all('p'):
         text = p.get_text().strip()
         if text:
             nodes.append({"tag": "p", "children": [text]})
+
     if not nodes:
-        # Если параграфов нет, создаём один узел со всем содержимым
         nodes = [{"tag": "p", "children": [content_html]}]
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://api.telegra.ph/createPage",
-            json={
+            data={
                 "title": title,
                 "author_name": author,
-                "content": nodes
+                "content": json.dumps(nodes)
             }
         ) as resp:
             data = await resp.json()
             if data["ok"]:
                 return data["result"]["url"]
             else:
-                logger.error(f"Telegraph API error: {data}")
-                raise Exception(f"Telegraph error: {data.get('error')}")
+                raise Exception(f"Telegraph error: {data}")
 
 
 # ===== РАССЫЛКА ВСЕМ ПОДПИСЧИКАМ =====
