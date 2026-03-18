@@ -123,34 +123,64 @@ async def fetch_html(url: str) -> str:
         return html
 
 
-# ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ =====
+# ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ (ИСПРАВЛЕНО) =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы со страницы."""
+    """Загружает текст главы со страницы с улучшенным ожиданием."""
     async with async_playwright() as p:
+        # Запускаем браузер с более реалистичным User-Agent
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = await context.new_page()
         try:
-            await page.goto(url, timeout=90000)  # увеличенный таймаут
-            # Пробуем разные селекторы для контента
+            # Увеличиваем таймаут до 120 секунд
+            await page.goto(url, timeout=120000)
+
+            # Список возможных селекторов контента главы (ранобес часто использует chapter-content)
+            content_selectors = [
+                'div.chapter-content',
+                'div.entry-content',
+                'article',
+                'div.text',
+                'div.content',
+                'div.chapter-text',
+                'div#chapter-content',
+                'div.chapter'
+            ]
+
             content = None
-            for selector in ['div.chapter-content', 'div.entry-content', 'article', 'div.text', 'div.content']:
-                if await page.locator(selector).count() > 0:
+            for selector in content_selectors:
+                try:
+                    # Ждём появления элемента, но не больше 10 секунд на селектор
+                    await page.wait_for_selector(selector, timeout=10000)
                     content = await page.text_content(selector)
-                    logger.info(f"Найден контент по селектору: {selector}")
-                    break
+                    if content and len(content.strip()) > 200:  # проверяем, что есть содержательный текст
+                        logger.info(f"Контент найден по селектору: {selector}")
+                        break
+                except:
+                    continue
+
+            # Если ничего не нашли, берём весь body
             if not content:
-                # Если ничего не нашли, берём весь body
                 content = await page.text_content('body')
                 logger.warning("Контент не найден по известным селекторам, взят body")
+
             return content.strip() if content else "[Текст не найден]"
+
         except Exception as e:
             logger.error(f"Ошибка загрузки главы {url}: {e}")
-            return f"[Ошибка загрузки: {e}]"
+            # Пробуем получить хотя бы частичный контент
+            try:
+                content = await page.content()
+                return f"[Ошибка загрузки, но получен частичный HTML: {content[:500]}...]"
+            except:
+                return f"[Ошибка загрузки: {e}]"
         finally:
             await browser.close()
 
 
-# ===== ПАРСИНГ СПИСКА ГЛАВ (ИСПРАВЛЕНО) =====
+# ===== ПАРСИНГ СПИСКА ГЛАВ =====
 def parse_chapters(html: str) -> list[dict]:
     soup = BeautifulSoup(html, 'html.parser')
     chapters = []
@@ -196,7 +226,7 @@ def parse_chapters(html: str) -> list[dict]:
     chapters.sort(key=lambda x: int(x['id']), reverse=True)
     logger.info(f"Найдено глав: {len(chapters)}")
     if chapters:
-        logger.info(f"Пример ссылки: {chapters[0]['link']}")
+        logger.info(f"Пример ссылки на главу: {chapters[0]['link']}")
     return chapters
 
 
@@ -213,9 +243,9 @@ async def get_latest_chapters(n: int) -> list[dict]:
         return []
 
 
-# ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER (ИСПРАВЛЕНО) =====
+# ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER =====
 async def translate_text(text: str, retries: int = 3) -> str:
-    """Переводит текст через OpenRouter (DeepSeek Chat)."""
+    """Переводит текст через OpenRouter (бесплатная модель)."""
     if len(text) > 120000:
         text = text[:120000] + "\n... [текст обрезан для перевода]"
 
@@ -229,7 +259,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
     }
 
     payload = {
-        "model": "stepfun/step-3.5-flash:free",  # актуальная бесплатная модель
+        "model": "stepfun/step-3.5-flash:free",  # бесплатная модель
         "messages": [
             {"role": "system", "content": "Ты профессиональный переводчик художественной литературы. Переводи точно и сохраняй стиль."},
             {"role": "user", "content": prompt}
@@ -300,13 +330,14 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
                 "title": title,
                 "author_name": author,
                 "content": nodes
-                # access_token не передаём для анонимной статьи
+                # access_token не указываем
             }
         ) as resp:
             data = await resp.json()
             if data["ok"]:
                 return data["result"]["url"]
             else:
+                logger.error(f"Telegraph error: {data}")
                 raise Exception(f"Telegraph error: {data.get('error')}")
 
 
