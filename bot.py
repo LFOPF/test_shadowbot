@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from telegraph import Telegraph
 
 # ===== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Инициализация Telegraph (анонимная)
+telegraph = Telegraph()
 
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
@@ -133,26 +137,22 @@ async def fetch_chapter_text(url: str) -> str:
         )
         page = await context.new_page()
         try:
-            # Ждём загрузки DOM
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # Ждём появления контейнера с текстом
             await page.wait_for_selector('div.text#arrticle', timeout=30000)
-            
-            # Извлекаем текст из всех параграфов внутри div#arrticle
+
             paragraphs = await page.evaluate('''() => {
                 const container = document.querySelector('div.text#arrticle');
                 if (!container) return [];
-                const paragraphs = Array.from(container.querySelectorAll('p'));
-                return paragraphs.map(p => p.innerText).filter(text => text.trim().length > 0);
+                const paras = Array.from(container.querySelectorAll('p'));
+                return paras.map(p => p.innerText).filter(text => text.trim().length > 0);
             }''')
-            
+
             if paragraphs:
                 return '\n\n'.join(paragraphs)
             else:
-                # Запасной вариант
                 content = await page.text_content('div.text#arrticle')
                 return content.strip() if content else "[Текст не найден]"
-                
+
         except Exception as e:
             logger.warning(f"Ошибка загрузки {url}: {e}")
             return f"[Ошибка загрузки: {e}]"
@@ -165,7 +165,6 @@ def parse_chapters(html: str) -> list[dict]:
     soup = BeautifulSoup(html, 'html.parser')
     chapters = []
 
-    # Основной поиск: ссылки на главы (формат /shadow-slave-.../number.html)
     for a in soup.find_all('a', href=True):
         href = a['href']
         text = a.get_text(strip=True)
@@ -177,7 +176,6 @@ def parse_chapters(html: str) -> list[dict]:
                 link = 'https://ranobes.net' + href
                 chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
 
-    # Запасной вариант: старый формат
     if not chapters:
         for a in soup.find_all('a', href=True):
             href = a['href']
@@ -190,7 +188,6 @@ def parse_chapters(html: str) -> list[dict]:
                     link = href if href.startswith('http') else 'https://ranobes.net' + href
                     chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
 
-    # Если всё равно не нашли, ищем все ссылки с текстом Chapter
     if not chapters:
         for a in soup.find_all('a', href=True):
             text = a.get_text(strip=True)
@@ -281,40 +278,18 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Неизвестная ошибка перевода]"
 
 
-# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ИСПРАВЛЕНО) =====
+# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ИСПРАВЛЕНО через библиотеку) =====
 async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
-    """Создаёт анонимную статью на Telegraph, корректно разбивая на абзацы."""
-    # Разбираем HTML и создаём массив узлов для Telegraph
-    soup = BeautifulSoup(content_html, 'html.parser')
-    nodes = []
-
-    # Ищем все теги <p> в нашем HTML
-    for p in soup.find_all('p'):
-        # Извлекаем текст параграфа
-        text = p.get_text().strip()
-        if text:  # пропускаем пустые
-            nodes.append({"tag": "p", "children": [text]})
-
-    # Если не нашли параграфы, создаём один узел со всем содержимым
-    if not nodes:
-        nodes = [{"tag": "p", "children": [content_html]}]
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.telegra.ph/createPage",
-            json={
-                "title": title,
-                "author_name": author,
-                "content": nodes
-                # Без access_token — для анонимных страниц
-            }
-        ) as resp:
-            data = await resp.json()
-            if data["ok"]:
-                return data["result"]["url"]
-            else:
-                logger.error(f"Telegraph error: {data}")
-                raise Exception(f"Telegraph error: {data.get('error')}")
+    """Создаёт анонимную страницу на Telegra.ph, используя библиотеку telegraph."""
+    loop = asyncio.get_event_loop()
+    def _create():
+        response = telegraph.create_page(
+            title,
+            html_content=content_html,
+            author_name=author
+        )
+        return response['url']
+    return await loop.run_in_executor(None, _create)
 
 
 # ===== РАССЫЛКА ВСЕМ ПОДПИСЧИКАМ =====
