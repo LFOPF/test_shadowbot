@@ -125,7 +125,7 @@ async def fetch_html(url: str) -> str:
 
 # ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ (ИСПРАВЛЕНО) =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы, собирая все значимые абзацы."""
+    """Загружает текст главы, собирая все абзацы из div#arrticle."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -135,19 +135,24 @@ async def fetch_chapter_text(url: str) -> str:
         try:
             # Ждём загрузки DOM
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # Ждём появления абзацев
-            await page.wait_for_selector('p', timeout=30000)
-            # Получаем все абзацы длиной более 100 символов (чтобы отсечь меню)
+            # Ждём появления контейнера с текстом
+            await page.wait_for_selector('div.text#arrticle', timeout=30000)
+            
+            # Извлекаем текст из всех параграфов внутри div#arrticle
             paragraphs = await page.evaluate('''() => {
-                const paragraphs = Array.from(document.querySelectorAll('p'));
-                return paragraphs.map(p => p.innerText).filter(text => text.length > 100);
+                const container = document.querySelector('div.text#arrticle');
+                if (!container) return [];
+                const paragraphs = Array.from(container.querySelectorAll('p'));
+                return paragraphs.map(p => p.innerText).filter(text => text.trim().length > 0);
             }''')
+            
             if paragraphs:
                 return '\n\n'.join(paragraphs)
             else:
-                # Если абзацев нет, берём весь текст body
-                content = await page.text_content('body')
-                return content.strip()
+                # Запасной вариант
+                content = await page.text_content('div.text#arrticle')
+                return content.strip() if content else "[Текст не найден]"
+                
         except Exception as e:
             logger.warning(f"Ошибка загрузки {url}: {e}")
             return f"[Ошибка загрузки: {e}]"
