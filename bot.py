@@ -19,10 +19,10 @@ if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY должен быть задан для перевода!")
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
-CHECK_INTERVAL = 2 * 60 * 60  # 2 часа (можно 60 для теста)
+CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
 LAST_CHAPTER_FILE = "last_chapter.txt"
 SUBSCRIBERS_FILE = "subscribers.json"
-SITE_URL = "https://t.me/YourBot"  # для статистики OpenRouter, можно заменить
+SITE_URL = "https://t.me/YourBot"  # замените на что-то своё
 SITE_NAME = "ShadowSlaveTranslator"
 # =============================================
 
@@ -130,10 +130,18 @@ async def fetch_chapter_text(url: str) -> str:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            await page.goto(url, timeout=60000)
-            # Ожидаем появления контейнера с текстом главы (селектор может отличаться)
-            await page.wait_for_selector('div.chapter-content', timeout=20000)
-            content = await page.text_content('div.chapter-content')
+            await page.goto(url, timeout=90000)  # увеличенный таймаут
+            # Пробуем разные селекторы для контента
+            content = None
+            for selector in ['div.chapter-content', 'div.entry-content', 'article', 'div.text', 'div.content']:
+                if await page.locator(selector).count() > 0:
+                    content = await page.text_content(selector)
+                    logger.info(f"Найден контент по селектору: {selector}")
+                    break
+            if not content:
+                # Если ничего не нашли, берём весь body
+                content = await page.text_content('body')
+                logger.warning("Контент не найден по известным селекторам, взят body")
             return content.strip() if content else "[Текст не найден]"
         except Exception as e:
             logger.error(f"Ошибка загрузки главы {url}: {e}")
@@ -142,22 +150,37 @@ async def fetch_chapter_text(url: str) -> str:
             await browser.close()
 
 
-# ===== ПАРСИНГ СПИСКА ГЛАВ =====
+# ===== ПАРСИНГ СПИСКА ГЛАВ (ИСПРАВЛЕНО) =====
 def parse_chapters(html: str) -> list[dict]:
     soup = BeautifulSoup(html, 'html.parser')
     chapters = []
 
+    # Основной поиск: ссылки на главы (формат /shadow-slave-.../number.html)
     for a in soup.find_all('a', href=True):
         href = a['href']
         text = a.get_text(strip=True)
-        if ('/read-' in href or '/chapter-' in href) and text.startswith('Chapter'):
+        if href.startswith('/shadow-slave-') and 'Chapter' in text:
             match = re.search(r'Chapter\s+(\d+)', text)
             if match:
                 chapter_id = match.group(1)
                 raw_title = text
-                link = href if href.startswith('http') else 'https://ranobes.net' + href
+                link = 'https://ranobes.net' + href
                 chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
 
+    # Запасной вариант: старый формат
+    if not chapters:
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            text = a.get_text(strip=True)
+            if ('/read-' in href or '/chapter-' in href) and text.startswith('Chapter'):
+                match = re.search(r'Chapter\s+(\d+)', text)
+                if match:
+                    chapter_id = match.group(1)
+                    raw_title = text
+                    link = href if href.startswith('http') else 'https://ranobes.net' + href
+                    chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
+
+    # Если всё равно не нашли, ищем все ссылки с текстом Chapter
     if not chapters:
         for a in soup.find_all('a', href=True):
             text = a.get_text(strip=True)
@@ -170,8 +193,10 @@ def parse_chapters(html: str) -> list[dict]:
                     link = href if href.startswith('http') else 'https://ranobes.net' + href
                     chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
 
-    chapters.sort(key=lambda x: int(x['id']), reverse=True)  # новые первыми
+    chapters.sort(key=lambda x: int(x['id']), reverse=True)
     logger.info(f"Найдено глав: {len(chapters)}")
+    if chapters:
+        logger.info(f"Пример ссылки: {chapters[0]['link']}")
     return chapters
 
 
@@ -188,10 +213,10 @@ async def get_latest_chapters(n: int) -> list[dict]:
         return []
 
 
-# ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER =====
+# ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER (ИСПРАВЛЕНО) =====
 async def translate_text(text: str, retries: int = 3) -> str:
-    """Переводит текст с DeepSeek V3 через OpenRouter."""
-    if len(text) > 120000:  # ограничим, чтобы не превысить лимиты
+    """Переводит текст через OpenRouter (DeepSeek Chat)."""
+    if len(text) > 120000:
         text = text[:120000] + "\n... [текст обрезан для перевода]"
 
     prompt = f"Переведи следующий текст художественной литературы на русский язык. Сохрани абзацы и форматирование. Текст:\n\n{text}"
@@ -204,7 +229,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
     }
 
     payload = {
-        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "model": "stepfun/step-3.5-flash:free",  # актуальная бесплатная модель
         "messages": [
             {"role": "system", "content": "Ты профессиональный переводчик художественной литературы. Переводи точно и сохраняй стиль."},
             {"role": "user", "content": prompt}
@@ -246,9 +271,9 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Неизвестная ошибка перевода]"
 
 
-# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH =====
+# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ИСПРАВЛЕНО) =====
 async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
-    """Создаёт статью на Telegraph и возвращает URL."""
+    """Создаёт анонимную статью на Telegraph и возвращает URL."""
     # Преобразуем HTML в формат Telegraph (массив нод)
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
@@ -261,14 +286,11 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
                     children.append(child.string)
                 elif child.name == 'br':
                     children.append({"tag": "br"})
-                # можно добавить поддержку других тегов
             nodes.append({"tag": "p", "children": children})
         elif elem.name is None and elem.string and elem.string.strip():
-            # Простой текст вне тегов
             nodes.append({"tag": "p", "children": [elem.string.strip()]})
 
     if not nodes:
-        # fallback: просто обернём весь текст в p
         nodes = [{"tag": "p", "children": [content_html]}]
 
     async with aiohttp.ClientSession() as session:
@@ -277,8 +299,8 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
             json={
                 "title": title,
                 "author_name": author,
-                "content": nodes,
-                "access_token": ""  # анонимная статья
+                "content": nodes
+                # access_token не передаём для анонимной статьи
             }
         ) as resp:
             data = await resp.json()
@@ -403,22 +425,17 @@ async def cmd_translate_last2(message: types.Message):
         for idx, ch in enumerate(chapters, 1):
             status = await message.answer(f"📥 Загружаю главу {idx}...")
 
-            # Загружаем текст главы
             chapter_text = await fetch_chapter_text(ch['link'])
             await status.edit_text(f"🔄 Перевожу главу {idx}...")
 
-            # Переводим
             translated = await translate_text(chapter_text)
 
-            # Преобразуем в HTML
             html_content = text_to_html(translated)
 
             await status.edit_text(f"📄 Создаю статью для главы {idx}...")
 
-            # Создаём статью на Telegraph
             page_url = await create_telegraph_page(ch['title'], html_content)
 
-            # Отправляем ссылку
             await message.answer(
                 f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
                 parse_mode="HTML"
@@ -440,7 +457,7 @@ async def cmd_translate_last(message: types.Message):
         return
     try:
         n = int(parts[1])
-        if n <= 0 or n > 10:  # ограничим, чтобы не перегружать API
+        if n <= 0 or n > 10:  # ограничение, чтобы не перегружать
             await message.answer("Количество от 1 до 10.")
             return
     except ValueError:
