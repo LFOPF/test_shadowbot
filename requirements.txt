@@ -2,3 +2,4 @@ aiogram
 beautifulsoup4
 playwright
 aiohttp
+redis
