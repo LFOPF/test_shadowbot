@@ -64,14 +64,6 @@ def clean_title(raw_title: str) -> str:
     return re.sub(r'\d+\s*(?:minutes?|hours?|days?)\s*ago$', '', raw_title, flags=re.IGNORECASE).strip()
 
 
-def format_chapter_count(n: int) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return f"{n} главу"
-    elif 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20):
-        return f"{n} главы"
-    return f"{n} глав"
-
-
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
     return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
@@ -81,7 +73,6 @@ def text_to_html(text: str) -> str:
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     """Возвращает URL страницы Telegraph для главы из хеша."""
     try:
-        # hget возвращает значение или None, если поле не существует
         return await redis_client.hget("telegraph_urls", chapter_id)
     except Exception as e:
         logger.error(f"get_cached_telegraph error: {e}")
@@ -91,14 +82,7 @@ async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
 async def save_telegraph_url(chapter_id: str, url: str):
     """Сохраняет URL страницы Telegraph для главы в хеш."""
     try:
-        # hset устанавливает поле в хеше
         await redis_client.hset("telegraph_urls", chapter_id, url)
-        # Можно также установить TTL на весь хеш, но это менее гибко.
-        # Если нужен TTL для отдельных записей, можно использовать отдельные ключи с TTL.
-        # Для простоты оставим без TTL или установим TTL для всего хеша (не рекомендуется).
-        # Вместо этого можно при сохранении устанавливать TTL на сам хеш? Нельзя для отдельных полей.
-        # Если вам нужно автоматическое удаление старых ссылок, лучше вернуться к отдельным ключам с TTL.
-        # Но обычно ссылки на Telegraph нужны постоянно, поэтому TTL не обязателен.
     except Exception as e:
         logger.error(f"save_telegraph_url error: {e}")
 
@@ -134,18 +118,20 @@ async def save_last_chapter(ch_id: str):
         logger.error(f"save_last_chapter error: {e}")
 
 
-# ======================== REDIS (закладки пользователей) ========================
+# ======================== REDIS (закладки пользователей) — теперь в хеше ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
+    """Возвращает номер главы из закладки пользователя (хеш user_bookmarks)."""
     try:
-        return await redis_client.get(f"bookmark:{user_id}")
+        return await redis_client.hget("user_bookmarks", str(user_id))
     except Exception as e:
         logger.error(f"get_user_bookmark error: {e}")
         return None
 
 
 async def save_user_bookmark(user_id: int, chapter_id: str):
+    """Сохраняет закладку пользователя в хеш user_bookmarks."""
     try:
-        await redis_client.set(f"bookmark:{user_id}", chapter_id)
+        await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
     except Exception as e:
         logger.error(f"save_user_bookmark error: {e}")
 
@@ -215,15 +201,6 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     else:
         logger.error("Не найдено ни одной главы — структура сайта изменилась?")
     return chapters
-
-
-async def get_latest_chapters(n: int) -> List[Dict[str, str]]:
-    try:
-        html = await fetch_html(TARGET_URL)
-        return parse_chapters(html)[:n]
-    except Exception as e:
-        logger.exception(f"get_latest_chapters: {e}")
-        return []
 
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
@@ -326,7 +303,7 @@ async def process_chapter(ch: Dict[str, str]) -> tuple[str, bool]:
     cid = ch['id']
     title = ch['title']
 
-    # 1. Проверяем кэш Telegraph (теперь из хеша)
+    # 1. Проверяем кэш Telegraph
     url = await get_cached_telegraph(cid)
     if url:
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
@@ -495,7 +472,10 @@ async def button_choose_translation(message: types.Message, state: FSMContext):
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Пожалуйста, введите число. Отмена.")
+        await message.answer(
+            "Пожалуйста, введите число. Отмена.",
+            reply_markup=await get_main_menu(message.from_user.id)
+        )
         await state.clear()
         return
 
@@ -528,7 +508,10 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         finally:
             await status_msg.delete()
     else:
-        await message.answer("Неизвестная команда. Пожалуйста, используйте меню.")
+        await message.answer(
+            "Неизвестная команда. Пожалуйста, используйте меню.",
+            reply_markup=await get_main_menu(message.from_user.id)
+        )
 
     await state.clear()
 
@@ -757,7 +740,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
-    # Регистрация обработчиков в правильном порядке
+    # Регистрация обработчиков
     # Сначала состояния
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_translation)
 
