@@ -3,7 +3,6 @@ import asyncio
 import logging
 import re
 import json
-import math
 from typing import Optional, Set, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, types
@@ -47,7 +46,8 @@ browser_context: Optional[BrowserContext] = None
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
-    waiting_for_translation = State()    # ожидание номера для перевода
+    waiting_for_choice = State()          # ожидание выбора типа (оригинал/перевод)
+    waiting_for_number = State()           # ожидание номера главы
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -227,14 +227,12 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
         
         html = await fetch_html(url)
         if not html:
-            # Если страница не загрузилась, сужаем диапазон и пробуем снова
             logger.warning(f"Страница {mid} не загрузилась, сужаем диапазон")
             right = mid - 1
             continue
             
         chapters = parse_chapters(html)
         if not chapters:
-            # Страница пуста — дальше страниц нет
             right = mid - 1
             continue
 
@@ -242,22 +240,17 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
         last_id = int(chapters[-1]['id'])   # самая старая глава на странице
 
         if chapter_number > first_id:
-            # Искомая глава новее, чем самые новые на этой странице — идём влево
             right = mid - 1
         elif chapter_number < last_id:
-            # Искомая глава старше, чем самые старые — идём вправо
             left = mid + 1
         else:
-            # Глава в диапазоне этой страницы — ищем внутри
             for ch in chapters:
                 if int(ch['id']) == chapter_number:
                     logger.info(f"Глава {chapter_number} найдена на странице {mid}")
                     return ch
-            # Если не нашли внутри диапазона, значит главы нет
             logger.warning(f"Глава {chapter_number} не найдена на странице {mid}, хотя должна быть в диапазоне")
             return None
 
-        # Небольшая задержка между запросами
         await asyncio.sleep(1)
 
     logger.warning(f"Глава {chapter_number} не найдена ни на одной странице")
@@ -348,32 +341,31 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
         return None
 
 
-# ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ ========================
-async def process_chapter(ch: Dict[str, str]) -> tuple[str, bool]:
+# ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ (перевод) ========================
+async def process_chapter_translation(ch: Dict[str, str]) -> tuple[str, bool]:
     """
-    Возвращает (текст_сообщения, успех).
-    Текст сообщения содержит либо ссылку на Telegraph, либо fallback-ссылку на оригинал.
+    Возвращает (текст_сообщения, успех) для переведённой главы.
     """
     cid = ch['id']
     title = ch['title']
 
-    # 1. Проверяем кэш Telegraph
+    # Проверяем кэш Telegraph
     url = await get_cached_telegraph(cid)
     if url:
         logger.info(f"Глава {cid} найдена в кэше")
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
 
-    # 2. Загружаем текст главы
+    # Загружаем текст главы
     try:
         text = await fetch_chapter_text(ch['link'])
     except Exception as e:
         logger.exception(f"Ошибка загрузки главы {cid}")
         return f"❌ Не удалось загрузить главу {title}\n🔗 Оригинал: {ch['link']}", False
 
-    # 3. Переводим
+    # Переводим
     translated = await translate_text(text)
 
-    # 4. Создаём страницу Telegraph
+    # Создаём страницу Telegraph
     try:
         html = text_to_html(translated)
         new_url = await create_telegraph_page(title, html)
@@ -415,13 +407,13 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ======================== ДИНАМИЧЕСКОЕ МЕНЮ ========================
+# ======================== КЛАВИАТУРЫ ========================
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     subs = await load_subscribers()
     is_subscribed = user_id in subs
 
     buttons = [
-        [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="🔢 Выбрать главу (перевод)")],
+        [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
     ]
@@ -438,6 +430,18 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     )
 
 
+# Клавиатура для выбора типа главы (оригинал/перевод)
+choice_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔗 Оригинал"), KeyboardButton(text="📚 Перевод")],
+        [KeyboardButton(text="❌ Отмена")]
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите тип главы"
+)
+
+
+# Клавиатура для отмены во время ввода номера
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
     resize_keyboard=True,
@@ -531,32 +535,48 @@ async def refresh_status(callback: types.CallbackQuery):
         await callback.answer()
 
 
-async def button_choose_translation(message: types.Message, state: FSMContext):
+async def button_choose_chapter(message: types.Message, state: FSMContext):
+    """Обработчик кнопки '📖 Выбор главы'."""
     await state.clear()
-
-    # Получаем список переведённых глав из хеша telegraph_urls
-    try:
-        translated_keys = await redis_client.hkeys("telegraph_urls")
-        if translated_keys:
-            translated_nums = [int(key.decode()) for key in translated_keys]
-            min_chapter = min(translated_nums)
-            max_chapter = max(translated_nums)
-            total = len(translated_nums)
-            range_text = f"📚 Уже переведено глав: **{total}**\nДоступны для чтения с **{min_chapter}** по **{max_chapter}**."
-        else:
-            range_text = "⚠️ Пока нет переведённых глав."
-    except Exception as e:
-        logger.exception("Ошибка при получении списка переведённых глав")
-        range_text = "❌ Не удалось получить информацию о переведённых главах."
-
-    await state.set_state(ChapterSelection.waiting_for_translation)
+    await state.set_state(ChapterSelection.waiting_for_choice)
     await message.answer(
-        f"🔢 Введите номер главы для перевода (только число).\n\n{range_text}",
+        "Выберите тип главы:",
+        reply_markup=choice_keyboard
+    )
+
+
+async def process_choice(message: types.Message, state: FSMContext):
+    """Обработка выбора типа главы (оригинал/перевод)."""
+    choice = message.text
+    if choice == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Выбор отменён.",
+            reply_markup=await get_main_menu(message.from_user.id)
+        )
+        return
+
+    if choice not in ["🔗 Оригинал", "📚 Перевод"]:
+        await message.answer(
+            "Пожалуйста, выберите вариант из меню.",
+            reply_markup=choice_keyboard
+        )
+        return
+
+    # Сохраняем тип в данных состояния
+    await state.update_data(choice_type='original' if choice == "🔗 Оригинал" else 'translation')
+
+    # Получаем номер последней главы для подсказки
+    last_chapter = await get_last_chapter() or "?"
+    await state.set_state(ChapterSelection.waiting_for_number)
+    await message.answer(
+        f"Введите номер главы (от 1 до {last_chapter}):",
         reply_markup=cancel_keyboard
     )
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
+    """Обработка введённого номера главы."""
     if message.text == "❌ Отмена":
         await state.clear()
         await message.answer(
@@ -575,50 +595,66 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     chapter_num = int(message.text)
     uid = message.from_user.id
 
-    # Сначала проверяем, есть ли уже перевод в кэше
-    cached_url = await get_cached_telegraph(str(chapter_num))
-    if cached_url:
-        await message.answer(
-            f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML"
-        )
-        await save_user_bookmark(uid, str(chapter_num))
-        await state.clear()
-        await message.answer(
-            "Что дальше?",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
+    # Получаем сохранённый тип выбора
+    data = await state.get_data()
+    choice_type = data.get('choice_type', 'translation')  # по умолчанию перевод (для обратной совместимости)
 
-    # Если в кэше нет, ищем на сайте
+    # Сразу сообщаем о начале поиска (для перевода) или загрузки (для оригинала)
+    if choice_type == 'translation':
+        status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
+    else:
+        status_msg = await message.answer(f"🔍 Ищу главу {chapter_num}...")
+
+    if choice_type == 'translation':
+        # Проверяем кэш
+        cached_url = await get_cached_telegraph(str(chapter_num))
+        if cached_url:
+            await status_msg.delete()
+            await message.answer(
+                f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}",
+                parse_mode="HTML"
+            )
+            await save_user_bookmark(uid, str(chapter_num))
+            await state.clear()
+            return
+
+    # Ищем главу на сайте
     chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
+        await status_msg.delete()
         await message.answer(
-            f"Глава с номером {chapter_num} не найдена. Попробуйте другой номер.",
-            reply_markup=cancel_keyboard
+            f"Глава с номером {chapter_num} не найдена. Проверьте номер.",
+            reply_markup=await get_main_menu(uid)
         )
+        await state.clear()
         return
 
-    status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
+    if choice_type == 'original':
+        # Отправляем ссылку на оригинал
+        await status_msg.delete()
+        await message.answer(
+            f"📢 <b>{chapter['title']}</b>\n🔗 {chapter['link']}",
+            parse_mode="HTML"
+        )
+        # Для оригинала закладку не обновляем? Пока оставим как есть (не обновляем)
+        await state.clear()
+        return
+
+    # Перевод
+    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
     try:
-        result_text, success = await process_chapter(chapter)
+        result_text, success = await process_chapter_translation(chapter)
+        await status_msg.delete()
         if success:
-            await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
         else:
-            await status_msg.edit_text("❌ Ошибка")
             await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"process_chapter_number translation error: {e}")
         await message.answer(f"❌ Ошибка при обработке главы {chapter['title']}")
     finally:
-        await status_msg.delete()
         await state.clear()
-        await message.answer(
-            "Что дальше?",
-            reply_markup=await get_main_menu(uid)
-        )
 
 
 async def button_bookmark(message: types.Message, state: FSMContext):
@@ -627,7 +663,7 @@ async def button_bookmark(message: types.Message, state: FSMContext):
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer(
-            "У вас ещё нет закладки. Выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
+            "У вас ещё нет закладки. Выберите главу через кнопку «📖 Выбор главы».",
             reply_markup=await get_main_menu(uid)
         )
         return
@@ -642,29 +678,30 @@ async def button_bookmark(message: types.Message, state: FSMContext):
         await save_user_bookmark(uid, bookmark)
         return
 
+    # Сообщаем о поиске
+    status_msg = await message.answer(f"🔍 Ищу перевод главы {bookmark}...")
+
     chapter = await find_chapter_by_number(int(bookmark))
     if not chapter:
+        await status_msg.delete()
         await message.answer(
             "Закладка указывает на несуществующую главу. Возможно, она была удалена. Установите новую закладку.",
             reply_markup=await get_main_menu(uid)
         )
         return
 
-    status_msg = await message.answer(f"📥 Загружаю главу {bookmark}...")
+    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {bookmark}...")
     try:
-        result_text, success = await process_chapter(chapter)
+        result_text, success = await process_chapter_translation(chapter)
+        await status_msg.delete()
         if success:
-            await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
         else:
-            await status_msg.edit_text("❌ Ошибка")
             await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"button_bookmark error: {e}")
         await message.answer("❌ Ошибка при загрузке главы.")
-    finally:
-        await status_msg.delete()
 
 
 async def button_prev(message: types.Message, state: FSMContext):
@@ -673,7 +710,7 @@ async def button_prev(message: types.Message, state: FSMContext):
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer(
-            "У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
+            "У вас нет закладки. Сначала выберите главу через кнопку «📖 Выбор главы».",
             reply_markup=await get_main_menu(uid)
         )
         return
@@ -697,29 +734,30 @@ async def button_prev(message: types.Message, state: FSMContext):
         await save_user_bookmark(uid, str(prev_num))
         return
 
+    # Сообщаем о поиске
+    status_msg = await message.answer(f"🔍 Ищу перевод главы {prev_num}...")
+
     chapter = await find_chapter_by_number(prev_num)
     if not chapter:
+        await status_msg.delete()
         await message.answer(
             f"Глава {prev_num} не найдена. Возможно, она ещё не вышла или была пропущена.",
             reply_markup=await get_main_menu(uid)
         )
         return
 
-    status_msg = await message.answer(f"📥 Загружаю предыдущую главу {prev_num}...")
+    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {prev_num}...")
     try:
-        result_text, success = await process_chapter(chapter)
+        result_text, success = await process_chapter_translation(chapter)
+        await status_msg.delete()
         if success:
-            await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
         else:
-            await status_msg.edit_text("❌ Ошибка")
             await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"button_prev error: {e}")
         await message.answer("❌ Ошибка при загрузке главы.")
-    finally:
-        await status_msg.delete()
 
 
 async def button_next(message: types.Message, state: FSMContext):
@@ -728,7 +766,7 @@ async def button_next(message: types.Message, state: FSMContext):
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer(
-            "У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
+            "У вас нет закладки. Сначала выберите главу через кнопку «📖 Выбор главы».",
             reply_markup=await get_main_menu(uid)
         )
         return
@@ -746,29 +784,30 @@ async def button_next(message: types.Message, state: FSMContext):
         await save_user_bookmark(uid, str(next_num))
         return
 
+    # Сообщаем о поиске
+    status_msg = await message.answer(f"🔍 Ищу перевод главы {next_num}...")
+
     chapter = await find_chapter_by_number(next_num)
     if not chapter:
+        await status_msg.delete()
         await message.answer(
             f"Глава {next_num} не найдена. Возможно, она ещё не вышла.",
             reply_markup=await get_main_menu(uid)
         )
         return
 
-    status_msg = await message.answer(f"📥 Загружаю следующую главу {next_num}...")
+    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {next_num}...")
     try:
-        result_text, success = await process_chapter(chapter)
+        result_text, success = await process_chapter_translation(chapter)
+        await status_msg.delete()
         if success:
-            await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
         else:
-            await status_msg.edit_text("❌ Ошибка")
             await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"button_next error: {e}")
         await message.answer("❌ Ошибка при загрузке главы.")
-    finally:
-        await status_msg.delete()
 
 
 async def button_help(message: types.Message, state: FSMContext):
@@ -777,7 +816,7 @@ async def button_help(message: types.Message, state: FSMContext):
     await message.answer(
         "🤖 Доступные действия через кнопки:\n"
         "📌 Моя закладка – показать перевод текущей сохранённой главы\n"
-        "🔢 Выбрать главу (перевод) – ввести номер и получить перевод\n"
+        "📖 Выбор главы – выбрать главу (оригинал или перевод)\n"
         "⬅️ Предыдущая глава – перевод предыдущей главы (относительно закладки)\n"
         "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
         "📊 Статус – статистика подписчиков\n"
@@ -823,7 +862,7 @@ async def monitor():
                     cid = ch['id']
                     logger.info(f"Автоматическая обработка главы {cid}")
                     try:
-                        result_text, success = await process_chapter(ch)
+                        result_text, success = await process_chapter_translation(ch)
                         await notify_all_subscribers(result_text, parse_mode="HTML")
                     except Exception as e:
                         logger.exception(f"Ошибка обработки новой главы {cid}")
@@ -888,10 +927,11 @@ async def main():
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     # Регистрация обработчиков
-    dp.message.register(process_chapter_number, ChapterSelection.waiting_for_translation)
+    dp.message.register(process_choice, ChapterSelection.waiting_for_choice)
+    dp.message.register(process_chapter_number, ChapterSelection.waiting_for_number)
 
+    dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
-    dp.message.register(button_choose_translation, lambda m: m.text == "🔢 Выбрать главу (перевод)")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
     dp.message.register(button_next, lambda m: m.text == "➡️ Следующая глава")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
