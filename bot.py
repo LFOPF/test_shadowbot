@@ -79,10 +79,11 @@ def get_page_url(page_num: int) -> str:
     return f"{base}/page/{page_num}/"
 
 
-# ======================== REDIS (общие данные) ========================
+# ======================== REDIS (общие данные) с декодированием ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
-        return await redis_client.hget("telegraph_urls", chapter_id)
+        value = await redis_client.hget("telegraph_urls", chapter_id)
+        return value.decode() if value else None
     except Exception as e:
         logger.error(f"get_cached_telegraph error: {e}")
         return None
@@ -99,7 +100,9 @@ async def save_telegraph_url(chapter_id: str, url: str):
 async def load_subscribers() -> Set[int]:
     try:
         data = await redis_client.get("subscribers")
-        return set(json.loads(data)) if data else set()
+        if data:
+            return set(json.loads(data.decode()))
+        return set()
     except Exception as e:
         logger.error(f"load_subscribers error: {e}")
         return set()
@@ -114,7 +117,8 @@ async def save_subscribers(subs: Set[int]):
 
 async def get_last_chapter() -> Optional[str]:
     try:
-        return await redis_client.get("last_chapter")
+        value = await redis_client.get("last_chapter")
+        return value.decode() if value else None
     except Exception as e:
         logger.error(f"get_last_chapter error: {e}")
         return None
@@ -130,7 +134,8 @@ async def save_last_chapter(ch_id: str):
 # ======================== REDIS (закладки пользователей) ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
     try:
-        return await redis_client.hget("user_bookmarks", str(user_id))
+        value = await redis_client.hget("user_bookmarks", str(user_id))
+        return value.decode() if value else None
     except Exception as e:
         logger.error(f"get_user_bookmark error: {e}")
         return None
@@ -612,7 +617,8 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             await status_msg.delete()
             await message.answer(
                 f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=await get_main_menu(uid)
             )
             await save_user_bookmark(uid, str(chapter_num))
             await state.clear()
@@ -630,13 +636,13 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     if choice_type == 'original':
-        # Отправляем ссылку на оригинал
+        # Отправляем ссылку на оригинал и сразу возвращаем основное меню
         await status_msg.delete()
         await message.answer(
             f"📢 <b>{chapter['title']}</b>\n🔗 {chapter['link']}",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
         )
-        # Для оригинала закладку не обновляем? Пока оставим как есть (не обновляем)
         await state.clear()
         return
 
@@ -645,14 +651,19 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     try:
         result_text, success = await process_chapter_translation(chapter)
         await status_msg.delete()
+        await message.answer(
+            result_text,
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
+        )
         if success:
-            await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"process_chapter_number translation error: {e}")
-        await message.answer(f"❌ Ошибка при обработке главы {chapter['title']}")
+        await message.answer(
+            f"❌ Ошибка при обработке главы {chapter['title']}",
+            reply_markup=await get_main_menu(uid)
+        )
     finally:
         await state.clear()
 
@@ -673,7 +684,8 @@ async def button_bookmark(message: types.Message, state: FSMContext):
     if cached_url:
         await message.answer(
             f"📖 <b>Глава {bookmark}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
         )
         await save_user_bookmark(uid, bookmark)
         return
@@ -694,14 +706,19 @@ async def button_bookmark(message: types.Message, state: FSMContext):
     try:
         result_text, success = await process_chapter_translation(chapter)
         await status_msg.delete()
+        await message.answer(
+            result_text,
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
+        )
         if success:
-            await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"button_bookmark error: {e}")
-        await message.answer("❌ Ошибка при загрузке главы.")
+        await message.answer(
+            "❌ Ошибка при загрузке главы.",
+            reply_markup=await get_main_menu(uid)
+        )
 
 
 async def button_prev(message: types.Message, state: FSMContext):
@@ -729,7 +746,8 @@ async def button_prev(message: types.Message, state: FSMContext):
     if cached_url:
         await message.answer(
             f"📖 <b>Глава {prev_num}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
         )
         await save_user_bookmark(uid, str(prev_num))
         return
@@ -750,14 +768,19 @@ async def button_prev(message: types.Message, state: FSMContext):
     try:
         result_text, success = await process_chapter_translation(chapter)
         await status_msg.delete()
+        await message.answer(
+            result_text,
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
+        )
         if success:
-            await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"button_prev error: {e}")
-        await message.answer("❌ Ошибка при загрузке главы.")
+        await message.answer(
+            "❌ Ошибка при загрузке главы.",
+            reply_markup=await get_main_menu(uid)
+        )
 
 
 async def button_next(message: types.Message, state: FSMContext):
@@ -779,7 +802,8 @@ async def button_next(message: types.Message, state: FSMContext):
     if cached_url:
         await message.answer(
             f"📖 <b>Глава {next_num}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
         )
         await save_user_bookmark(uid, str(next_num))
         return
@@ -800,14 +824,19 @@ async def button_next(message: types.Message, state: FSMContext):
     try:
         result_text, success = await process_chapter_translation(chapter)
         await status_msg.delete()
+        await message.answer(
+            result_text,
+            parse_mode="HTML",
+            reply_markup=await get_main_menu(uid)
+        )
         if success:
-            await message.answer(result_text, parse_mode="HTML")
             await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(result_text, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"button_next error: {e}")
-        await message.answer("❌ Ошибка при загрузке главы.")
+        await message.answer(
+            "❌ Ошибка при загрузке главы.",
+            reply_markup=await get_main_menu(uid)
+        )
 
 
 async def button_help(message: types.Message, state: FSMContext):
