@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 import json
+import math
 from typing import Optional, Set, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, types
@@ -70,6 +71,14 @@ def text_to_html(text: str) -> str:
     return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
 
 
+def get_page_url(page_num: int) -> str:
+    """Возвращает URL страницы с главами по номеру страницы."""
+    if page_num == 1:
+        return TARGET_URL
+    base = TARGET_URL.rstrip('/')
+    return f"{base}/page/{page_num}/"
+
+
 # ======================== REDIS (общие данные) ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
@@ -82,6 +91,7 @@ async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
 async def save_telegraph_url(chapter_id: str, url: str):
     try:
         await redis_client.hset("telegraph_urls", chapter_id, url)
+        logger.info(f"Сохранён URL для главы {chapter_id}: {url}")
     except Exception as e:
         logger.error(f"save_telegraph_url error: {e}")
 
@@ -134,20 +144,25 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 
 # ======================== PLAYWRIGHT ========================
-async def fetch_html(url: str) -> str:
+async def fetch_html(url: str, retries: int = 2) -> str:
+    """Загружает HTML страницы с повторными попытками при ошибке."""
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
 
-    page = await browser_context.new_page()
-    try:
-        await page.goto(url, timeout=60000)
-        await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
-        return await page.content()
-    except Exception as e:
-        logger.warning(f"fetch_html error: {e}")
-        return ""
-    finally:
-        await page.close()
+    for attempt in range(retries):
+        page = await browser_context.new_page()
+        try:
+            await page.goto(url, timeout=60000)
+            await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
+            return await page.content()
+        except Exception as e:
+            logger.warning(f"fetch_html error on {url} (попытка {attempt+1}): {e}")
+            if attempt == retries - 1:
+                return ""
+            await asyncio.sleep(2 ** attempt)
+        finally:
+            await page.close()
+    return ""
 
 
 async def fetch_chapter_text(url: str) -> str:
@@ -202,48 +217,50 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
     """
-    Ищет главу по номеру, перебирая страницы пагинации.
+    Бинарный поиск главы по номеру на страницах пагинации.
     """
-    page_num = 1
-    while page_num <= MAX_PAGES:
-        # Формируем URL для текущей страницы
-        if page_num == 1:
-            url = TARGET_URL
+    left, right = 1, MAX_PAGES
+    while left <= right:
+        mid = (left + right) // 2
+        url = get_page_url(mid)
+        logger.info(f"Бинарный поиск: проверяем страницу {mid}")
+        
+        html = await fetch_html(url)
+        if not html:
+            # Если страница не загрузилась, сужаем диапазон и пробуем снова
+            logger.warning(f"Страница {mid} не загрузилась, сужаем диапазон")
+            right = mid - 1
+            continue
+            
+        chapters = parse_chapters(html)
+        if not chapters:
+            # Страница пуста — дальше страниц нет
+            right = mid - 1
+            continue
+
+        first_id = int(chapters[0]['id'])   # самая новая глава на странице
+        last_id = int(chapters[-1]['id'])   # самая старая глава на странице
+
+        if chapter_number > first_id:
+            # Искомая глава новее, чем самые новые на этой странице — идём влево
+            right = mid - 1
+        elif chapter_number < last_id:
+            # Искомая глава старше, чем самые старые — идём вправо
+            left = mid + 1
         else:
-            base = TARGET_URL.rstrip('/')
-            url = f"{base}/page/{page_num}/"
-
-        logger.info(f"Поиск главы {chapter_number} на странице: {url}")
-        try:
-            html = await fetch_html(url)
-            chapters_on_page = parse_chapters(html)
-
-            # Проверяем, есть ли нужная глава на этой странице
-            for ch in chapters_on_page:
+            # Глава в диапазоне этой страницы — ищем внутри
+            for ch in chapters:
                 if int(ch['id']) == chapter_number:
-                    logger.info(f"Глава {chapter_number} найдена на странице {page_num}")
+                    logger.info(f"Глава {chapter_number} найдена на странице {mid}")
                     return ch
+            # Если не нашли внутри диапазона, значит главы нет
+            logger.warning(f"Глава {chapter_number} не найдена на странице {mid}, хотя должна быть в диапазоне")
+            return None
 
-            # Если на странице нет ни одной главы (пусто) — дальше страниц нет
-            if not chapters_on_page:
-                logger.info(f"Страница {page_num} пуста. Поиск прекращён.")
-                break
-
-            # Берем последнюю главу на странице (самую старую)
-            last_chapter_on_page = int(chapters_on_page[-1]['id'])
-            if last_chapter_on_page < chapter_number:
-                logger.info(f"На странице {page_num} главы уже меньше {chapter_number}. Поиск прекращён.")
-                break
-
-        except Exception as e:
-            logger.exception(f"Ошибка при парсинге страницы {page_num}: {e}")
-            break
-
-        page_num += 1
-        # Небольшая задержка, чтобы не нагружать сервер
+        # Небольшая задержка между запросами
         await asyncio.sleep(1)
 
-    logger.warning(f"Глава {chapter_number} не найдена ни на одной из проверенных страниц.")
+    logger.warning(f"Глава {chapter_number} не найдена ни на одной странице")
     return None
 
 
@@ -299,7 +316,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
 
 
 # ======================== TELEGRAPH ========================
-async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
+async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> Optional[str]:
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
     for p in soup.find_all('p'):
@@ -315,37 +332,57 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
         "author_name": author,
         "content": nodes,
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://api.telegra.ph/createPage", json=payload) as resp:
-            data = await resp.json()
-            if data.get("ok"):
-                return data["result"]["url"]
-            logger.error(f"Telegraph error: {data}")
-            raise Exception(data.get('error', 'Неизвестная ошибка'))
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.telegra.ph/createPage", json=payload, timeout=30) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    url = data["result"]["url"]
+                    logger.info(f"Создана страница Telegraph: {url}")
+                    return url
+                else:
+                    logger.error(f"Telegraph error: {data}")
+                    return None
+    except Exception as e:
+        logger.exception(f"Ошибка при создании страницы Telegraph: {e}")
+        return None
 
 
 # ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ ========================
 async def process_chapter(ch: Dict[str, str]) -> tuple[str, bool]:
+    """
+    Возвращает (текст_сообщения, успех).
+    Текст сообщения содержит либо ссылку на Telegraph, либо fallback-ссылку на оригинал.
+    """
     cid = ch['id']
     title = ch['title']
 
+    # 1. Проверяем кэш Telegraph
     url = await get_cached_telegraph(cid)
     if url:
+        logger.info(f"Глава {cid} найдена в кэше")
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
 
+    # 2. Загружаем текст главы
     try:
         text = await fetch_chapter_text(ch['link'])
     except Exception as e:
         logger.exception(f"Ошибка загрузки главы {cid}")
         return f"❌ Не удалось загрузить главу {title}\n🔗 Оригинал: {ch['link']}", False
 
+    # 3. Переводим
     translated = await translate_text(text)
 
+    # 4. Создаём страницу Telegraph
     try:
         html = text_to_html(translated)
         new_url = await create_telegraph_page(title, html)
-        await save_telegraph_url(cid, new_url)
-        return f"📖 <b>{title}</b>\n\n🔗 {new_url}", True
+        if new_url:
+            await save_telegraph_url(cid, new_url)
+            return f"📖 <b>{title}</b>\n\n🔗 {new_url}", True
+        else:
+            logger.error(f"Не удалось создать Telegraph для главы {cid}")
+            return f"❌ Перевод готов, но не удалось создать страницу.\n🔗 Оригинал: {ch['link']}", False
     except Exception as e:
         logger.exception(f"Ошибка создания Telegraph для {cid}")
         return f"❌ Перевод готов, но не удалось создать страницу.\n🔗 Оригинал: {ch['link']}", False
@@ -536,6 +573,24 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     chapter_num = int(message.text)
+    uid = message.from_user.id
+
+    # Сначала проверяем, есть ли уже перевод в кэше
+    cached_url = await get_cached_telegraph(str(chapter_num))
+    if cached_url:
+        await message.answer(
+            f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}",
+            parse_mode="HTML"
+        )
+        await save_user_bookmark(uid, str(chapter_num))
+        await state.clear()
+        await message.answer(
+            "Что дальше?",
+            reply_markup=await get_main_menu(uid)
+        )
+        return
+
+    # Если в кэше нет, ищем на сайте
     chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
         await message.answer(
@@ -550,7 +605,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         if success:
             await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
-            await save_user_bookmark(message.from_user.id, chapter['id'])
+            await save_user_bookmark(uid, chapter['id'])
         else:
             await status_msg.edit_text("❌ Ошибка")
             await message.answer(result_text, parse_mode="HTML")
@@ -562,7 +617,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(
             "Что дальше?",
-            reply_markup=await get_main_menu(message.from_user.id)
+            reply_markup=await get_main_menu(uid)
         )
 
 
@@ -575,6 +630,16 @@ async def button_bookmark(message: types.Message, state: FSMContext):
             "У вас ещё нет закладки. Выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
             reply_markup=await get_main_menu(uid)
         )
+        return
+
+    # Проверяем кэш
+    cached_url = await get_cached_telegraph(bookmark)
+    if cached_url:
+        await message.answer(
+            f"📖 <b>Глава {bookmark}</b>\n\n🔗 {cached_url}",
+            parse_mode="HTML"
+        )
+        await save_user_bookmark(uid, bookmark)
         return
 
     chapter = await find_chapter_by_number(int(bookmark))
@@ -622,6 +687,16 @@ async def button_prev(message: types.Message, state: FSMContext):
         )
         return
 
+    # Проверяем кэш
+    cached_url = await get_cached_telegraph(str(prev_num))
+    if cached_url:
+        await message.answer(
+            f"📖 <b>Глава {prev_num}</b>\n\n🔗 {cached_url}",
+            parse_mode="HTML"
+        )
+        await save_user_bookmark(uid, str(prev_num))
+        return
+
     chapter = await find_chapter_by_number(prev_num)
     if not chapter:
         await message.answer(
@@ -660,6 +735,16 @@ async def button_next(message: types.Message, state: FSMContext):
 
     current = int(bookmark)
     next_num = current + 1
+
+    # Проверяем кэш
+    cached_url = await get_cached_telegraph(str(next_num))
+    if cached_url:
+        await message.answer(
+            f"📖 <b>Глава {next_num}</b>\n\n🔗 {cached_url}",
+            parse_mode="HTML"
+        )
+        await save_user_bookmark(uid, str(next_num))
+        return
 
     chapter = await find_chapter_by_number(next_num)
     if not chapter:
@@ -725,7 +810,6 @@ async def monitor():
     while True:
         logger.info("Начало проверки")
         try:
-            # Загружаем только первую страницу
             html = await fetch_html(TARGET_URL)
             chapters = parse_chapters(html)
             last_str = await get_last_chapter()
