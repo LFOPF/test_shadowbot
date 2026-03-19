@@ -3,239 +3,212 @@ import asyncio
 import logging
 import re
 import json
-import aiohttp
-from bs4 import BeautifulSoup
+from typing import Optional, Set, List, Dict, Any
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.fsm.storage.redis import RedisStorage
+import redis.asyncio as redis
+from playwright.async_api import async_playwright, Playwright, BrowserContext
+from bs4 import BeautifulSoup
+import aiohttp
 
-# ===== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =====
+# ======================== НАСТРОЙКИ ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN должен быть задан!")
-if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY должен быть задан для перевода!")
-if not TELEGRAPH_ACCESS_TOKEN:
-    raise ValueError("TELEGRAPH_ACCESS_TOKEN не задан в переменных окружения!")
+REDIS_URL = os.getenv("REDIS_URL")
+
+if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
+    raise ValueError("Не заданы все обязательные переменные окружения")
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
-CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
-LAST_CHAPTER_FILE = "last_chapter.txt"
-SUBSCRIBERS_FILE = "subscribers.json"
-SITE_URL = "https://t.me/YourBot"  # замените на что-то своё
+CHECK_INTERVAL = 3600  # 1 час
+SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
-# =============================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# ======================== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ========================
+redis_client: Optional[redis.Redis] = None
+bot: Optional[Bot] = None
+playwright_instance: Optional[Playwright] = None
+browser_context: Optional[BrowserContext] = None
+
+# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
+def extract_chapter_id(text: str) -> Optional[str]:
+    text = text.strip()
+    patterns = [
+        r'(?:Chapter|Ch\.?|Глава)\s*[:.\-–—]?\s*(\d+)',
+        r'(\d{4,})',
+    ]
+    for pat in patterns:
+        if m := re.search(pat, text, re.IGNORECASE):
+            return m.group(1)
+    return None
 
 
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 def clean_title(raw_title: str) -> str:
-    """Удаляет временную метку из названия главы."""
-    cleaned = re.sub(r'\d+\s*(?:minutes?|hours?|days?)\s*ago$', '', raw_title, flags=re.IGNORECASE)
-    return cleaned.strip()
+    return re.sub(r'\d+\s*(?:minutes?|hours?|days?)\s*ago$', '', raw_title, flags=re.IGNORECASE).strip()
 
 
 def format_chapter_count(n: int) -> str:
-    """Правильное склонение слова 'глава'."""
     if n % 10 == 1 and n % 100 != 11:
         return f"{n} главу"
     elif 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20):
         return f"{n} главы"
-    else:
-        return f"{n} глав"
+    return f"{n} глав"
 
 
 def text_to_html(text: str) -> str:
-    """Преобразует обычный текст в HTML с абзацами."""
     paragraphs = text.split('\n\n')
-    html_paragraphs = []
-    for p in paragraphs:
-        p = p.replace('\n', '<br>')
-        if p.strip():
-            html_paragraphs.append(f"<p>{p}</p>")
-    return ''.join(html_paragraphs)
+    return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
 
 
-# ===== РАБОТА С ПОДПИСЧИКАМИ =====
-def load_subscribers() -> set[int]:
+# ======================== REDIS ========================
+async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
-        with open(SUBSCRIBERS_FILE, "r") as f:
-            data = json.load(f)
-            return set(data.get("subscribers", []))
-    except FileNotFoundError:
-        return set()
+        return await redis_client.get(f"trans_url:{chapter_id}")
     except Exception as e:
-        logger.error(f"Ошибка загрузки подписчиков: {e}")
-        return set()
-
-
-def save_subscribers(subscribers: set[int]):
-    try:
-        with open(SUBSCRIBERS_FILE, "w") as f:
-            json.dump({"subscribers": list(subscribers)}, f)
-    except Exception as e:
-        logger.error(f"Ошибка сохранения подписчиков: {e}")
-
-
-# ===== РАБОТА С ПОСЛЕДНЕЙ ГЛАВОЙ =====
-def get_last_chapter() -> str | None:
-    try:
-        with open(LAST_CHAPTER_FILE, "r") as f:
-            content = f.read().strip()
-            return content if content else None
-    except FileNotFoundError:
+        logger.error(f"get_cached_telegraph error: {e}")
         return None
 
 
-def save_last_chapter(chapter_id: str):
-    with open(LAST_CHAPTER_FILE, "w") as f:
-        f.write(chapter_id)
+async def save_telegraph_url(chapter_id: str, url: str):
+    try:
+        await redis_client.set(f"trans_url:{chapter_id}", url, ex=60*60*24*90)
+    except Exception as e:
+        logger.error(f"save_telegraph_url error: {e}")
 
 
-# ===== ЗАГРУЗКА СТРАНИЦЫ СО СПИСКОМ ГЛАВ =====
+async def load_subscribers() -> Set[int]:
+    try:
+        data = await redis_client.get("subscribers")
+        return set(json.loads(data)) if data else set()
+    except Exception as e:
+        logger.error(f"load_subscribers error: {e}")
+        return set()
+
+
+async def save_subscribers(subs: Set[int]):
+    try:
+        await redis_client.set("subscribers", json.dumps(list(subs)))
+    except Exception as e:
+        logger.error(f"save_subscribers error: {e}")
+
+
+async def get_last_chapter() -> Optional[str]:
+    try:
+        return await redis_client.get("last_chapter")
+    except Exception as e:
+        logger.error(f"get_last_chapter error: {e}")
+        return None
+
+
+async def save_last_chapter(ch_id: str):
+    try:
+        await redis_client.set("last_chapter", ch_id)
+    except Exception as e:
+        logger.error(f"save_last_chapter error: {e}")
+
+
+# ======================== PLAYWRIGHT ========================
 async def fetch_html(url: str) -> str:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        html = ""
-        try:
-            await page.goto(url, timeout=60000)
-            await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
-            html = await page.content()
-        except PlaywrightTimeoutError:
-            logger.warning("Таймаут ожидания элементов, но страница могла загрузиться.")
-            html = await page.content()
-        except Exception as e:
-            logger.error(f"Ошибка Playwright: {e}")
-            html = await page.content() if page else ""
-        finally:
-            await browser.close()
+    if not playwright_instance or not browser_context:
+        raise RuntimeError("Playwright не инициализирован")
 
-        if not html:
-            raise Exception("Не удалось получить HTML")
-        with open("debug.html", "w", encoding="utf-8") as f:
-            f.write(html[:20000])
-        return html
+    page = await browser_context.new_page()
+    try:
+        await page.goto(url, timeout=60000)
+        await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
+        return await page.content()
+    except Exception as e:
+        logger.warning(f"fetch_html error: {e}")
+        return ""
+    finally:
+        await page.close()
 
 
-# ===== ЗАГРУЗКА ТЕКСТА КОНКРЕТНОЙ ГЛАВЫ =====
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст главы, собирая все абзацы из div#arrticle."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        )
-        page = await context.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector('div.text#arrticle', timeout=30000)
+    if not playwright_instance or not browser_context:
+        raise RuntimeError("Playwright не инициализирован")
 
-            paragraphs = await page.evaluate('''() => {
-                const container = document.querySelector('div.text#arrticle');
-                if (!container) return [];
-                const paras = Array.from(container.querySelectorAll('p'));
-                return paras.map(p => p.innerText).filter(text => text.trim().length > 0);
-            }''')
-
-            if paragraphs:
-                return '\n\n'.join(paragraphs)
-            else:
-                content = await page.text_content('div.text#arrticle')
-                return content.strip() if content else "[Текст не найден]"
-
-        except Exception as e:
-            logger.warning(f"Ошибка загрузки {url}: {e}")
-            return f"[Ошибка загрузки: {e}]"
-        finally:
-            await browser.close()
+    page = await browser_context.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector('div.text#arrticle', timeout=30000)
+        paragraphs = await page.evaluate('''() => {
+            const c = document.querySelector('div.text#arrticle');
+            if (!c) return [];
+            return Array.from(c.querySelectorAll('p'))
+                .map(p => p.innerText.trim())
+                .filter(t => t.length > 0);
+        }''')
+        if paragraphs:
+            return '\n\n'.join(paragraphs)
+        content = await page.text_content('div.text#arrticle')
+        return content.strip() if content else "[Текст не найден]"
+    except Exception as e:
+        logger.warning(f"fetch_chapter_text {url}: {e}")
+        return f"[Ошибка загрузки: {e}]"
+    finally:
+        await page.close()
 
 
-# ===== ПАРСИНГ СПИСКА ГЛАВ =====
-def parse_chapters(html: str) -> list[dict]:
+def parse_chapters(html: str) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, 'html.parser')
     chapters = []
-
     for a in soup.find_all('a', href=True):
-        href = a['href']
         text = a.get_text(strip=True)
-        if href.startswith('/shadow-slave-') and 'Chapter' in text:
-            match = re.search(r'Chapter\s+(\d+)', text)
-            if match:
-                chapter_id = match.group(1)
-                raw_title = text
-                link = 'https://ranobes.net' + href
-                chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
-
-    if not chapters:
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            text = a.get_text(strip=True)
-            if ('/read-' in href or '/chapter-' in href) and text.startswith('Chapter'):
-                match = re.search(r'Chapter\s+(\d+)', text)
-                if match:
-                    chapter_id = match.group(1)
-                    raw_title = text
-                    link = href if href.startswith('http') else 'https://ranobes.net' + href
-                    chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
-
-    if not chapters:
-        for a in soup.find_all('a', href=True):
-            text = a.get_text(strip=True)
-            if text.startswith('Chapter'):
-                match = re.search(r'Chapter\s+(\d+)', text)
-                if match:
-                    chapter_id = match.group(1)
-                    raw_title = text
-                    href = a['href']
-                    link = href if href.startswith('http') else 'https://ranobes.net' + href
-                    chapters.append({'id': chapter_id, 'raw_title': raw_title, 'link': link})
-
+        href = a['href']
+        cid = extract_chapter_id(text)
+        if cid and cid.isdigit():
+            link = 'https://ranobes.net' + href if not href.startswith('http') else href
+            chapters.append({
+                'id': cid,
+                'raw_title': text,
+                'title': clean_title(text),
+                'link': link
+            })
     chapters.sort(key=lambda x: int(x['id']), reverse=True)
-    logger.info(f"Найдено глав: {len(chapters)}")
+
     if chapters:
-        logger.info(f"Пример ссылки на главу: {chapters[0]['link']}")
+        logger.info(f"Найдено глав: {len(chapters)} | Самая новая: {chapters[0]['id']} — {chapters[0]['raw_title']!r}")
+    else:
+        logger.error("Не найдено ни одной главы — структура сайта изменилась?")
     return chapters
 
 
-# ===== ПОЛУЧЕНИЕ ПОСЛЕДНИХ N ГЛАВ =====
-async def get_latest_chapters(n: int) -> list[dict]:
+async def get_latest_chapters(n: int) -> List[Dict[str, str]]:
     try:
         html = await fetch_html(TARGET_URL)
-        all_chapters = parse_chapters(html)
-        for ch in all_chapters:
-            ch['title'] = clean_title(ch['raw_title'])
-        return all_chapters[:n]
+        return parse_chapters(html)[:n]
     except Exception as e:
-        logger.exception(f"Ошибка в get_latest_chapters: {e}")
+        logger.exception(f"get_latest_chapters: {e}")
         return []
 
 
-# ===== ПЕРЕВОД ЧЕРЕЗ OPENROUTER =====
+# ======================== ПЕРЕВОД ========================
 async def translate_text(text: str, retries: int = 3) -> str:
-    """Переводит текст через OpenRouter (бесплатная модель)."""
     if len(text) > 120000:
-        text = text[:120000] + "\n... [текст обрезан для перевода]"
+        logger.warning("Текст слишком длинный, обрезаем")
+        text = text[:120000] + "\n... [обрезано]"
 
     prompt = f"Переведи следующий текст художественной литературы на русский язык. Сохрани абзацы и форматирование. Текст:\n\n{text}"
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": SITE_URL,
         "X-Title": SITE_NAME,
         "Content-Type": "application/json"
     }
-
     payload = {
-        "model": "stepfun/step-3.5-flash:free",  # бесплатная модель
+        "model": "stepfun/step-3.5-flash:free",
         "messages": [
             {"role": "system", "content": "Ты профессиональный переводчик художественной литературы. Переводи точно и сохраняй стиль."},
             {"role": "user", "content": prompt}
@@ -255,294 +228,329 @@ async def translate_text(text: str, retries: int = 3) -> str:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        translated = data["choices"][0]["message"]["content"]
-                        return translated.strip()
+                        return data["choices"][0]["message"]["content"].strip()
                     elif resp.status == 429:
-                        logger.warning(f"Rate limit, попытка {attempt+1}/{retries}")
-                        if attempt == retries - 1:
-                            return f"[Ошибка перевода: превышен лимит запросов. Оригинал:\n{text[:500]}...]"
+                        logger.warning(f"Rate limit (попытка {attempt+1})")
                         await asyncio.sleep(2 ** attempt)
                     else:
-                        error_text = await resp.text()
-                        logger.error(f"Ошибка перевода {resp.status}: {error_text}")
-                        return f"[Ошибка перевода. Оригинал:\n{text[:500]}...]"
+                        logger.error(f"Перевод {resp.status}: {await resp.text()}")
+                        return f"[Ошибка перевода {resp.status}]"
         except asyncio.TimeoutError:
-            logger.warning(f"Таймаут перевода, попытка {attempt+1}/{retries}")
+            logger.warning(f"Таймаут перевода (попытка {attempt+1})")
             if attempt == retries - 1:
-                return f"[Ошибка: таймаут перевода. Оригинал:\n{text[:500]}...]"
+                return "[Таймаут]"
             await asyncio.sleep(2 ** attempt)
         except Exception as e:
-            logger.exception(f"Исключение при переводе: {e}")
-            return f"[Ошибка соединения. Оригинал:\n{text[:500]}...]"
-    return "[Неизвестная ошибка перевода]"
+            logger.exception(f"Исключение перевода: {e}")
+    return "[Не удалось перевести]"
 
 
-# ===== СОЗДАНИЕ СТАТЬИ НА TELEGRAPH (ПРЯМОЙ API) =====
+# ======================== TELEGRAPH ========================
 async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> str:
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
     for p in soup.find_all('p'):
-        text = p.get_text().strip()
-        if text:
-            nodes.append({"tag": "p", "children": [text]})
-
+        t = p.get_text().strip()
+        if t:
+            nodes.append({"tag": "p", "children": [t]})
     if not nodes:
         nodes = [{"tag": "p", "children": [content_html]}]
 
     payload = {
-        "access_token": TELEGRAPH_ACCESS_TOKEN,          # ← вот это обязательно!
+        "access_token": TELEGRAPH_ACCESS_TOKEN,
         "title": title,
         "author_name": author,
         "content": nodes,
-        # "return_content": False   # можно добавить, если не нужен контент обратно
     }
-
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.telegra.ph/createPage",
-            json=payload
-        ) as resp:
+        async with session.post("https://api.telegra.ph/createPage", json=payload) as resp:
             data = await resp.json()
             if data.get("ok"):
                 return data["result"]["url"]
-            else:
-                logger.error(f"Telegraph API error: {data}")
-                raise Exception(f"Telegraph error: {data.get('error')}")
+            logger.error(f"Telegraph error: {data}")
+            raise Exception(data.get('error', 'Неизвестная ошибка'))
 
 
-# ===== РАССЫЛКА ВСЕМ ПОДПИСЧИКАМ =====
-async def notify_all_subscribers(text: str, parse_mode: str = "HTML"):
-    subscribers = load_subscribers()
-    if not subscribers:
-        logger.info("Нет подписчиков.")
+# ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ ========================
+async def process_chapter(ch: Dict[str, str]) -> tuple[str, bool]:
+    """
+    Возвращает (текст_сообщения, успех).
+    Текст сообщения содержит либо ссылку на Telegraph, либо fallback-ссылку на оригинал.
+    """
+    cid = ch['id']
+    title = ch['title']
+
+    # 1. Проверяем кэш Telegraph
+    url = await get_cached_telegraph(cid)
+    if url:
+        return f"📖 <b>{title}</b>\n\n🔗 {url}", True
+
+    # 2. Загружаем текст главы
+    try:
+        text = await fetch_chapter_text(ch['link'])
+    except Exception as e:
+        logger.exception(f"Ошибка загрузки главы {cid}")
+        return f"❌ Не удалось загрузить главу {title}\n🔗 Оригинал: {ch['link']}", False
+
+    # 3. Переводим
+    translated = await translate_text(text)
+
+    # 4. Создаём страницу Telegraph
+    try:
+        html = text_to_html(translated)
+        new_url = await create_telegraph_page(title, html)
+        await save_telegraph_url(cid, new_url)
+        return f"📖 <b>{title}</b>\n\n🔗 {new_url}", True
+    except Exception as e:
+        logger.exception(f"Ошибка создания Telegraph для {cid}")
+        return f"❌ Перевод готов, но не удалось создать страницу.\n🔗 Оригинал: {ch['link']}", False
+
+
+# ======================== РАССЫЛКА ========================
+async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
+    subs = await load_subscribers()
+    if not subs:
+        logger.info("Нет подписчиков")
         return
 
-    removed = set()
-    for uid in subscribers:
-        try:
-            await bot.send_message(chat_id=uid, text=text, parse_mode=parse_mode)
-        except (TelegramForbiddenError, TelegramBadRequest) as e:
-            logger.warning(f"Ошибка отправки {uid}: {e}, удаляем")
-            removed.add(uid)
-        except Exception as e:
-            logger.error(f"Неизвестная ошибка {uid}: {e}")
+    semaphore = asyncio.Semaphore(10)
 
-    if removed:
-        subscribers -= removed
-        save_subscribers(subscribers)
+    async def send_with_limit(uid):
+        async with semaphore:
+            try:
+                await bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+            except (TelegramForbiddenError, TelegramBadRequest):
+                logger.info(f"Пользователь {uid} недоступен, будет удалён при следующей очистке")
+            except Exception as e:
+                logger.error(f"Ошибка отправки {uid}: {e}")
+
+    tasks = [send_with_limit(uid) for uid in subs]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ===== КОМАНДЫ БОТА =====
-@dp.message(Command("start"))
+# ======================== КЛАВИАТУРЫ ========================
+main_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📋 Последние 5 глав")],
+        [KeyboardButton(text="📚 Последние 2 (перевод)")],
+        [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="❌ Отписаться")]  # Добавлена кнопка отписки
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие..."
+)
+
+quick_actions = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить статус", callback_data="refresh_status")],
+        [InlineKeyboardButton(text="🔗 Все главы", url="https://ranobes.net/chapters/1205249/")],
+        [InlineKeyboardButton(text="📢 Поделиться", switch_inline_query="Shadow Slave")]
+    ]
+)
+
+
+# ======================== ХЕНДЛЕРЫ (только для кнопок и /start) ========================
 async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    subs = load_subscribers()
-    if user_id in subs:
-        await message.answer("Вы уже подписаны!")
+    uid = message.from_user.id
+    subs = await load_subscribers()
+    if uid in subs:
+        await message.answer("Вы уже подписаны!", reply_markup=main_menu)
     else:
-        subs.add(user_id)
-        save_subscribers(subs)
-        await message.answer("✅ Вы подписались на уведомления о новых главах!")
+        subs.add(uid)
+        await save_subscribers(subs)
+        await message.answer(
+            "✅ Подписка оформлена!\n\n"
+            "Используйте кнопки меню для навигации.",
+            reply_markup=main_menu
+        )
 
 
-@dp.message(Command("stop"))
-async def cmd_stop(message: types.Message):
-    user_id = message.from_user.id
-    subs = load_subscribers()
-    if user_id in subs:
-        subs.remove(user_id)
-        save_subscribers(subs)
-        await message.answer("❌ Вы отписались.")
+async def button_unsubscribe(message: types.Message):
+    uid = message.from_user.id
+    subs = await load_subscribers()
+    if uid in subs:
+        subs.remove(uid)
+        await save_subscribers(subs)
+        await message.answer("❌ Вы отписались от уведомлений.", reply_markup=main_menu)
     else:
-        await message.answer("Вы не были подписаны.")
+        await message.answer("Вы не были подписаны.", reply_markup=main_menu)
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: types.Message):
-    subs = load_subscribers()
-    count = len(subs)
-    last = get_last_chapter() or "пока нет"
-    await message.answer(f"📊 Подписчиков: {count}\nПоследняя глава: {last}")
+async def button_status(message: types.Message):
+    subs = await load_subscribers()
+    last = await get_last_chapter() or "пока нет"
+    text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
+    await message.answer(text, reply_markup=quick_actions)
 
 
-@dp.message(Command("last2"))
-async def cmd_last2(message: types.Message):
-    await message.answer("🔄 Загружаю 2 последние главы...")
-    try:
-        chapters = await get_latest_chapters(2)
-        if not chapters:
-            await message.answer("Не удалось найти главы.")
-            return
-        for ch in chapters:
-            msg = f"📢 <b>{ch['title']}</b>\n🔗 {ch['link']}"
-            await message.answer(msg, parse_mode="HTML")
-            await asyncio.sleep(0.5)
-    except Exception as e:
-        logger.exception(f"Ошибка /last2: {e}")
-        await message.answer("❌ Ошибка.")
+async def refresh_status(callback: types.CallbackQuery):
+    subs = await load_subscribers()
+    last = await get_last_chapter() or "пока нет"
+    text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
+    await callback.message.edit_text(text, reply_markup=quick_actions)
+    await callback.answer()
 
 
-@dp.message(Command("last"))
-async def cmd_last(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Укажите количество. Пример: /last 5")
+async def button_last5(message: types.Message):
+    await message.answer("🔄 Загружаю 5 последних глав...")
+    chs = await get_latest_chapters(5)
+    if not chs:
+        await message.answer("Не удалось найти главы.")
         return
-    try:
-        n = int(parts[1])
-        if n <= 0 or n > 50:
-            await message.answer("Число от 1 до 50.")
-            return
-    except ValueError:
-        await message.answer("Некорректное число.")
-        return
-
-    await message.answer(f"🔄 Загружаю {format_chapter_count(n)}...")
-    try:
-        chapters = await get_latest_chapters(n)
-        if not chapters:
-            await message.answer("Главы не найдены.")
-            return
-        for ch in chapters:
-            msg = f"📢 <b>{ch['title']}</b>\n🔗 {ch['link']}"
-            await message.answer(msg, parse_mode="HTML")
-            await asyncio.sleep(0.5)
-    except Exception as e:
-        logger.exception(f"Ошибка /last: {e}")
-        await message.answer("❌ Ошибка.")
+    for ch in chs:
+        await message.answer(f"📢 <b>{ch['title']}</b>\n🔗 {ch['link']}", parse_mode="HTML")
+        await asyncio.sleep(0.5)
 
 
-@dp.message(Command("tr2"))
-async def cmd_translate_last2(message: types.Message):
-    """Перевести 2 последние главы и отправить ссылки на Telegraph."""
+async def button_translate_2(message: types.Message):
     await message.answer("🔄 Загружаю и перевожу 2 последние главы...")
-    try:
-        chapters = await get_latest_chapters(2)
-        if not chapters:
-            await message.answer("Главы не найдены.")
-            return
-
-        for idx, ch in enumerate(chapters, 1):
-            status = await message.answer(f"📥 Глава {idx}: загрузка...")
-            chapter_text = await fetch_chapter_text(ch['link'])
-            await status.edit_text(f"🔄 Глава {idx}: перевод...")
-            translated = await translate_text(chapter_text)
-
-            # Преобразуем в HTML для Telegraph
-            html_content = text_to_html(translated)
-
-            await status.edit_text(f"📄 Глава {idx}: создание статьи...")
-            page_url = await create_telegraph_page(ch['title'], html_content)
-
-            # Отправляем ссылку
-            await message.answer(
-                f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
-                parse_mode="HTML"
-            )
-            await status.delete()
-            await asyncio.sleep(1)
-
-    except Exception as e:
-        logger.exception(f"Ошибка /tr2: {e}")
-        await message.answer("❌ Произошла внутренняя ошибка.")
-
-
-@dp.message(Command("tr"))
-async def cmd_translate_last(message: types.Message):
-    """Перевести N последних глав и отправить ссылки на Telegraph."""
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Укажите количество. Пример: /tr 5")
+    chs = await get_latest_chapters(2)
+    if not chs:
+        await message.answer("Главы не найдены.")
         return
-    try:
-        n = int(parts[1])
-        if n <= 0 or n > 10:
-            await message.answer("Количество от 1 до 10.")
-            return
-    except ValueError:
-        await message.answer("Некорректное число.")
-        return
-
-    await message.answer(f"🔄 Загружаю и перевожу {format_chapter_count(n)}...")
-    try:
-        chapters = await get_latest_chapters(n)
-        if not chapters:
-            await message.answer("Главы не найдены.")
-            return
-
-        for idx, ch in enumerate(chapters, 1):
-            status = await message.answer(f"📥 Глава {idx} из {n}: загрузка...")
-            chapter_text = await fetch_chapter_text(ch['link'])
-            await status.edit_text(f"🔄 Глава {idx} из {n}: перевод...")
-            translated = await translate_text(chapter_text)
-
-            html_content = text_to_html(translated)
-
-            await status.edit_text(f"📄 Глава {idx} из {n}: создание статьи...")
-            page_url = await create_telegraph_page(ch['title'], html_content)
-
-            await message.answer(
-                f"📖 <b>{ch['title']}</b>\n\n🔗 <a href='{page_url}'>Читать перевод на Telegraph</a>",
-                parse_mode="HTML"
-            )
-            await status.delete()
-            await asyncio.sleep(1)
-
-    except Exception as e:
-        logger.exception(f"Ошибка /tr: {e}")
-        await message.answer("❌ Произошла внутренняя ошибка.")
-
-
-# ===== МОНИТОРИНГ НОВЫХ ГЛАВ =====
-async def monitor():
-    while True:
+    for idx, ch in enumerate(chs, 1):
+        status_msg = await message.answer(f"📥 Глава {idx}/2: проверка...")
         try:
-            logger.info("Проверяем новые главы...")
+            result_text, success = await process_chapter(ch)
+            if success:
+                await status_msg.edit_text("✅ Готово!")
+                await message.answer(result_text, parse_mode="HTML")
+            else:
+                await status_msg.edit_text("❌ Ошибка")
+                await message.answer(result_text, parse_mode="HTML")
+        except Exception as e:
+            logger.exception(f"button_translate_2 {ch['id']}: {e}")
+            await message.answer("❌ Ошибка")
+        finally:
+            await status_msg.delete()
+            await asyncio.sleep(1)
+
+
+async def button_help(message: types.Message):
+    await message.answer(
+        "🤖 Доступные действия через кнопки:\n"
+        "📋 Последние 5 глав – ссылки на оригинал\n"
+        "📚 Последние 2 (перевод) – перевод на Telegraph\n"
+        "📊 Статус – статистика подписчиков\n"
+        "❌ Отписаться – отключить уведомления\n"
+        "❓ Помощь – это сообщение",
+        reply_markup=main_menu
+    )
+
+
+# Обработчик для любых других текстовых сообщений (не кнопок)
+async def handle_other_text(message: types.Message):
+    await message.answer(
+        "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
+        reply_markup=main_menu
+    )
+
+
+# ======================== МОНИТОРИНГ ========================
+async def monitor():
+    logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
+    while True:
+        logger.info("Начало проверки")
+        try:
             html = await fetch_html(TARGET_URL)
             chapters = parse_chapters(html)
-            for ch in chapters:
-                ch['title'] = clean_title(ch['raw_title'])
+            last_str = await get_last_chapter()
+            last_int = int(last_str) if last_str and last_str.isdigit() else 0
 
-            last_id = get_last_chapter()
-            last_int = int(last_id) if last_id else None
-
-            new_chapters = []
-            for ch in reversed(chapters):
-                ch_int = int(ch['id'])
-                if last_int is None or ch_int > last_int:
-                    new_chapters.append(ch)
-                else:
-                    break
+            new_chapters = [ch for ch in reversed(chapters) if int(ch['id']) > last_int]
 
             if new_chapters:
                 logger.info(f"Новых глав: {len(new_chapters)}")
                 for ch in new_chapters:
-                    msg = f"📢 <b>{ch['title']}</b>\n🔗 {ch['link']}"
-                    await notify_all_subscribers(msg, parse_mode="HTML")
-                    save_last_chapter(ch['id'])
-                    await asyncio.sleep(0.5)
+                    cid = ch['id']
+                    logger.info(f"Автоматическая обработка главы {cid}")
+                    try:
+                        result_text, success = await process_chapter(ch)
+                        await notify_all_subscribers(result_text, parse_mode="HTML")
+                    except Exception as e:
+                        logger.exception(f"Ошибка обработки новой главы {cid}")
+                        fallback = (
+                            f"📢 <b>Новая глава!</b>\n"
+                            f"<b>{ch['title']}</b>\n\n"
+                            f"🔗 Оригинал: {ch['link']}\n"
+                            f"(перевод временно недоступен)"
+                        )
+                        await notify_all_subscribers(fallback, parse_mode="HTML")
+
+                max_id = max(int(ch['id']) for ch in new_chapters)
+                await save_last_chapter(str(max_id))
+                logger.info(f"last_chapter обновлён до {max_id}")
+
             else:
-                logger.info("Новых глав нет.")
+                logger.info("Новых глав нет")
+
         except Exception as e:
-            logger.exception(f"Ошибка в мониторинге: {e}")
+            logger.exception(f"Критическая ошибка мониторинга: {e}")
+            await asyncio.sleep(60)
+
+        logger.info(f"Проверка завершена. Ожидание {CHECK_INTERVAL} сек")
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-# ===== ЗАПУСК =====
+# ======================== LIFECYCLE ========================
 async def on_startup():
-    logger.info("Бот запущен.")
+    logger.info("Бот запущен. Инициализация Playwright...")
+    global playwright_instance, browser_context
+    try:
+        playwright_instance = await async_playwright().start()
+        browser = await playwright_instance.chromium.launch(headless=True)
+        browser_context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        logger.info("Playwright готов")
+    except Exception as e:
+        logger.exception(f"Ошибка инициализации Playwright: {e}")
+        raise
+
     asyncio.create_task(monitor())
+    logger.info("Мониторинг запущен")
 
 
 async def on_shutdown():
-    logger.info("Бот остановлен.")
+    logger.info("Бот остановлен. Закрытие ресурсов...")
+    global playwright_instance, browser_context
+    if browser_context:
+        await browser_context.close()
+    if playwright_instance:
+        await playwright_instance.stop()
+    if redis_client:
+        await redis_client.aclose()
 
 
-dp.startup.register(on_startup)
-dp.shutdown.register(on_shutdown)
-
-
+# ======================== ЗАПУСК ========================
 async def main():
+    global redis_client, bot
+    redis_client = await redis.from_url(REDIS_URL)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=RedisStorage(redis_client))
+
+    # Регистрируем только /start и обработчики кнопок
+    dp.message.register(cmd_start, Command("start"))
+
+    dp.message.register(button_last5, lambda m: m.text == "📋 Последние 5 глав")
+    dp.message.register(button_translate_2, lambda m: m.text == "📚 Последние 2 (перевод)")
+    dp.message.register(button_status, lambda m: m.text == "📊 Статус")
+    dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
+    dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
+
+    # Все остальные текстовые сообщения
+    dp.message.register(handle_other_text)
+
+    dp.callback_query.register(refresh_status, lambda c: c.data == "refresh_status")
+
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
     await dp.start_polling(bot)
 
 
