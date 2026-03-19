@@ -392,8 +392,13 @@ async def refresh_status(callback: types.CallbackQuery):
     subs = await load_subscribers()
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
-    await callback.message.edit_text(text, reply_markup=quick_actions)
-    await callback.answer()
+    
+    # Проверяем, изменился ли текст
+    if callback.message.text == text and callback.message.reply_markup == quick_actions:
+        await callback.answer("Данные актуальны", show_alert=False)
+    else:
+        await callback.message.edit_text(text, reply_markup=quick_actions)
+        await callback.answer()
 
 
 async def button_last5(message: types.Message):
