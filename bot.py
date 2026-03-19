@@ -461,9 +461,27 @@ async def refresh_status(callback: types.CallbackQuery):
 
 async def button_choose_translation(message: types.Message, state: FSMContext):
     await state.clear()
+    
+    # Получаем список переведённых глав из хеша telegraph_urls
+    try:
+        # Получаем все поля хеша (ключи)
+        translated_keys = await redis_client.hkeys("telegraph_urls")
+        if translated_keys:
+            # Преобразуем байты в строки, затем в числа
+            translated_nums = [int(key.decode()) for key in translated_keys]
+            min_chapter = min(translated_nums)
+            max_chapter = max(translated_nums)
+            total = len(translated_nums)
+            range_text = f"📚 Уже переведено глав: **{total}**\nДоступны для чтения с **{min_chapter}** по **{max_chapter}**."
+        else:
+            range_text = "⚠️ Пока нет переведённых глав."
+    except Exception as e:
+        logger.exception("Ошибка при получении списка переведённых глав")
+        range_text = "❌ Не удалось получить информацию о переведённых главах."
+
     await state.set_state(ChapterSelection.waiting_for_translation)
     await message.answer(
-        "Введите номер главы для перевода (только число):",
+        f"🔢 Введите номер главы для перевода (только число).\n\n{range_text}",
         reply_markup=cancel_keyboard
     )
 
@@ -781,3 +799,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
