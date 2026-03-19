@@ -45,7 +45,6 @@ browser_context: Optional[BrowserContext] = None
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
-    waiting_for_original = State()      # ожидание номера для оригинала
     waiting_for_translation = State()    # ожидание номера для перевода
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
@@ -370,18 +369,33 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ======================== КЛАВИАТУРЫ ========================
-main_menu = ReplyKeyboardMarkup(
-    keyboard=[
+# ======================== ДИНАМИЧЕСКОЕ МЕНЮ ========================
+async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
+    """Возвращает клавиатуру с учётом подписки пользователя."""
+    subs = await load_subscribers()
+    is_subscribed = user_id in subs
+
+    # Базовые кнопки, общие для всех
+    buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="🔢 Выбрать главу (перевод)")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
-        [KeyboardButton(text="❌ Отписаться")]
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Выберите действие..."
-)
+    ]
 
+    # Кнопка подписки/отписки в зависимости от статуса
+    if is_subscribed:
+        buttons.append([KeyboardButton(text="❌ Отписаться")])
+    else:
+        buttons.append([KeyboardButton(text="✅ Подписаться")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие..."
+    )
+
+
+# ======================== INLINE КЛАВИАТУРА ДЛЯ СТАТУСА ========================
 quick_actions = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить статус", callback_data="refresh_status")],
@@ -395,15 +409,35 @@ quick_actions = InlineKeyboardMarkup(
 async def cmd_start(message: types.Message):
     uid = message.from_user.id
     subs = await load_subscribers()
-    if uid in subs:
-        await message.answer("Вы уже подписаны!", reply_markup=main_menu)
-    else:
+    if uid not in subs:
         subs.add(uid)
         await save_subscribers(subs)
         await message.answer(
             "✅ Подписка оформлена!\n\n"
             "Используйте кнопки меню для навигации.",
-            reply_markup=main_menu
+            reply_markup=await get_main_menu(uid)
+        )
+    else:
+        await message.answer(
+            "Вы уже подписаны!",
+            reply_markup=await get_main_menu(uid)
+        )
+
+
+async def button_subscribe(message: types.Message):
+    uid = message.from_user.id
+    subs = await load_subscribers()
+    if uid in subs:
+        await message.answer(
+            "Вы уже подписаны на уведомления.",
+            reply_markup=await get_main_menu(uid)
+        )
+    else:
+        subs.add(uid)
+        await save_subscribers(subs)
+        await message.answer(
+            "✅ Вы подписались на уведомления о новых главах!",
+            reply_markup=await get_main_menu(uid)
         )
 
 
@@ -413,12 +447,19 @@ async def button_unsubscribe(message: types.Message):
     if uid in subs:
         subs.remove(uid)
         await save_subscribers(subs)
-        await message.answer("❌ Вы отписались от уведомлений.", reply_markup=main_menu)
+        await message.answer(
+            "❌ Вы отписались от уведомлений.",
+            reply_markup=await get_main_menu(uid)
+        )
     else:
-        await message.answer("Вы не были подписаны.", reply_markup=main_menu)
+        await message.answer(
+            "Вы не были подписаны.",
+            reply_markup=await get_main_menu(uid)
+        )
 
 
 async def button_status(message: types.Message):
+    uid = message.from_user.id
     subs = await load_subscribers()
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
@@ -429,7 +470,7 @@ async def refresh_status(callback: types.CallbackQuery):
     subs = await load_subscribers()
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
-    
+
     if callback.message.text == text:
         await callback.answer("Данные актуальны", show_alert=False)
     else:
@@ -443,7 +484,6 @@ async def button_choose_translation(message: types.Message, state: FSMContext):
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
-    # Проверяем, что сообщение содержит число
     if not message.text.isdigit():
         await message.answer("Пожалуйста, введите число. Отмена.")
         await state.clear()
@@ -452,22 +492,22 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     chapter_num = int(message.text)
     current_state = await state.get_state()
 
-    # Ищем главу
     chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
-        await message.answer(f"Глава с номером {chapter_num} не найдена. Попробуйте другой номер или начните заново через меню.")
+        await message.answer(
+            f"Глава с номером {chapter_num} не найдена. Попробуйте другой номер.",
+            reply_markup=await get_main_menu(message.from_user.id)
+        )
         await state.clear()
         return
 
     if current_state == ChapterSelection.waiting_for_translation.state:
-        # Обрабатываем перевод
         status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
         try:
             result_text, success = await process_chapter(chapter)
             if success:
                 await status_msg.edit_text("✅ Готово!")
                 await message.answer(result_text, parse_mode="HTML")
-                # Сохраняем закладку
                 await save_user_bookmark(message.from_user.id, chapter['id'])
             else:
                 await status_msg.edit_text("❌ Ошибка")
@@ -478,23 +518,27 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         finally:
             await status_msg.delete()
     else:
-        # Если вдруг пришло не в том состоянии
         await message.answer("Неизвестная команда. Пожалуйста, используйте меню.")
 
     await state.clear()
 
 
-# НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ЗАКЛАДОК
 async def button_bookmark(message: types.Message):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("У вас ещё нет закладки. Выберите главу через кнопку «🔢 Выбрать главу (перевод)».")
+        await message.answer(
+            "У вас ещё нет закладки. Выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     chapter = await find_chapter_by_number(int(bookmark))
     if not chapter:
-        await message.answer("Закладка указывает на несуществующую главу. Возможно, она была удалена. Установите новую закладку.")
+        await message.answer(
+            "Закладка указывает на несуществующую главу. Возможно, она была удалена. Установите новую закладку.",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     status_msg = await message.answer(f"📥 Загружаю главу {bookmark}...")
@@ -503,7 +547,6 @@ async def button_bookmark(message: types.Message):
         if success:
             await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
-            # Обновляем закладку (на тот же номер, но можно и не обновлять)
             await save_user_bookmark(uid, chapter['id'])
         else:
             await status_msg.edit_text("❌ Ошибка")
@@ -519,18 +562,27 @@ async def button_prev(message: types.Message):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».")
+        await message.answer(
+            "У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     current = int(bookmark)
     prev_num = current - 1
     if prev_num < 1:
-        await message.answer("Это первая глава. Предыдущей не существует.")
+        await message.answer(
+            "Это первая глава. Предыдущей не существует.",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     chapter = await find_chapter_by_number(prev_num)
     if not chapter:
-        await message.answer(f"Глава {prev_num} не найдена. Возможно, она ещё не вышла или была пропущена.")
+        await message.answer(
+            f"Глава {prev_num} не найдена. Возможно, она ещё не вышла или была пропущена.",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     status_msg = await message.answer(f"📥 Загружаю предыдущую главу {prev_num}...")
@@ -539,7 +591,6 @@ async def button_prev(message: types.Message):
         if success:
             await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
-            # Обновляем закладку на предыдущую главу
             await save_user_bookmark(uid, chapter['id'])
         else:
             await status_msg.edit_text("❌ Ошибка")
@@ -555,7 +606,10 @@ async def button_next(message: types.Message):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».")
+        await message.answer(
+            "У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     current = int(bookmark)
@@ -563,7 +617,10 @@ async def button_next(message: types.Message):
 
     chapter = await find_chapter_by_number(next_num)
     if not chapter:
-        await message.answer(f"Глава {next_num} не найдена. Возможно, она ещё не вышла.")
+        await message.answer(
+            f"Глава {next_num} не найдена. Возможно, она ещё не вышла.",
+            reply_markup=await get_main_menu(uid)
+        )
         return
 
     status_msg = await message.answer(f"📥 Загружаю следующую главу {next_num}...")
@@ -572,7 +629,6 @@ async def button_next(message: types.Message):
         if success:
             await status_msg.edit_text("✅ Готово!")
             await message.answer(result_text, parse_mode="HTML")
-            # Обновляем закладку на следующую главу
             await save_user_bookmark(uid, chapter['id'])
         else:
             await status_msg.edit_text("❌ Ошибка")
@@ -585,6 +641,7 @@ async def button_next(message: types.Message):
 
 
 async def button_help(message: types.Message):
+    uid = message.from_user.id
     await message.answer(
         "🤖 Доступные действия через кнопки:\n"
         "📌 Моя закладка – показать перевод текущей сохранённой главы\n"
@@ -592,17 +649,18 @@ async def button_help(message: types.Message):
         "⬅️ Предыдущая глава – перевод предыдущей главы (относительно закладки)\n"
         "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
         "📊 Статус – статистика подписчиков\n"
-        "❌ Отписаться – отключить уведомления\n"
+        "✅ Подписаться / ❌ Отписаться – управление уведомлениями (кнопка меняется в зависимости от статуса)\n"
         "❓ Помощь – это сообщение",
-        reply_markup=main_menu
+        reply_markup=await get_main_menu(uid)
     )
 
 
 # Обработчик для любых других текстовых сообщений (не кнопок и не состояний)
 async def handle_other_text(message: types.Message):
+    uid = message.from_user.id
     await message.answer(
         "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
-        reply_markup=main_menu
+        reply_markup=await get_main_menu(uid)
     )
 
 
@@ -700,6 +758,7 @@ async def main():
     dp.message.register(button_next, lambda m: m.text == "➡️ Следующая глава")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
+    dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
 
     # Все остальные текстовые сообщения
