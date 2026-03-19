@@ -16,9 +16,8 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import redis.asyncio as redis
-from playwright.async_api import async_playwright, Playwright, BrowserContext
-from bs4 import BeautifulSoup
 import aiohttp
+from bs4 import BeautifulSoup
 
 # ======================== НАСТРОЙКИ ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,6 +33,7 @@ CHECK_INTERVAL = 3600  # 1 час
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120  # Максимальное количество страниц для поиска (с сайта)
+CHAPTERS_PER_PAGE = 25  # Количество глав на одной странице
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -41,8 +41,6 @@ logger = logging.getLogger(__name__)
 # ======================== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ========================
 redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
-playwright_instance: Optional[Playwright] = None
-browser_context: Optional[BrowserContext] = None
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -70,6 +68,7 @@ def clean_title(raw_title: str) -> str:
         raw_title,
         flags=re.IGNORECASE
     ).strip()
+
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
@@ -136,6 +135,46 @@ async def save_last_chapter(ch_id: str):
         logger.error(f"save_last_chapter error: {e}")
 
 
+async def get_first_chapter() -> Optional[int]:
+    """Возвращает номер самой новой главы (из первой страницы или Redis)."""
+    try:
+        cached = await redis_client.get("first_chapter")
+        if cached:
+            return int(cached.decode())
+    except Exception as e:
+        logger.error(f"get_first_chapter cached error: {e}")
+
+    # Если нет в кэше, загружаем первую страницу
+    html = await fetch_html(TARGET_URL)
+    if not html:
+        return None
+    chapters = parse_chapters(html)
+    if not chapters:
+        return None
+    first = int(chapters[0]['id'])
+    try:
+        await redis_client.set("first_chapter", str(first), ex=3600)  # кэш на час
+    except Exception as e:
+        logger.error(f"save_first_chapter error: {e}")
+    return first
+
+
+async def get_cached_page(page_num: int) -> Optional[str]:
+    try:
+        value = await redis_client.get(f"page:{page_num}")
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_cached_page error: {e}")
+        return None
+
+
+async def save_page_cache(page_num: int, html: str):
+    try:
+        await redis_client.set(f"page:{page_num}", html, ex=86400)  # сутки
+    except Exception as e:
+        logger.error(f"save_page_cache error: {e}")
+
+
 # ======================== REDIS (закладки пользователей) ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
     try:
@@ -153,52 +192,48 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
         logger.error(f"save_user_bookmark error: {e}")
 
 
-# ======================== PLAYWRIGHT ========================
+# ======================== ЗАГРУЗКА СТРАНИЦ (без Playwright) ========================
 async def fetch_html(url: str, retries: int = 2) -> str:
     """Загружает HTML страницы с повторными попытками при ошибке."""
-    if not playwright_instance or not browser_context:
-        raise RuntimeError("Playwright не инициализирован")
-
     for attempt in range(retries):
-        page = await browser_context.new_page()
         try:
-            await page.goto(url, timeout=60000)
-            await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
-            return await page.content()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=30) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    else:
+                        logger.warning(f"HTTP {resp.status} при загрузке {url}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Таймаут при загрузке {url} (попытка {attempt+1})")
         except Exception as e:
-            logger.warning(f"fetch_html error on {url} (попытка {attempt+1}): {e}")
-            if attempt == retries - 1:
-                return ""
-            await asyncio.sleep(2 ** attempt)
-        finally:
-            await page.close()
+            logger.warning(f"Ошибка при загрузке {url} (попытка {attempt+1}): {e}")
+        await asyncio.sleep(2 ** attempt)
     return ""
 
 
-async def fetch_chapter_text(url: str) -> str:
-    if not playwright_instance or not browser_context:
-        raise RuntimeError("Playwright не инициализирован")
+async def fetch_html_cached(url: str, page_num: int) -> str:
+    """Загружает страницу с кэшированием."""
+    cached = await get_cached_page(page_num)
+    if cached:
+        return cached
+    html = await fetch_html(url)
+    if html:
+        await save_page_cache(page_num, html)
+    return html
 
-    page = await browser_context.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_selector('div.text#arrticle', timeout=30000)
-        paragraphs = await page.evaluate('''() => {
-            const c = document.querySelector('div.text#arrticle');
-            if (!c) return [];
-            return Array.from(c.querySelectorAll('p'))
-                .map(p => p.innerText.trim())
-                .filter(t => t.length > 0);
-        }''')
-        if paragraphs:
-            return '\n\n'.join(paragraphs)
-        content = await page.text_content('div.text#arrticle')
-        return content.strip() if content else "[Текст не найден]"
-    except Exception as e:
-        logger.warning(f"fetch_chapter_text {url}: {e}")
-        return f"[Ошибка загрузки: {e}]"
-    finally:
-        await page.close()
+
+async def fetch_chapter_text(url: str) -> str:
+    """Загружает текст конкретной главы."""
+    html = await fetch_html(url)
+    if not html:
+        return "[Текст не найден]"
+    soup = BeautifulSoup(html, 'html.parser')
+    content_div = soup.find('div', class_='text', id='arrticle')
+    if not content_div:
+        return "[Текст не найден]"
+    paragraphs = content_div.find_all('p')
+    text = '\n\n'.join(p.get_text().strip() for p in paragraphs if p.get_text().strip())
+    return text if text else "[Текст не найден]"
 
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
@@ -227,28 +262,53 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
     """
-    Бинарный поиск главы по номеру на страницах пагинации.
+    Ускоренный поиск главы с математическим расчётом страницы и кэшированием.
     """
+    # Получаем самую новую главу
+    first_chapter = await get_first_chapter()
+    if not first_chapter:
+        # Если не смогли получить, используем бинарный поиск
+        logger.warning("Не удалось получить первую главу, переключаюсь на бинарный поиск")
+        return await find_chapter_by_number_binary(chapter_number)
+
+    # Вычисляем предполагаемую страницу
+    page_estimate = 1 + (first_chapter - chapter_number) // CHAPTERS_PER_PAGE
+    if page_estimate < 1:
+        page_estimate = 1
+    if page_estimate > MAX_PAGES:
+        page_estimate = MAX_PAGES
+
+    # Загружаем предполагаемую страницу
+    url = get_page_url(page_estimate)
+    html = await fetch_html_cached(url, page_estimate)
+    if html:
+        chapters = parse_chapters(html)
+        for ch in chapters:
+            if int(ch['id']) == chapter_number:
+                logger.info(f"Глава {chapter_number} найдена на странице {page_estimate}")
+                return ch
+
+    # Если не нашли, запускаем бинарный поиск (на случай несоответствия)
+    logger.info(f"Глава не на странице {page_estimate}, запускаю бинарный поиск")
+    return await find_chapter_by_number_binary(chapter_number)
+
+
+async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
+    """Бинарный поиск (оставлен как fallback)."""
     left, right = 1, MAX_PAGES
     while left <= right:
         mid = (left + right) // 2
         url = get_page_url(mid)
-        logger.info(f"Бинарный поиск: проверяем страницу {mid}")
-        
-        html = await fetch_html(url)
+        html = await fetch_html_cached(url, mid)
         if not html:
-            logger.warning(f"Страница {mid} не загрузилась, сужаем диапазон")
             right = mid - 1
             continue
-            
         chapters = parse_chapters(html)
         if not chapters:
             right = mid - 1
             continue
-
-        first_id = int(chapters[0]['id'])   # самая новая глава на странице
-        last_id = int(chapters[-1]['id'])   # самая старая глава на странице
-
+        first_id = int(chapters[0]['id'])
+        last_id = int(chapters[-1]['id'])
         if chapter_number > first_id:
             right = mid - 1
         elif chapter_number < last_id:
@@ -256,14 +316,9 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
         else:
             for ch in chapters:
                 if int(ch['id']) == chapter_number:
-                    logger.info(f"Глава {chapter_number} найдена на странице {mid}")
                     return ch
-            logger.warning(f"Глава {chapter_number} не найдена на странице {mid}, хотя должна быть в диапазоне")
             return None
-
-        await asyncio.sleep(1)
-
-    logger.warning(f"Глава {chapter_number} не найдена ни на одной странице")
+        await asyncio.sleep(0.5)  # небольшая задержка
     return None
 
 
@@ -538,17 +593,22 @@ async def refresh_status(callback: types.CallbackQuery):
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
 
-    try:
-        if callback.message.text == text:
+    if callback.message.text == text:
+        try:
             await callback.answer("Данные актуальны", show_alert=False)
-        else:
+        except TelegramBadRequest:
+            # Игнорируем ошибку устаревшего callback
+            pass
+    else:
+        try:
             await callback.message.edit_text(text, reply_markup=quick_actions)
             await callback.answer()
-    except TelegramBadRequest as e:
-        if "query is too old" in str(e) or "query ID is invalid" in str(e):
-            logger.warning(f"Callback expired: {e}")
-        else:
-            raise
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e) or "query ID is invalid" in str(e):
+                # Игнорируем устаревший callback
+                pass
+            else:
+                raise
 
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
@@ -613,7 +673,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
 
     # Получаем сохранённый тип выбора
     data = await state.get_data()
-    choice_type = data.get('choice_type', 'translation')  # по умолчанию перевод (для обратной совместимости)
+    choice_type = data.get('choice_type', 'translation')
 
     # Сразу сообщаем о начале поиска (для перевода) или загрузки (для оригинала)
     if choice_type == 'translation':
@@ -931,30 +991,14 @@ async def monitor():
 
 # ======================== LIFECYCLE ========================
 async def on_startup():
-    logger.info("Бот запущен. Инициализация Playwright...")
-    global playwright_instance, browser_context
-    try:
-        playwright_instance = await async_playwright().start()
-        browser = await playwright_instance.chromium.launch(headless=True)
-        browser_context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        )
-        logger.info("Playwright готов")
-    except Exception as e:
-        logger.exception(f"Ошибка инициализации Playwright: {e}")
-        raise
-
+    logger.info("Бот запущен. Инициализация...")
+    # Никакой инициализации Playwright больше не требуется
     asyncio.create_task(monitor())
     logger.info("Мониторинг запущен")
 
 
 async def on_shutdown():
     logger.info("Бот остановлен. Закрытие ресурсов...")
-    global playwright_instance, browser_context
-    if browser_context:
-        await browser_context.close()
-    if playwright_instance:
-        await playwright_instance.stop()
     if redis_client:
         await redis_client.aclose()
 
