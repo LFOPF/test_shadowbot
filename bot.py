@@ -78,7 +78,7 @@ def text_to_html(text: str) -> str:
     return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
 
 
-# ======================== REDIS ========================
+# ======================== REDIS (общие данные) ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
         return await redis_client.get(f"trans_url:{chapter_id}")
@@ -123,6 +123,22 @@ async def save_last_chapter(ch_id: str):
         await redis_client.set("last_chapter", ch_id)
     except Exception as e:
         logger.error(f"save_last_chapter error: {e}")
+
+
+# ======================== REDIS (закладки пользователей) ========================
+async def get_user_bookmark(user_id: int) -> Optional[str]:
+    try:
+        return await redis_client.get(f"bookmark:{user_id}")
+    except Exception as e:
+        logger.error(f"get_user_bookmark error: {e}")
+        return None
+
+
+async def save_user_bookmark(user_id: int, chapter_id: str):
+    try:
+        await redis_client.set(f"bookmark:{user_id}", chapter_id)
+    except Exception as e:
+        logger.error(f"save_user_bookmark error: {e}")
 
 
 # ======================== PLAYWRIGHT ========================
@@ -205,7 +221,7 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
     """Ищет главу по номеру на странице списка и возвращает её данные."""
     try:
         html = await fetch_html(TARGET_URL)
-        chapters = parse_chapters(html)  # все главы
+        chapters = parse_chapters(html)
         for ch in chapters:
             if int(ch['id']) == chapter_number:
                 return ch
@@ -357,9 +373,8 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
 # ======================== КЛАВИАТУРЫ ========================
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📋 Последние 5 глав")],
-        [KeyboardButton(text="📚 Последние 2 (перевод)")],
-        [KeyboardButton(text="🔢 Выбрать главу (оригинал)"), KeyboardButton(text="🔢 Выбрать главу (перевод)")],
+        [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="🔢 Выбрать главу (перевод)")],
+        [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
         [KeyboardButton(text="❌ Отписаться")]
     ],
@@ -422,46 +437,6 @@ async def refresh_status(callback: types.CallbackQuery):
         await callback.answer()
 
 
-async def button_last5(message: types.Message):
-    await message.answer("🔄 Загружаю 5 последних глав...")
-    chs = await get_latest_chapters(5)
-    if not chs:
-        await message.answer("Не удалось найти главы.")
-        return
-    for ch in chs:
-        await message.answer(f"📢 <b>{ch['title']}</b>\n🔗 {ch['link']}", parse_mode="HTML")
-        await asyncio.sleep(0.5)
-
-
-async def button_translate_2(message: types.Message):
-    await message.answer("🔄 Загружаю и перевожу 2 последние главы...")
-    chs = await get_latest_chapters(2)
-    if not chs:
-        await message.answer("Главы не найдены.")
-        return
-    for idx, ch in enumerate(chs, 1):
-        status_msg = await message.answer(f"📥 Глава {idx}/2: проверка...")
-        try:
-            result_text, success = await process_chapter(ch)
-            if success:
-                await status_msg.edit_text("✅ Готово!")
-                await message.answer(result_text, parse_mode="HTML")
-            else:
-                await status_msg.edit_text("❌ Ошибка")
-                await message.answer(result_text, parse_mode="HTML")
-        except Exception as e:
-            logger.exception(f"button_translate_2 {ch['id']}: {e}")
-            await message.answer("❌ Ошибка")
-        finally:
-            await status_msg.delete()
-            await asyncio.sleep(1)
-
-
-async def button_choose_original(message: types.Message, state: FSMContext):
-    await state.set_state(ChapterSelection.waiting_for_original)
-    await message.answer("Введите номер главы (только число):")
-
-
 async def button_choose_translation(message: types.Message, state: FSMContext):
     await state.set_state(ChapterSelection.waiting_for_translation)
     await message.answer("Введите номер главы для перевода (только число):")
@@ -484,10 +459,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    if current_state == ChapterSelection.waiting_for_original.state:
-        # Отправляем ссылку на оригинал
-        await message.answer(f"📢 <b>{chapter['title']}</b>\n🔗 {chapter['link']}", parse_mode="HTML")
-    elif current_state == ChapterSelection.waiting_for_translation.state:
+    if current_state == ChapterSelection.waiting_for_translation.state:
         # Обрабатываем перевод
         status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
         try:
@@ -495,6 +467,8 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             if success:
                 await status_msg.edit_text("✅ Готово!")
                 await message.answer(result_text, parse_mode="HTML")
+                # Сохраняем закладку
+                await save_user_bookmark(message.from_user.id, chapter['id'])
             else:
                 await status_msg.edit_text("❌ Ошибка")
                 await message.answer(result_text, parse_mode="HTML")
@@ -503,17 +477,120 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             await message.answer(f"❌ Ошибка при обработке главы {chapter['title']}")
         finally:
             await status_msg.delete()
+    else:
+        # Если вдруг пришло не в том состоянии
+        await message.answer("Неизвестная команда. Пожалуйста, используйте меню.")
 
     await state.clear()
+
+
+# НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ЗАКЛАДОК
+async def button_bookmark(message: types.Message):
+    uid = message.from_user.id
+    bookmark = await get_user_bookmark(uid)
+    if not bookmark:
+        await message.answer("У вас ещё нет закладки. Выберите главу через кнопку «🔢 Выбрать главу (перевод)».")
+        return
+
+    chapter = await find_chapter_by_number(int(bookmark))
+    if not chapter:
+        await message.answer("Закладка указывает на несуществующую главу. Возможно, она была удалена. Установите новую закладку.")
+        return
+
+    status_msg = await message.answer(f"📥 Загружаю главу {bookmark}...")
+    try:
+        result_text, success = await process_chapter(chapter)
+        if success:
+            await status_msg.edit_text("✅ Готово!")
+            await message.answer(result_text, parse_mode="HTML")
+            # Обновляем закладку (на тот же номер, но можно и не обновлять)
+            await save_user_bookmark(uid, chapter['id'])
+        else:
+            await status_msg.edit_text("❌ Ошибка")
+            await message.answer(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"button_bookmark error: {e}")
+        await message.answer("❌ Ошибка при загрузке главы.")
+    finally:
+        await status_msg.delete()
+
+
+async def button_prev(message: types.Message):
+    uid = message.from_user.id
+    bookmark = await get_user_bookmark(uid)
+    if not bookmark:
+        await message.answer("У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».")
+        return
+
+    current = int(bookmark)
+    prev_num = current - 1
+    if prev_num < 1:
+        await message.answer("Это первая глава. Предыдущей не существует.")
+        return
+
+    chapter = await find_chapter_by_number(prev_num)
+    if not chapter:
+        await message.answer(f"Глава {prev_num} не найдена. Возможно, она ещё не вышла или была пропущена.")
+        return
+
+    status_msg = await message.answer(f"📥 Загружаю предыдущую главу {prev_num}...")
+    try:
+        result_text, success = await process_chapter(chapter)
+        if success:
+            await status_msg.edit_text("✅ Готово!")
+            await message.answer(result_text, parse_mode="HTML")
+            # Обновляем закладку на предыдущую главу
+            await save_user_bookmark(uid, chapter['id'])
+        else:
+            await status_msg.edit_text("❌ Ошибка")
+            await message.answer(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"button_prev error: {e}")
+        await message.answer("❌ Ошибка при загрузке главы.")
+    finally:
+        await status_msg.delete()
+
+
+async def button_next(message: types.Message):
+    uid = message.from_user.id
+    bookmark = await get_user_bookmark(uid)
+    if not bookmark:
+        await message.answer("У вас нет закладки. Сначала выберите главу через кнопку «🔢 Выбрать главу (перевод)».")
+        return
+
+    current = int(bookmark)
+    next_num = current + 1
+
+    chapter = await find_chapter_by_number(next_num)
+    if not chapter:
+        await message.answer(f"Глава {next_num} не найдена. Возможно, она ещё не вышла.")
+        return
+
+    status_msg = await message.answer(f"📥 Загружаю следующую главу {next_num}...")
+    try:
+        result_text, success = await process_chapter(chapter)
+        if success:
+            await status_msg.edit_text("✅ Готово!")
+            await message.answer(result_text, parse_mode="HTML")
+            # Обновляем закладку на следующую главу
+            await save_user_bookmark(uid, chapter['id'])
+        else:
+            await status_msg.edit_text("❌ Ошибка")
+            await message.answer(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"button_next error: {e}")
+        await message.answer("❌ Ошибка при загрузке главы.")
+    finally:
+        await status_msg.delete()
 
 
 async def button_help(message: types.Message):
     await message.answer(
         "🤖 Доступные действия через кнопки:\n"
-        "📋 Последние 5 глав – ссылки на оригинал\n"
-        "📚 Последние 2 (перевод) – перевод на Telegraph\n"
-        "🔢 Выбрать главу (оригинал) – получить ссылку на конкретную главу\n"
-        "🔢 Выбрать главу (перевод) – получить перевод конкретной главы\n"
+        "📌 Моя закладка – показать перевод текущей сохранённой главы\n"
+        "🔢 Выбрать главу (перевод) – ввести номер и получить перевод\n"
+        "⬅️ Предыдущая глава – перевод предыдущей главы (относительно закладки)\n"
+        "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
         "📊 Статус – статистика подписчиков\n"
         "❌ Отписаться – отключить уведомления\n"
         "❓ Помощь – это сообщение",
@@ -614,14 +691,13 @@ async def main():
 
     # Регистрация обработчиков в правильном порядке
     # Сначала состояния
-    dp.message.register(process_chapter_number, ChapterSelection.waiting_for_original)
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_translation)
 
     # Затем кнопки
-    dp.message.register(button_last5, lambda m: m.text == "📋 Последние 5 глав")
-    dp.message.register(button_translate_2, lambda m: m.text == "📚 Последние 2 (перевод)")
-    dp.message.register(button_choose_original, lambda m: m.text == "🔢 Выбрать главу (оригинал)")
+    dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_choose_translation, lambda m: m.text == "🔢 Выбрать главу (перевод)")
+    dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
+    dp.message.register(button_next, lambda m: m.text == "➡️ Следующая глава")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
