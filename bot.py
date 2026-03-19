@@ -110,22 +110,6 @@ async def save_telegraph_url(chapter_id: str, url: str):
         logger.error(f"save_telegraph_url error: {e}")
 
 
-async def get_telegraph_title(path: str) -> Optional[str]:
-    try:
-        value = await redis_client.get(f"telegraph_title:{path}")
-        return value.decode() if value else None
-    except Exception as e:
-        logger.error(f"get_telegraph_title error: {e}")
-        return None
-
-
-async def save_telegraph_title(path: str, title: str):
-    try:
-        await redis_client.set(f"telegraph_title:{path}", title)
-    except Exception as e:
-        logger.error(f"save_telegraph_title error: {e}")
-
-
 async def load_subscribers() -> Set[int]:
     try:
         data = await redis_client.get("subscribers")
@@ -184,9 +168,10 @@ async def get_first_chapter() -> Optional[int]:
     return first
 
 
+# ======================== КЭШ СТРАНИЦ (теперь в хеше) ========================
 async def get_cached_page(page_num: int) -> Optional[str]:
     try:
-        value = await redis_client.get(f"page:{page_num}")
+        value = await redis_client.hget("page_cache", str(page_num))
         return value.decode() if value else None
     except Exception as e:
         logger.error(f"get_cached_page error: {e}")
@@ -195,7 +180,7 @@ async def get_cached_page(page_num: int) -> Optional[str]:
 
 async def save_page_cache(page_num: int, html: str):
     try:
-        await redis_client.set(f"page:{page_num}", html, ex=86400)  # сутки
+        await redis_client.hset("page_cache", str(page_num), html)
     except Exception as e:
         logger.error(f"save_page_cache error: {e}")
 
@@ -227,7 +212,6 @@ async def fetch_html(url: str, retries: int = 2) -> str:
         page = await browser_context.new_page()
         try:
             await page.goto(url, timeout=60000)
-            # Ждём появления хотя бы одной ссылки с "Chapter"
             await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
             return await page.content()
         except Exception as e:
@@ -306,21 +290,17 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
     """
     Ускоренный поиск главы с математическим расчётом страницы и кэшированием.
     """
-    # Получаем самую новую главу
     first_chapter = await get_first_chapter()
     if not first_chapter:
-        # Если не смогли получить, используем бинарный поиск
         logger.warning("Не удалось получить первую главу, переключаюсь на бинарный поиск")
         return await find_chapter_by_number_binary(chapter_number)
 
-    # Вычисляем предполагаемую страницу
     page_estimate = 1 + (first_chapter - chapter_number) // CHAPTERS_PER_PAGE
     if page_estimate < 1:
         page_estimate = 1
     if page_estimate > MAX_PAGES:
         page_estimate = MAX_PAGES
 
-    # Загружаем предполагаемую страницу
     url = get_page_url(page_estimate)
     html = await fetch_html_cached(url, page_estimate)
     if html:
@@ -330,13 +310,11 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
                 logger.info(f"Глава {chapter_number} найдена на странице {page_estimate}")
                 return ch
 
-    # Если не нашли, запускаем бинарный поиск (на случай несоответствия)
     logger.info(f"Глава не на странице {page_estimate}, запускаю бинарный поиск")
     return await find_chapter_by_number_binary(chapter_number)
 
 
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
-    """Бинарный поиск (оставлен как fallback)."""
     left, right = 1, MAX_PAGES
     while left <= right:
         mid = (left + right) // 2
@@ -360,7 +338,7 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
                 if int(ch['id']) == chapter_number:
                     return ch
             return None
-        await asyncio.sleep(0.5)  # небольшая задержка
+        await asyncio.sleep(0.5)
     return None
 
 
@@ -415,99 +393,30 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Не удалось перевести]"
 
 
-# ======================== TELEGRAPH (API) ========================
-async def get_telegraph_page_content(path: str) -> Optional[List[Dict]]:
-    """Возвращает содержимое страницы Telegraph (список узлов)."""
-    url = f"https://api.telegra.ph/getPage/{path}?return_content=true"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    return data["result"]["content"]
-                else:
-                    logger.error(f"Ошибка получения страницы {path}: {data}")
-                    return None
-    except Exception as e:
-        logger.exception(f"Ошибка при запросе к Telegraph API: {e}")
-        return None
-
-
-async def update_telegraph_page(path: str, title: str, content_nodes: List[Dict], author: str = "Shadow Slave Bot") -> bool:
-    """Обновляет существующую страницу Telegraph."""
-    payload = {
-        "access_token": TELEGRAPH_ACCESS_TOKEN,
-        "path": path,
-        "title": title,
-        "author_name": author,
-        "content": content_nodes,
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.telegra.ph/editPage", json=payload, timeout=30) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    logger.info(f"Страница {path} успешно обновлена")
-                    return True
-                else:
-                    logger.error(f"Ошибка обновления страницы {path}: {data}")
-                    return False
-    except Exception as e:
-        logger.exception(f"Ошибка при обновлении страницы Telegraph: {e}")
-        return False
-
-
+# ======================== TELEGRAPH (создание страницы с водяным знаком) ========================
 async def create_telegraph_page(
     title: str,
     content_html: str,
     author: str = "Shadow Slave Bot",
-    prev_chapter_url: Optional[str] = None,
-    next_chapter_url: Optional[str] = None,
-    chapter_number: Optional[str] = None
+    chapter_number: Optional[str] = None,
+    user_id: Optional[int] = None
 ) -> Optional[str]:
     """
-    Создаёт страницу Telegraph с навигационными ссылками.
-
-    Args:
-        title: Название главы (переведённое)
-        content_html: HTML-содержимое главы
-        author: Автор страницы
-        prev_chapter_url: URL предыдущей главы (если есть)
-        next_chapter_url: URL следующей главы (если есть)
-        chapter_number: Номер главы для отображения
-
-    Returns:
-        URL созданной страницы или None
+    Создаёт страницу Telegraph с водяным знаком (user_id в комментарии).
     """
+    # Добавляем номер главы в начале
+    header = f"<p><b>Глава {chapter_number}</b></p>" if chapter_number else ""
 
-    # Создаём навигационную панель в начале
-    nav_html = ""
-    if chapter_number:
-        nav_html += f"<p><b>Глава {chapter_number}</b></p>"
+    # Добавляем водяной знак в виде HTML-комментария
+    watermark = f"<!-- uid:{user_id} -->" if user_id else ""
 
-    nav_links = []
-    if prev_chapter_url:
-        nav_links.append(f'<a href="{prev_chapter_url}">← Предыдущая глава</a>')
-    if next_chapter_url:
-        nav_links.append(f'<a href="{next_chapter_url}">Следующая глава →</a>')
+    full_html = header + content_html + watermark
 
-    if nav_links:
-        separator = " &nbsp;|&nbsp; " if len(nav_links) > 1 else ""
-        nav_html += f'<p style="text-align: center;">{separator.join(nav_links)}</p><hr>'
-
-    # Полный HTML с навигацией в начале и в конце
-    full_html = nav_html + content_html
-    if nav_links:
-        full_html += f'<hr><p style="text-align: center;">{separator.join(nav_links)}</p>'
-
-    # Конвертируем HTML в узлы Telegraph (упрощённо: каждый абзац как отдельный узел)
-    # Telegraph ожидает массив узлов, где каждый узел имеет tag и children
-    # Для простоты разобьём по <p> и <hr>
+    # Конвертируем в узлы Telegraph (упрощённо)
     soup = BeautifulSoup(full_html, 'html.parser')
     nodes = []
     for elem in soup.children:
         if elem.name == 'p':
-            # Обрабатываем возможные ссылки внутри p
             children = []
             for sub in elem.children:
                 if sub.name == 'a':
@@ -521,8 +430,19 @@ async def create_telegraph_page(
                     if text:
                         children.append(text)
             nodes.append({"tag": "p", "children": children})
-        elif elem.name == 'hr':
-            nodes.append({"tag": "hr"})
+        elif isinstance(elem, str) and elem.strip().startswith('<!--'):
+            # Комментарии игнорируются, но мы можем добавить их как текст? Лучше оставить как есть,
+            # но Telegraph может не поддерживать комментарии. Вставим как обычный текст с классом hidden.
+            # Однако для простоты добавим как отдельный параграф с нулевой высотой? Не будем усложнять.
+            # Просто добавим как текст, он будет виден, что плохо. Поэтому используем скрытый span.
+            # Сделаем невидимый span:
+            nodes.append({
+                "tag": "p",
+                "children": [{"tag": "span", "attrs": {"style": "display:none"}, "children": [f"uid:{user_id}"]}]
+            })
+        else:
+            # Остальные теги (hr и т.д.) обрабатывать не будем
+            pass
 
     if not nodes:
         nodes = [{"tag": "p", "children": [full_html]}]
@@ -540,9 +460,7 @@ async def create_telegraph_page(
                 data = await resp.json()
                 if data.get("ok"):
                     url = data["result"]["url"]
-                    path = get_telegraph_path(url)
-                    await save_telegraph_title(path, title)
-                    logger.info(f"Создана страница Telegraph: {url}")
+                    logger.info(f"Создана страница Telegraph: {url} для пользователя {user_id}")
                     return url
                 else:
                     logger.error(f"Telegraph error: {data}")
@@ -553,7 +471,7 @@ async def create_telegraph_page(
 
 
 # ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ (перевод) ========================
-async def process_chapter_translation(ch: Dict[str, str]) -> tuple[str, bool]:
+async def process_chapter_translation(ch: Dict[str, str], user_id: Optional[int] = None) -> tuple[str, bool]:
     """
     Возвращает (текст_сообщения, успех) для переведённой главы.
     """
@@ -567,10 +485,6 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[str, bool]:
         logger.info(f"Глава {cid} найдена в кэше")
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
 
-    # Получаем ссылки на соседние главы из Redis
-    prev_url = await get_cached_telegraph(str(chapter_num - 1)) if chapter_num > 1 else None
-    next_url = await get_cached_telegraph(str(chapter_num + 1))
-
     # Загружаем текст главы
     try:
         text = await fetch_chapter_text(ch['link'])
@@ -578,85 +492,26 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[str, bool]:
         logger.exception(f"Ошибка загрузки главы {cid}")
         return f"❌ Не удалось загрузить главу {title}\n🔗 Оригинал: {ch['link']}", False
 
-    # Переводим текст
+    # Переводим текст и заголовок
     translated = await translate_text(text)
-    # Переводим заголовок
     translated_title = await translate_text(title)
 
-    # Создаём страницу с навигацией (только prev_url, next_url пока может отсутствовать)
+    # Создаём страницу с водяным знаком
     html = text_to_html(translated)
     new_url = await create_telegraph_page(
         title=translated_title,
         content_html=html,
-        prev_chapter_url=prev_url,
-        next_chapter_url=next_url,  # если есть, добавится
-        chapter_number=cid
+        chapter_number=cid,
+        user_id=user_id
     )
 
     if not new_url:
         logger.error(f"Не удалось создать Telegraph для главы {cid}")
         return f"❌ Перевод готов, но не удалось создать страницу.\n🔗 Оригинал: {ch['link']}", False
 
-    # Сохраняем URL новой главы
+    # Сохраняем URL
     await save_telegraph_url(cid, new_url)
-
-    # Если есть предыдущая глава, обновляем её, добавив ссылку на новую
-    if prev_url:
-        await add_next_link_to_prev_page(prev_url, new_url, translated_title)
-
     return f"📖 <b>{title}</b>\n\n🔗 {new_url}", True
-
-
-async def add_next_link_to_prev_page(prev_url: str, next_url: str, next_title: str):
-    """Добавляет в конец страницы prev_url ссылку на next_url, если её там ещё нет."""
-    path = get_telegraph_path(prev_url)
-    content_nodes = await get_telegraph_page_content(path)
-    if not content_nodes:
-        logger.error(f"Не удалось получить содержимое страницы {path} для обновления")
-        return False
-
-    # Получаем заголовок предыдущей страницы
-    title = await get_telegraph_title(path)
-    if not title:
-        # Если не сохранён, пробуем получить из API? Но для простоты используем заглушку
-        title = "Shadow Slave"
-
-    # Проверяем, есть ли уже ссылка на next_url
-    link_exists = False
-    for node in content_nodes:
-        if node.get("tag") == "p":
-            for child in node.get("children", []):
-                if isinstance(child, dict) and child.get("tag") == "a":
-                    if child.get("attrs", {}).get("href") == next_url:
-                        link_exists = True
-                        break
-            if link_exists:
-                break
-
-    if link_exists:
-        logger.info(f"Ссылка на {next_url} уже существует в {path}, пропускаем")
-        return True
-
-    # Создаём новый узел-ссылку
-    new_node = {
-        "tag": "p",
-        "children": [
-            {
-                "tag": "a",
-                "attrs": {"href": next_url},
-                "children": [f"Следующая глава: {next_title} →"]
-            }
-        ]
-    }
-
-    # Добавляем в конец
-    content_nodes.append(new_node)
-
-    # Обновляем страницу
-    success = await update_telegraph_page(path, title, content_nodes)
-    if success:
-        logger.info(f"Страница {path} обновлена, добавлена ссылка на {next_url}")
-    return success
 
 
 # ======================== РАССЫЛКА ========================
@@ -709,7 +564,6 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     )
 
 
-# Клавиатура для выбора типа главы (оригинал/перевод)
 choice_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔗 Оригинал"), KeyboardButton(text="📚 Перевод")],
@@ -720,7 +574,6 @@ choice_keyboard = ReplyKeyboardMarkup(
 )
 
 
-# Клавиатура для отмены во время ввода номера
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
     resize_keyboard=True,
@@ -811,7 +664,6 @@ async def refresh_status(callback: types.CallbackQuery):
         try:
             await callback.answer("Данные актуальны", show_alert=False)
         except TelegramBadRequest:
-            # Игнорируем ошибку устаревшего callback
             pass
     else:
         try:
@@ -819,14 +671,12 @@ async def refresh_status(callback: types.CallbackQuery):
             await callback.answer()
         except TelegramBadRequest as e:
             if "query is too old" in str(e) or "query ID is invalid" in str(e):
-                # Игнорируем устаревший callback
                 pass
             else:
                 raise
 
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
-    """Обработчик кнопки '📖 Выбор главы'."""
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_choice)
     await message.answer(
@@ -836,7 +686,6 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
 
 
 async def process_choice(message: types.Message, state: FSMContext):
-    """Обработка выбора типа главы (оригинал/перевод)."""
     choice = message.text
     if choice == "❌ Отмена":
         await state.clear()
@@ -853,10 +702,7 @@ async def process_choice(message: types.Message, state: FSMContext):
         )
         return
 
-    # Сохраняем тип в данных состояния
     await state.update_data(choice_type='original' if choice == "🔗 Оригинал" else 'translation')
-
-    # Получаем номер последней главы для подсказки
     last_chapter = await get_last_chapter() or "?"
     await state.set_state(ChapterSelection.waiting_for_number)
     await message.answer(
@@ -866,7 +712,6 @@ async def process_choice(message: types.Message, state: FSMContext):
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
-    """Обработка введённого номера главы."""
     if message.text == "❌ Отмена":
         await state.clear()
         await message.answer(
@@ -885,18 +730,15 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     chapter_num = int(message.text)
     uid = message.from_user.id
 
-    # Получаем сохранённый тип выбора
     data = await state.get_data()
     choice_type = data.get('choice_type', 'translation')
 
-    # Сразу сообщаем о начале поиска (для перевода) или загрузки (для оригинала)
     if choice_type == 'translation':
         status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
     else:
         status_msg = await message.answer(f"🔍 Ищу главу {chapter_num}...")
 
     if choice_type == 'translation':
-        # Проверяем кэш
         cached_url = await get_cached_telegraph(str(chapter_num))
         if cached_url:
             await status_msg.delete()
@@ -909,7 +751,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             await state.clear()
             return
 
-    # Ищем главу на сайте
     chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
         await status_msg.delete()
@@ -921,7 +762,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     if choice_type == 'original':
-        # Отправляем ссылку на оригинал и сразу возвращаем основное меню
         await status_msg.delete()
         await message.answer(
             f"📢 <b>{chapter['title']}</b>\n🔗 {chapter['link']}",
@@ -934,7 +774,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     # Перевод
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
     try:
-        result_text, success = await process_chapter_translation(chapter)
+        result_text, success = await process_chapter_translation(chapter, user_id=uid)
         await status_msg.delete()
         await message.answer(
             result_text,
@@ -964,7 +804,6 @@ async def button_bookmark(message: types.Message, state: FSMContext):
         )
         return
 
-    # Проверяем кэш
     cached_url = await get_cached_telegraph(bookmark)
     if cached_url:
         await message.answer(
@@ -975,9 +814,7 @@ async def button_bookmark(message: types.Message, state: FSMContext):
         await save_user_bookmark(uid, bookmark)
         return
 
-    # Сообщаем о поиске
     status_msg = await message.answer(f"🔍 Ищу перевод главы {bookmark}...")
-
     chapter = await find_chapter_by_number(int(bookmark))
     if not chapter:
         await status_msg.delete()
@@ -989,7 +826,7 @@ async def button_bookmark(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {bookmark}...")
     try:
-        result_text, success = await process_chapter_translation(chapter)
+        result_text, success = await process_chapter_translation(chapter, user_id=uid)
         await status_msg.delete()
         await message.answer(
             result_text,
@@ -1026,7 +863,6 @@ async def button_prev(message: types.Message, state: FSMContext):
         )
         return
 
-    # Проверяем кэш
     cached_url = await get_cached_telegraph(str(prev_num))
     if cached_url:
         await message.answer(
@@ -1037,9 +873,7 @@ async def button_prev(message: types.Message, state: FSMContext):
         await save_user_bookmark(uid, str(prev_num))
         return
 
-    # Сообщаем о поиске
     status_msg = await message.answer(f"🔍 Ищу перевод главы {prev_num}...")
-
     chapter = await find_chapter_by_number(prev_num)
     if not chapter:
         await status_msg.delete()
@@ -1051,7 +885,7 @@ async def button_prev(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {prev_num}...")
     try:
-        result_text, success = await process_chapter_translation(chapter)
+        result_text, success = await process_chapter_translation(chapter, user_id=uid)
         await status_msg.delete()
         await message.answer(
             result_text,
@@ -1082,7 +916,6 @@ async def button_next(message: types.Message, state: FSMContext):
     current = int(bookmark)
     next_num = current + 1
 
-    # Проверяем кэш
     cached_url = await get_cached_telegraph(str(next_num))
     if cached_url:
         await message.answer(
@@ -1093,9 +926,7 @@ async def button_next(message: types.Message, state: FSMContext):
         await save_user_bookmark(uid, str(next_num))
         return
 
-    # Сообщаем о поиске
     status_msg = await message.answer(f"🔍 Ищу перевод главы {next_num}...")
-
     chapter = await find_chapter_by_number(next_num)
     if not chapter:
         await status_msg.delete()
@@ -1107,7 +938,7 @@ async def button_next(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {next_num}...")
     try:
-        result_text, success = await process_chapter_translation(chapter)
+        result_text, success = await process_chapter_translation(chapter, user_id=uid)
         await status_msg.delete()
         await message.answer(
             result_text,
@@ -1140,7 +971,6 @@ async def button_help(message: types.Message, state: FSMContext):
     )
 
 
-# Обработчик для любых других текстовых сообщений (не кнопок и не состояний)
 async def handle_other_text(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is not None:
@@ -1157,7 +987,7 @@ async def handle_other_text(message: types.Message, state: FSMContext):
         )
 
 
-# ======================== МОНИТОРИНГ (только первая страница) ========================
+# ======================== МОНИТОРИНГ (автоматический перевод) ========================
 async def monitor():
     logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
     while True:
@@ -1176,7 +1006,8 @@ async def monitor():
                     cid = ch['id']
                     logger.info(f"Автоматическая обработка главы {cid}")
                     try:
-                        result_text, success = await process_chapter_translation(ch)
+                        # При автоматическом переводе не передаём user_id (водяной знак не ставится)
+                        result_text, success = await process_chapter_translation(ch, user_id=None)
                         await notify_all_subscribers(result_text, parse_mode="HTML")
                     except Exception as e:
                         logger.exception(f"Ошибка обработки новой главы {cid}")
@@ -1240,7 +1071,6 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
-    # Регистрация обработчиков
     dp.message.register(process_choice, ChapterSelection.waiting_for_choice)
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_number)
 
