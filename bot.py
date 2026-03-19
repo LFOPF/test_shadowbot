@@ -110,6 +110,24 @@ async def save_telegraph_url(chapter_id: str, url: str):
         logger.error(f"save_telegraph_url error: {e}")
 
 
+async def get_cached_title(chapter_id: str) -> Optional[str]:
+    """Возвращает переведённое название главы из хеша chapter_titles."""
+    try:
+        value = await redis_client.hget("chapter_titles", chapter_id)
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_cached_title error: {e}")
+        return None
+
+
+async def save_cached_title(chapter_id: str, title: str):
+    """Сохраняет переведённое название главы в хеш chapter_titles."""
+    try:
+        await redis_client.hset("chapter_titles", chapter_id, title)
+    except Exception as e:
+        logger.error(f"save_cached_title error: {e}")
+
+
 async def load_subscribers() -> Set[int]:
     try:
         data = await redis_client.get("subscribers")
@@ -483,6 +501,7 @@ async def process_chapter_translation(ch: Dict[str, str], user_id: Optional[int]
     url = await get_cached_telegraph(cid)
     if url:
         logger.info(f"Глава {cid} найдена в кэше")
+        # Можно также получить переведённый заголовок из кэша, но пока используем оригинальный
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
 
     # Загружаем текст главы
@@ -495,6 +514,9 @@ async def process_chapter_translation(ch: Dict[str, str], user_id: Optional[int]
     # Переводим текст и заголовок
     translated = await translate_text(text)
     translated_title = await translate_text(title)
+
+    # Сохраняем переведённый заголовок
+    await save_cached_title(cid, translated_title)
 
     # Создаём страницу с водяным знаком
     html = text_to_html(translated)
@@ -741,6 +763,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     if choice_type == 'translation':
         cached_url = await get_cached_telegraph(str(chapter_num))
         if cached_url:
+            # Можно также получить переведённый заголовок, но для простоты используем оригинальный
             await status_msg.delete()
             await message.answer(
                 f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}",
