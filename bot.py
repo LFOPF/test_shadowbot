@@ -4,6 +4,7 @@ import logging
 import re
 import json
 from typing import Optional, Set, List, Dict, Any
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -86,6 +87,11 @@ def get_page_url(page_num: int) -> str:
     return f"{base}/page/{page_num}/"
 
 
+def get_telegraph_path(url: str) -> str:
+    """Извлекает путь из URL Telegraph (последняя часть)."""
+    return urlparse(url).path.split('/')[-1]
+
+
 # ======================== REDIS (общие данные) с декодированием ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
@@ -102,6 +108,22 @@ async def save_telegraph_url(chapter_id: str, url: str):
         logger.info(f"Сохранён URL для главы {chapter_id}: {url}")
     except Exception as e:
         logger.error(f"save_telegraph_url error: {e}")
+
+
+async def get_telegraph_title(path: str) -> Optional[str]:
+    try:
+        value = await redis_client.get(f"telegraph_title:{path}")
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_telegraph_title error: {e}")
+        return None
+
+
+async def save_telegraph_title(path: str, title: str):
+    try:
+        await redis_client.set(f"telegraph_title:{path}", title)
+    except Exception as e:
+        logger.error(f"save_telegraph_title error: {e}")
 
 
 async def load_subscribers() -> Set[int]:
@@ -147,7 +169,7 @@ async def get_first_chapter() -> Optional[int]:
     except Exception as e:
         logger.error(f"get_first_chapter cached error: {e}")
 
-    # Если нет в кэше, загружаем первую страницу через Playwright
+    # Если нет в кэше, загружаем первую страницу
     html = await fetch_html(TARGET_URL)
     if not html:
         return None
@@ -393,16 +415,117 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Не удалось перевести]"
 
 
-# ======================== TELEGRAPH ========================
-async def create_telegraph_page(title: str, content_html: str, author: str = "Shadow Slave Bot") -> Optional[str]:
-    soup = BeautifulSoup(content_html, 'html.parser')
+# ======================== TELEGRAPH (API) ========================
+async def get_telegraph_page_content(path: str) -> Optional[List[Dict]]:
+    """Возвращает содержимое страницы Telegraph (список узлов)."""
+    url = f"https://api.telegra.ph/getPage/{path}?return_content=true"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=30) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return data["result"]["content"]
+                else:
+                    logger.error(f"Ошибка получения страницы {path}: {data}")
+                    return None
+    except Exception as e:
+        logger.exception(f"Ошибка при запросе к Telegraph API: {e}")
+        return None
+
+
+async def update_telegraph_page(path: str, title: str, content_nodes: List[Dict], author: str = "Shadow Slave Bot") -> bool:
+    """Обновляет существующую страницу Telegraph."""
+    payload = {
+        "access_token": TELEGRAPH_ACCESS_TOKEN,
+        "path": path,
+        "title": title,
+        "author_name": author,
+        "content": content_nodes,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.telegra.ph/editPage", json=payload, timeout=30) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    logger.info(f"Страница {path} успешно обновлена")
+                    return True
+                else:
+                    logger.error(f"Ошибка обновления страницы {path}: {data}")
+                    return False
+    except Exception as e:
+        logger.exception(f"Ошибка при обновлении страницы Telegraph: {e}")
+        return False
+
+
+async def create_telegraph_page(
+    title: str,
+    content_html: str,
+    author: str = "Shadow Slave Bot",
+    prev_chapter_url: Optional[str] = None,
+    next_chapter_url: Optional[str] = None,
+    chapter_number: Optional[str] = None
+) -> Optional[str]:
+    """
+    Создаёт страницу Telegraph с навигационными ссылками.
+
+    Args:
+        title: Название главы (переведённое)
+        content_html: HTML-содержимое главы
+        author: Автор страницы
+        prev_chapter_url: URL предыдущей главы (если есть)
+        next_chapter_url: URL следующей главы (если есть)
+        chapter_number: Номер главы для отображения
+
+    Returns:
+        URL созданной страницы или None
+    """
+
+    # Создаём навигационную панель в начале
+    nav_html = ""
+    if chapter_number:
+        nav_html += f"<p><b>Глава {chapter_number}</b></p>"
+
+    nav_links = []
+    if prev_chapter_url:
+        nav_links.append(f'<a href="{prev_chapter_url}">← Предыдущая глава</a>')
+    if next_chapter_url:
+        nav_links.append(f'<a href="{next_chapter_url}">Следующая глава →</a>')
+
+    if nav_links:
+        separator = " &nbsp;|&nbsp; " if len(nav_links) > 1 else ""
+        nav_html += f'<p style="text-align: center;">{separator.join(nav_links)}</p><hr>'
+
+    # Полный HTML с навигацией в начале и в конце
+    full_html = nav_html + content_html
+    if nav_links:
+        full_html += f'<hr><p style="text-align: center;">{separator.join(nav_links)}</p>'
+
+    # Конвертируем HTML в узлы Telegraph (упрощённо: каждый абзац как отдельный узел)
+    # Telegraph ожидает массив узлов, где каждый узел имеет tag и children
+    # Для простоты разобьём по <p> и <hr>
+    soup = BeautifulSoup(full_html, 'html.parser')
     nodes = []
-    for p in soup.find_all('p'):
-        t = p.get_text().strip()
-        if t:
-            nodes.append({"tag": "p", "children": [t]})
+    for elem in soup.children:
+        if elem.name == 'p':
+            # Обрабатываем возможные ссылки внутри p
+            children = []
+            for sub in elem.children:
+                if sub.name == 'a':
+                    children.append({
+                        "tag": "a",
+                        "attrs": {"href": sub.get('href')},
+                        "children": [sub.get_text()]
+                    })
+                else:
+                    text = sub.string if sub.string else ''
+                    if text:
+                        children.append(text)
+            nodes.append({"tag": "p", "children": children})
+        elif elem.name == 'hr':
+            nodes.append({"tag": "hr"})
+
     if not nodes:
-        nodes = [{"tag": "p", "children": [content_html]}]
+        nodes = [{"tag": "p", "children": [full_html]}]
 
     payload = {
         "access_token": TELEGRAPH_ACCESS_TOKEN,
@@ -410,12 +533,15 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
         "author_name": author,
         "content": nodes,
     }
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post("https://api.telegra.ph/createPage", json=payload, timeout=30) as resp:
                 data = await resp.json()
                 if data.get("ok"):
                     url = data["result"]["url"]
+                    path = get_telegraph_path(url)
+                    await save_telegraph_title(path, title)
                     logger.info(f"Создана страница Telegraph: {url}")
                     return url
                 else:
@@ -433,12 +559,17 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[str, bool]:
     """
     cid = ch['id']
     title = ch['title']
+    chapter_num = int(cid)
 
     # Проверяем кэш Telegraph
     url = await get_cached_telegraph(cid)
     if url:
         logger.info(f"Глава {cid} найдена в кэше")
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
+
+    # Получаем ссылки на соседние главы из Redis
+    prev_url = await get_cached_telegraph(str(chapter_num - 1)) if chapter_num > 1 else None
+    next_url = await get_cached_telegraph(str(chapter_num + 1))
 
     # Загружаем текст главы
     try:
@@ -447,22 +578,85 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[str, bool]:
         logger.exception(f"Ошибка загрузки главы {cid}")
         return f"❌ Не удалось загрузить главу {title}\n🔗 Оригинал: {ch['link']}", False
 
-    # Переводим
+    # Переводим текст
     translated = await translate_text(text)
+    # Переводим заголовок
+    translated_title = await translate_text(title)
 
-    # Создаём страницу Telegraph
-    try:
-        html = text_to_html(translated)
-        new_url = await create_telegraph_page(title, html)
-        if new_url:
-            await save_telegraph_url(cid, new_url)
-            return f"📖 <b>{title}</b>\n\n🔗 {new_url}", True
-        else:
-            logger.error(f"Не удалось создать Telegraph для главы {cid}")
-            return f"❌ Перевод готов, но не удалось создать страницу.\n🔗 Оригинал: {ch['link']}", False
-    except Exception as e:
-        logger.exception(f"Ошибка создания Telegraph для {cid}")
+    # Создаём страницу с навигацией (только prev_url, next_url пока может отсутствовать)
+    html = text_to_html(translated)
+    new_url = await create_telegraph_page(
+        title=translated_title,
+        content_html=html,
+        prev_chapter_url=prev_url,
+        next_chapter_url=next_url,  # если есть, добавится
+        chapter_number=cid
+    )
+
+    if not new_url:
+        logger.error(f"Не удалось создать Telegraph для главы {cid}")
         return f"❌ Перевод готов, но не удалось создать страницу.\n🔗 Оригинал: {ch['link']}", False
+
+    # Сохраняем URL новой главы
+    await save_telegraph_url(cid, new_url)
+
+    # Если есть предыдущая глава, обновляем её, добавив ссылку на новую
+    if prev_url:
+        await add_next_link_to_prev_page(prev_url, new_url, translated_title)
+
+    return f"📖 <b>{title}</b>\n\n🔗 {new_url}", True
+
+
+async def add_next_link_to_prev_page(prev_url: str, next_url: str, next_title: str):
+    """Добавляет в конец страницы prev_url ссылку на next_url, если её там ещё нет."""
+    path = get_telegraph_path(prev_url)
+    content_nodes = await get_telegraph_page_content(path)
+    if not content_nodes:
+        logger.error(f"Не удалось получить содержимое страницы {path} для обновления")
+        return False
+
+    # Получаем заголовок предыдущей страницы
+    title = await get_telegraph_title(path)
+    if not title:
+        # Если не сохранён, пробуем получить из API? Но для простоты используем заглушку
+        title = "Shadow Slave"
+
+    # Проверяем, есть ли уже ссылка на next_url
+    link_exists = False
+    for node in content_nodes:
+        if node.get("tag") == "p":
+            for child in node.get("children", []):
+                if isinstance(child, dict) and child.get("tag") == "a":
+                    if child.get("attrs", {}).get("href") == next_url:
+                        link_exists = True
+                        break
+            if link_exists:
+                break
+
+    if link_exists:
+        logger.info(f"Ссылка на {next_url} уже существует в {path}, пропускаем")
+        return True
+
+    # Создаём новый узел-ссылку
+    new_node = {
+        "tag": "p",
+        "children": [
+            {
+                "tag": "a",
+                "attrs": {"href": next_url},
+                "children": [f"Следующая глава: {next_title} →"]
+            }
+        ]
+    }
+
+    # Добавляем в конец
+    content_nodes.append(new_node)
+
+    # Обновляем страницу
+    success = await update_telegraph_page(path, title, content_nodes)
+    if success:
+        logger.info(f"Страница {path} обновлена, добавлена ссылка на {next_url}")
+    return success
 
 
 # ======================== РАССЫЛКА ========================
