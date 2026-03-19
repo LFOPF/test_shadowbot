@@ -33,6 +33,7 @@ TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 3600  # 1 час
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
+MAX_PAGES = 120  # Максимальное количество страниц для поиска (с сайта)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -200,16 +201,50 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
 
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
-    try:
-        html = await fetch_html(TARGET_URL)
-        chapters = parse_chapters(html)
-        for ch in chapters:
-            if int(ch['id']) == chapter_number:
-                return ch
-        return None
-    except Exception as e:
-        logger.exception(f"find_chapter_by_number error: {e}")
-        return None
+    """
+    Ищет главу по номеру, перебирая страницы пагинации.
+    """
+    page_num = 1
+    while page_num <= MAX_PAGES:
+        # Формируем URL для текущей страницы
+        if page_num == 1:
+            url = TARGET_URL
+        else:
+            base = TARGET_URL.rstrip('/')
+            url = f"{base}/page/{page_num}/"
+
+        logger.info(f"Поиск главы {chapter_number} на странице: {url}")
+        try:
+            html = await fetch_html(url)
+            chapters_on_page = parse_chapters(html)
+
+            # Проверяем, есть ли нужная глава на этой странице
+            for ch in chapters_on_page:
+                if int(ch['id']) == chapter_number:
+                    logger.info(f"Глава {chapter_number} найдена на странице {page_num}")
+                    return ch
+
+            # Если на странице нет ни одной главы (пусто) — дальше страниц нет
+            if not chapters_on_page:
+                logger.info(f"Страница {page_num} пуста. Поиск прекращён.")
+                break
+
+            # Берем последнюю главу на странице (самую старую)
+            last_chapter_on_page = int(chapters_on_page[-1]['id'])
+            if last_chapter_on_page < chapter_number:
+                logger.info(f"На странице {page_num} главы уже меньше {chapter_number}. Поиск прекращён.")
+                break
+
+        except Exception as e:
+            logger.exception(f"Ошибка при парсинге страницы {page_num}: {e}")
+            break
+
+        page_num += 1
+        # Небольшая задержка, чтобы не нагружать сервер
+        await asyncio.sleep(1)
+
+    logger.warning(f"Глава {chapter_number} не найдена ни на одной из проверенных страниц.")
+    return None
 
 
 # ======================== ПЕРЕВОД ========================
@@ -343,7 +378,7 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ======================== КЛАВИАТУРЫ ========================
+# ======================== ДИНАМИЧЕСКОЕ МЕНЮ ========================
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     subs = await load_subscribers()
     is_subscribed = user_id in subs
@@ -461,18 +496,16 @@ async def refresh_status(callback: types.CallbackQuery):
 
 async def button_choose_translation(message: types.Message, state: FSMContext):
     await state.clear()
-    
+
     # Получаем список переведённых глав из хеша telegraph_urls
     try:
-        # Получаем все поля хеша (ключи)
         translated_keys = await redis_client.hkeys("telegraph_urls")
         if translated_keys:
-            # Преобразуем байты в строки, затем в числа
             translated_nums = [int(key.decode()) for key in translated_keys]
             min_chapter = min(translated_nums)
             max_chapter = max(translated_nums)
             total = len(translated_nums)
-            range_text = f"Переведено глав: {total}\nДоступные главы: c {min_chapter} по {max_chapter}."
+            range_text = f"📚 Уже переведено глав: **{total}**\nДоступны для чтения с **{min_chapter}** по **{max_chapter}**."
         else:
             range_text = "⚠️ Пока нет переведённых глав."
     except Exception as e:
@@ -487,7 +520,6 @@ async def button_choose_translation(message: types.Message, state: FSMContext):
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
-    # Проверяем, не нажата ли кнопка отмены
     if message.text == "❌ Отмена":
         await state.clear()
         await message.answer(
@@ -528,7 +560,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     finally:
         await status_msg.delete()
         await state.clear()
-        # Возвращаем обычное меню
         await message.answer(
             "Что дальше?",
             reply_markup=await get_main_menu(message.from_user.id)
@@ -673,8 +704,6 @@ async def button_help(message: types.Message, state: FSMContext):
 
 # Обработчик для любых других текстовых сообщений (не кнопок и не состояний)
 async def handle_other_text(message: types.Message, state: FSMContext):
-    # Если активно состояние, но это не должно происходить, так как в состоянии есть своя клавиатура,
-    # но на всякий случай очистим состояние и предложим меню
     current_state = await state.get_state()
     if current_state is not None:
         await state.clear()
@@ -690,12 +719,13 @@ async def handle_other_text(message: types.Message, state: FSMContext):
         )
 
 
-# ======================== МОНИТОРИНГ ========================
+# ======================== МОНИТОРИНГ (только первая страница) ========================
 async def monitor():
     logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
     while True:
         logger.info("Начало проверки")
         try:
+            # Загружаем только первую страницу
             html = await fetch_html(TARGET_URL)
             chapters = parse_chapters(html)
             last_str = await get_last_chapter()
@@ -799,4 +829,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
