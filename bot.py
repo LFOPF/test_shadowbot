@@ -13,6 +13,8 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 import redis.asyncio as redis
 from playwright.async_api import async_playwright, Playwright, BrowserContext
 from bs4 import BeautifulSoup
@@ -40,6 +42,11 @@ redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
 browser_context: Optional[BrowserContext] = None
+
+# ======================== FSM СОСТОЯНИЯ ========================
+class ChapterSelection(StatesGroup):
+    waiting_for_original = State()      # ожидание номера для оригинала
+    waiting_for_translation = State()    # ожидание номера для перевода
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -194,6 +201,20 @@ async def get_latest_chapters(n: int) -> List[Dict[str, str]]:
         return []
 
 
+async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
+    """Ищет главу по номеру на странице списка и возвращает её данные."""
+    try:
+        html = await fetch_html(TARGET_URL)
+        chapters = parse_chapters(html)  # все главы
+        for ch in chapters:
+            if int(ch['id']) == chapter_number:
+                return ch
+        return None
+    except Exception as e:
+        logger.exception(f"find_chapter_by_number error: {e}")
+        return None
+
+
 # ======================== ПЕРЕВОД ========================
 async def translate_text(text: str, retries: int = 3) -> str:
     if len(text) > 120000:
@@ -338,8 +359,9 @@ main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📋 Последние 5 глав")],
         [KeyboardButton(text="📚 Последние 2 (перевод)")],
+        [KeyboardButton(text="🔢 Выбрать главу (оригинал)"), KeyboardButton(text="🔢 Выбрать главу (перевод)")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
-        [KeyboardButton(text="❌ Отписаться")]  # Добавлена кнопка отписки
+        [KeyboardButton(text="❌ Отписаться")]
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие..."
@@ -354,7 +376,7 @@ quick_actions = InlineKeyboardMarkup(
 )
 
 
-# ======================== ХЕНДЛЕРЫ (только для кнопок и /start) ========================
+# ======================== ХЕНДЛЕРЫ ========================
 async def cmd_start(message: types.Message):
     uid = message.from_user.id
     subs = await load_subscribers()
@@ -393,7 +415,6 @@ async def refresh_status(callback: types.CallbackQuery):
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
     
-    # Проверяем, изменился ли текст
     if callback.message.text == text and callback.message.reply_markup == quick_actions:
         await callback.answer("Данные актуальны", show_alert=False)
     else:
@@ -436,11 +457,63 @@ async def button_translate_2(message: types.Message):
             await asyncio.sleep(1)
 
 
+async def button_choose_original(message: types.Message, state: FSMContext):
+    await state.set_state(ChapterSelection.waiting_for_original)
+    await message.answer("Введите номер главы (только число):")
+
+
+async def button_choose_translation(message: types.Message, state: FSMContext):
+    await state.set_state(ChapterSelection.waiting_for_translation)
+    await message.answer("Введите номер главы для перевода (только число):")
+
+
+async def process_chapter_number(message: types.Message, state: FSMContext):
+    # Проверяем, что сообщение содержит число
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите число. Отмена.")
+        await state.clear()
+        return
+
+    chapter_num = int(message.text)
+    current_state = await state.get_state()
+
+    # Ищем главу
+    chapter = await find_chapter_by_number(chapter_num)
+    if not chapter:
+        await message.answer(f"Глава с номером {chapter_num} не найдена. Попробуйте другой номер или начните заново через меню.")
+        await state.clear()
+        return
+
+    if current_state == ChapterSelection.waiting_for_original.state:
+        # Отправляем ссылку на оригинал
+        await message.answer(f"📢 <b>{chapter['title']}</b>\n🔗 {chapter['link']}", parse_mode="HTML")
+    elif current_state == ChapterSelection.waiting_for_translation.state:
+        # Обрабатываем перевод
+        status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
+        try:
+            result_text, success = await process_chapter(chapter)
+            if success:
+                await status_msg.edit_text("✅ Готово!")
+                await message.answer(result_text, parse_mode="HTML")
+            else:
+                await status_msg.edit_text("❌ Ошибка")
+                await message.answer(result_text, parse_mode="HTML")
+        except Exception as e:
+            logger.exception(f"process_chapter_number translation error: {e}")
+            await message.answer(f"❌ Ошибка при обработке главы {chapter['title']}")
+        finally:
+            await status_msg.delete()
+
+    await state.clear()
+
+
 async def button_help(message: types.Message):
     await message.answer(
         "🤖 Доступные действия через кнопки:\n"
         "📋 Последние 5 глав – ссылки на оригинал\n"
         "📚 Последние 2 (перевод) – перевод на Telegraph\n"
+        "🔢 Выбрать главу (оригинал) – получить ссылку на конкретную главу\n"
+        "🔢 Выбрать главу (перевод) – получить перевод конкретной главы\n"
         "📊 Статус – статистика подписчиков\n"
         "❌ Отписаться – отключить уведомления\n"
         "❓ Помощь – это сообщение",
@@ -448,7 +521,7 @@ async def button_help(message: types.Message):
     )
 
 
-# Обработчик для любых других текстовых сообщений (не кнопок)
+# Обработчик для любых других текстовых сообщений (не кнопок и не состояний)
 async def handle_other_text(message: types.Message):
     await message.answer(
         "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
@@ -539,11 +612,16 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
-    # Регистрируем только /start и обработчики кнопок
-    dp.message.register(cmd_start, Command("start"))
+    # Регистрация обработчиков в правильном порядке
+    # Сначала состояния
+    dp.message.register(process_chapter_number, ChapterSelection.waiting_for_original)
+    dp.message.register(process_chapter_number, ChapterSelection.waiting_for_translation)
 
+    # Затем кнопки
     dp.message.register(button_last5, lambda m: m.text == "📋 Последние 5 глав")
     dp.message.register(button_translate_2, lambda m: m.text == "📚 Последние 2 (перевод)")
+    dp.message.register(button_choose_original, lambda m: m.text == "🔢 Выбрать главу (оригинал)")
+    dp.message.register(button_choose_translation, lambda m: m.text == "🔢 Выбрать главу (перевод)")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
@@ -551,7 +629,11 @@ async def main():
     # Все остальные текстовые сообщения
     dp.message.register(handle_other_text)
 
+    # Callback
     dp.callback_query.register(refresh_status, lambda c: c.data == "refresh_status")
+
+    # Команда /start
+    dp.message.register(cmd_start, Command("start"))
 
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
