@@ -63,8 +63,13 @@ def extract_chapter_id(text: str) -> Optional[str]:
 
 
 def clean_title(raw_title: str) -> str:
-    return re.sub(r'\d+\s*(?:minutes?|hours?|days?)\s*ago$', '', raw_title, flags=re.IGNORECASE).strip()
-
+    # Удаляем в конце строки временные метки типа "X minutes/hours/days/weeks/months/years ago"
+    return re.sub(
+        r'\s*\d+\s*(?:minute|hour|day|week|month|year)s?\s+ago$',
+        '',
+        raw_title,
+        flags=re.IGNORECASE
+    ).strip()
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
