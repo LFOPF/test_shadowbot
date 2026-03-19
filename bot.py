@@ -533,11 +533,17 @@ async def refresh_status(callback: types.CallbackQuery):
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
 
-    if callback.message.text == text:
-        await callback.answer("Данные актуальны", show_alert=False)
-    else:
-        await callback.message.edit_text(text, reply_markup=quick_actions)
-        await callback.answer()
+    try:
+        if callback.message.text == text:
+            await callback.answer("Данные актуальны", show_alert=False)
+        else:
+            await callback.message.edit_text(text, reply_markup=quick_actions)
+            await callback.answer()
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e) or "query ID is invalid" in str(e):
+            logger.warning(f"Callback expired: {e}")
+        else:
+            raise
 
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
