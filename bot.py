@@ -472,7 +472,7 @@ async def button_choose_translation(message: types.Message, state: FSMContext):
             min_chapter = min(translated_nums)
             max_chapter = max(translated_nums)
             total = len(translated_nums)
-            range_text = f"Переведено глав: {total}\nДоступные главы {min_chapter} — {max_chapter}."
+            range_text = f"Переведено глав: {total}\nДоступные главы: c {min_chapter} по {max_chapter}."
         else:
             range_text = "⚠️ Пока нет переведённых глав."
     except Exception as e:
