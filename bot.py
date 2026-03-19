@@ -16,8 +16,9 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import redis.asyncio as redis
-import aiohttp
+from playwright.async_api import async_playwright, Playwright, BrowserContext
 from bs4 import BeautifulSoup
+import aiohttp
 
 # ======================== НАСТРОЙКИ ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -41,6 +42,8 @@ logger = logging.getLogger(__name__)
 # ======================== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ========================
 redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
+playwright_instance: Optional[Playwright] = None
+browser_context: Optional[BrowserContext] = None
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -144,7 +147,7 @@ async def get_first_chapter() -> Optional[int]:
     except Exception as e:
         logger.error(f"get_first_chapter cached error: {e}")
 
-    # Если нет в кэше, загружаем первую страницу
+    # Если нет в кэше, загружаем первую страницу через Playwright
     html = await fetch_html(TARGET_URL)
     if not html:
         return None
@@ -192,22 +195,26 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
         logger.error(f"save_user_bookmark error: {e}")
 
 
-# ======================== ЗАГРУЗКА СТРАНИЦ (без Playwright) ========================
+# ======================== PLAYWRIGHT (глобальный браузер) ========================
 async def fetch_html(url: str, retries: int = 2) -> str:
-    """Загружает HTML страницы с повторными попытками при ошибке."""
+    """Загружает HTML страницы через Playwright с повторными попытками."""
+    if not playwright_instance or not browser_context:
+        raise RuntimeError("Playwright не инициализирован")
+
     for attempt in range(retries):
+        page = await browser_context.new_page()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=30) as resp:
-                    if resp.status == 200:
-                        return await resp.text()
-                    else:
-                        logger.warning(f"HTTP {resp.status} при загрузке {url}")
-        except asyncio.TimeoutError:
-            logger.warning(f"Таймаут при загрузке {url} (попытка {attempt+1})")
+            await page.goto(url, timeout=60000)
+            # Ждём появления хотя бы одной ссылки с "Chapter"
+            await page.wait_for_selector('a:has-text("Chapter")', timeout=20000)
+            return await page.content()
         except Exception as e:
-            logger.warning(f"Ошибка при загрузке {url} (попытка {attempt+1}): {e}")
-        await asyncio.sleep(2 ** attempt)
+            logger.warning(f"fetch_html error on {url} (попытка {attempt+1}): {e}")
+            if attempt == retries - 1:
+                return ""
+            await asyncio.sleep(2 ** attempt)
+        finally:
+            await page.close()
     return ""
 
 
@@ -223,17 +230,30 @@ async def fetch_html_cached(url: str, page_num: int) -> str:
 
 
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст конкретной главы."""
-    html = await fetch_html(url)
-    if not html:
-        return "[Текст не найден]"
-    soup = BeautifulSoup(html, 'html.parser')
-    content_div = soup.find('div', class_='text', id='arrticle')
-    if not content_div:
-        return "[Текст не найден]"
-    paragraphs = content_div.find_all('p')
-    text = '\n\n'.join(p.get_text().strip() for p in paragraphs if p.get_text().strip())
-    return text if text else "[Текст не найден]"
+    """Загружает текст конкретной главы через Playwright."""
+    if not playwright_instance or not browser_context:
+        raise RuntimeError("Playwright не инициализирован")
+
+    page = await browser_context.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector('div.text#arrticle', timeout=30000)
+        paragraphs = await page.evaluate('''() => {
+            const c = document.querySelector('div.text#arrticle');
+            if (!c) return [];
+            return Array.from(c.querySelectorAll('p'))
+                .map(p => p.innerText.trim())
+                .filter(t => t.length > 0);
+        }''')
+        if paragraphs:
+            return '\n\n'.join(paragraphs)
+        content = await page.text_content('div.text#arrticle')
+        return content.strip() if content else "[Текст не найден]"
+    except Exception as e:
+        logger.warning(f"fetch_chapter_text {url}: {e}")
+        return f"[Ошибка загрузки: {e}]"
+    finally:
+        await page.close()
 
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
@@ -991,14 +1011,30 @@ async def monitor():
 
 # ======================== LIFECYCLE ========================
 async def on_startup():
-    logger.info("Бот запущен. Инициализация...")
-    # Никакой инициализации Playwright больше не требуется
+    logger.info("Бот запущен. Инициализация Playwright...")
+    global playwright_instance, browser_context
+    try:
+        playwright_instance = await async_playwright().start()
+        browser = await playwright_instance.chromium.launch(headless=True)
+        browser_context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        logger.info("Playwright готов")
+    except Exception as e:
+        logger.exception(f"Ошибка инициализации Playwright: {e}")
+        raise
+
     asyncio.create_task(monitor())
     logger.info("Мониторинг запущен")
 
 
 async def on_shutdown():
     logger.info("Бот остановлен. Закрытие ресурсов...")
+    global playwright_instance, browser_context
+    if browser_context:
+        await browser_context.close()
+    if playwright_instance:
+        await playwright_instance.stop()
     if redis_client:
         await redis_client.aclose()
 
