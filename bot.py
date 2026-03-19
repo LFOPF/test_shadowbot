@@ -71,7 +71,6 @@ def text_to_html(text: str) -> str:
 
 # ======================== REDIS (общие данные) ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
-    """Возвращает URL страницы Telegraph для главы из хеша."""
     try:
         return await redis_client.hget("telegraph_urls", chapter_id)
     except Exception as e:
@@ -80,7 +79,6 @@ async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
 
 
 async def save_telegraph_url(chapter_id: str, url: str):
-    """Сохраняет URL страницы Telegraph для главы в хеш."""
     try:
         await redis_client.hset("telegraph_urls", chapter_id, url)
     except Exception as e:
@@ -120,7 +118,6 @@ async def save_last_chapter(ch_id: str):
 
 # ======================== REDIS (закладки пользователей) ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
-    """Возвращает номер главы из закладки пользователя (хеш user_bookmarks)."""
     try:
         return await redis_client.hget("user_bookmarks", str(user_id))
     except Exception as e:
@@ -129,7 +126,6 @@ async def get_user_bookmark(user_id: int) -> Optional[str]:
 
 
 async def save_user_bookmark(user_id: int, chapter_id: str):
-    """Сохраняет закладку пользователя в хеш user_bookmarks."""
     try:
         await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
     except Exception as e:
@@ -204,7 +200,6 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
 
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
-    """Ищет главу по номеру на странице списка и возвращает её данные."""
     try:
         html = await fetch_html(TARGET_URL)
         chapters = parse_chapters(html)
@@ -296,29 +291,21 @@ async def create_telegraph_page(title: str, content_html: str, author: str = "Sh
 
 # ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ ========================
 async def process_chapter(ch: Dict[str, str]) -> tuple[str, bool]:
-    """
-    Возвращает (текст_сообщения, успех).
-    Текст сообщения содержит либо ссылку на Telegraph, либо fallback-ссылку на оригинал.
-    """
     cid = ch['id']
     title = ch['title']
 
-    # 1. Проверяем кэш Telegraph
     url = await get_cached_telegraph(cid)
     if url:
         return f"📖 <b>{title}</b>\n\n🔗 {url}", True
 
-    # 2. Загружаем текст главы
     try:
         text = await fetch_chapter_text(ch['link'])
     except Exception as e:
         logger.exception(f"Ошибка загрузки главы {cid}")
         return f"❌ Не удалось загрузить главу {title}\n🔗 Оригинал: {ch['link']}", False
 
-    # 3. Переводим
     translated = await translate_text(text)
 
-    # 4. Создаём страницу Telegraph
     try:
         html = text_to_html(translated)
         new_url = await create_telegraph_page(title, html)
@@ -356,20 +343,17 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ======================== ДИНАМИЧЕСКОЕ МЕНЮ ========================
+# ======================== КЛАВИАТУРЫ ========================
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    """Возвращает клавиатуру с учётом подписки пользователя."""
     subs = await load_subscribers()
     is_subscribed = user_id in subs
 
-    # Базовые кнопки, общие для всех
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="🔢 Выбрать главу (перевод)")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
     ]
 
-    # Кнопка подписки/отписки в зависимости от статуса
     if is_subscribed:
         buttons.append([KeyboardButton(text="❌ Отписаться")])
     else:
@@ -382,7 +366,13 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     )
 
 
-# ======================== INLINE КЛАВИАТУРА ДЛЯ СТАТУСА ========================
+cancel_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Отмена")]],
+    resize_keyboard=True,
+    input_field_placeholder="Введите номер главы или нажмите Отмена"
+)
+
+
 quick_actions = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить статус", callback_data="refresh_status")],
@@ -394,7 +384,6 @@ quick_actions = InlineKeyboardMarkup(
 
 # ======================== ХЕНДЛЕРЫ ========================
 async def cmd_start(message: types.Message, state: FSMContext):
-    # Очищаем состояние, если оно было активно
     await state.clear()
     uid = message.from_user.id
     subs = await load_subscribers()
@@ -414,7 +403,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 
 async def button_subscribe(message: types.Message, state: FSMContext):
-    # Выходим из любого активного состояния
     await state.clear()
     uid = message.from_user.id
     subs = await load_subscribers()
@@ -472,20 +460,29 @@ async def refresh_status(callback: types.CallbackQuery):
 
 
 async def button_choose_translation(message: types.Message, state: FSMContext):
-    # Если было активное состояние, очищаем и устанавливаем новое
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_translation)
-    await message.answer("Введите номер главы для перевода (только число):")
+    await message.answer(
+        "Введите номер главы для перевода (только число):",
+        reply_markup=cancel_keyboard
+    )
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
-    # Этот обработчик сработает только при активном состоянии waiting_for_translation
-    if not message.text.isdigit():
+    # Проверяем, не нажата ли кнопка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
         await message.answer(
-            "Пожалуйста, введите число. Если хотите отменить ввод, нажмите любую кнопку меню.",
+            "Ввод отменён.",
             reply_markup=await get_main_menu(message.from_user.id)
         )
-        # Не очищаем состояние, остаёмся в ожидании числа
+        return
+
+    if not message.text.isdigit():
+        await message.answer(
+            "Пожалуйста, введите число. Если хотите отменить ввод, нажмите кнопку «❌ Отмена».",
+            reply_markup=cancel_keyboard
+        )
         return
 
     chapter_num = int(message.text)
@@ -493,9 +490,8 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     if not chapter:
         await message.answer(
             f"Глава с номером {chapter_num} не найдена. Попробуйте другой номер.",
-            reply_markup=await get_main_menu(message.from_user.id)
+            reply_markup=cancel_keyboard
         )
-        await state.clear()
         return
 
     status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
@@ -514,6 +510,11 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     finally:
         await status_msg.delete()
         await state.clear()
+        # Возвращаем обычное меню
+        await message.answer(
+            "Что дальше?",
+            reply_markup=await get_main_menu(message.from_user.id)
+        )
 
 
 async def button_bookmark(message: types.Message, state: FSMContext):
@@ -654,7 +655,8 @@ async def button_help(message: types.Message, state: FSMContext):
 
 # Обработчик для любых других текстовых сообщений (не кнопок и не состояний)
 async def handle_other_text(message: types.Message, state: FSMContext):
-    # Если активно состояние, но сообщение не число и не кнопка, то очищаем состояние и сообщаем об отмене
+    # Если активно состояние, но это не должно происходить, так как в состоянии есть своя клавиатура,
+    # но на всякий случай очистим состояние и предложим меню
     current_state = await state.get_state()
     if current_state is not None:
         await state.clear()
@@ -754,10 +756,8 @@ async def main():
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     # Регистрация обработчиков
-    # Сначала состояние (самый специфичный обработчик)
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_translation)
 
-    # Затем кнопки
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_choose_translation, lambda m: m.text == "🔢 Выбрать главу (перевод)")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
@@ -767,13 +767,10 @@ async def main():
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
 
-    # Все остальные текстовые сообщения (включая отмену состояния)
     dp.message.register(handle_other_text)
 
-    # Callback
     dp.callback_query.register(refresh_status, lambda c: c.data == "refresh_status")
 
-    # Команда /start
     dp.message.register(cmd_start, Command("start"))
 
     dp.startup.register(on_startup)
