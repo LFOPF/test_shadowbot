@@ -118,7 +118,7 @@ async def save_last_chapter(ch_id: str):
         logger.error(f"save_last_chapter error: {e}")
 
 
-# ======================== REDIS (закладки пользователей) — теперь в хеше ========================
+# ======================== REDIS (закладки пользователей) ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
     """Возвращает номер главы из закладки пользователя (хеш user_bookmarks)."""
     try:
@@ -393,7 +393,9 @@ quick_actions = InlineKeyboardMarkup(
 
 
 # ======================== ХЕНДЛЕРЫ ========================
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    # Очищаем состояние, если оно было активно
+    await state.clear()
     uid = message.from_user.id
     subs = await load_subscribers()
     if uid not in subs:
@@ -411,7 +413,9 @@ async def cmd_start(message: types.Message):
         )
 
 
-async def button_subscribe(message: types.Message):
+async def button_subscribe(message: types.Message, state: FSMContext):
+    # Выходим из любого активного состояния
+    await state.clear()
     uid = message.from_user.id
     subs = await load_subscribers()
     if uid in subs:
@@ -428,7 +432,8 @@ async def button_subscribe(message: types.Message):
         )
 
 
-async def button_unsubscribe(message: types.Message):
+async def button_unsubscribe(message: types.Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     subs = await load_subscribers()
     if uid in subs:
@@ -445,7 +450,8 @@ async def button_unsubscribe(message: types.Message):
         )
 
 
-async def button_status(message: types.Message):
+async def button_status(message: types.Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     subs = await load_subscribers()
     last = await get_last_chapter() or "пока нет"
@@ -466,22 +472,23 @@ async def refresh_status(callback: types.CallbackQuery):
 
 
 async def button_choose_translation(message: types.Message, state: FSMContext):
+    # Если было активное состояние, очищаем и устанавливаем новое
+    await state.clear()
     await state.set_state(ChapterSelection.waiting_for_translation)
     await message.answer("Введите номер главы для перевода (только число):")
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
+    # Этот обработчик сработает только при активном состоянии waiting_for_translation
     if not message.text.isdigit():
         await message.answer(
-            "Пожалуйста, введите число. Отмена.",
+            "Пожалуйста, введите число. Если хотите отменить ввод, нажмите любую кнопку меню.",
             reply_markup=await get_main_menu(message.from_user.id)
         )
-        await state.clear()
+        # Не очищаем состояние, остаёмся в ожидании числа
         return
 
     chapter_num = int(message.text)
-    current_state = await state.get_state()
-
     chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
         await message.answer(
@@ -491,32 +498,26 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    if current_state == ChapterSelection.waiting_for_translation.state:
-        status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
-        try:
-            result_text, success = await process_chapter(chapter)
-            if success:
-                await status_msg.edit_text("✅ Готово!")
-                await message.answer(result_text, parse_mode="HTML")
-                await save_user_bookmark(message.from_user.id, chapter['id'])
-            else:
-                await status_msg.edit_text("❌ Ошибка")
-                await message.answer(result_text, parse_mode="HTML")
-        except Exception as e:
-            logger.exception(f"process_chapter_number translation error: {e}")
-            await message.answer(f"❌ Ошибка при обработке главы {chapter['title']}")
-        finally:
-            await status_msg.delete()
-    else:
-        await message.answer(
-            "Неизвестная команда. Пожалуйста, используйте меню.",
-            reply_markup=await get_main_menu(message.from_user.id)
-        )
+    status_msg = await message.answer(f"📥 Загружаю и перевожу главу {chapter_num}...")
+    try:
+        result_text, success = await process_chapter(chapter)
+        if success:
+            await status_msg.edit_text("✅ Готово!")
+            await message.answer(result_text, parse_mode="HTML")
+            await save_user_bookmark(message.from_user.id, chapter['id'])
+        else:
+            await status_msg.edit_text("❌ Ошибка")
+            await message.answer(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"process_chapter_number translation error: {e}")
+        await message.answer(f"❌ Ошибка при обработке главы {chapter['title']}")
+    finally:
+        await status_msg.delete()
+        await state.clear()
 
+
+async def button_bookmark(message: types.Message, state: FSMContext):
     await state.clear()
-
-
-async def button_bookmark(message: types.Message):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
@@ -551,7 +552,8 @@ async def button_bookmark(message: types.Message):
         await status_msg.delete()
 
 
-async def button_prev(message: types.Message):
+async def button_prev(message: types.Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
@@ -595,7 +597,8 @@ async def button_prev(message: types.Message):
         await status_msg.delete()
 
 
-async def button_next(message: types.Message):
+async def button_next(message: types.Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
@@ -633,7 +636,8 @@ async def button_next(message: types.Message):
         await status_msg.delete()
 
 
-async def button_help(message: types.Message):
+async def button_help(message: types.Message, state: FSMContext):
+    await state.clear()
     uid = message.from_user.id
     await message.answer(
         "🤖 Доступные действия через кнопки:\n"
@@ -649,12 +653,21 @@ async def button_help(message: types.Message):
 
 
 # Обработчик для любых других текстовых сообщений (не кнопок и не состояний)
-async def handle_other_text(message: types.Message):
-    uid = message.from_user.id
-    await message.answer(
-        "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
-        reply_markup=await get_main_menu(uid)
-    )
+async def handle_other_text(message: types.Message, state: FSMContext):
+    # Если активно состояние, но сообщение не число и не кнопка, то очищаем состояние и сообщаем об отмене
+    current_state = await state.get_state()
+    if current_state is not None:
+        await state.clear()
+        await message.answer(
+            "Ввод отменён. Используйте кнопки меню.",
+            reply_markup=await get_main_menu(message.from_user.id)
+        )
+    else:
+        uid = message.from_user.id
+        await message.answer(
+            "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
+            reply_markup=await get_main_menu(uid)
+        )
 
 
 # ======================== МОНИТОРИНГ ========================
@@ -741,7 +754,7 @@ async def main():
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     # Регистрация обработчиков
-    # Сначала состояния
+    # Сначала состояние (самый специфичный обработчик)
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_translation)
 
     # Затем кнопки
@@ -754,7 +767,7 @@ async def main():
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
 
-    # Все остальные текстовые сообщения
+    # Все остальные текстовые сообщения (включая отмену состояния)
     dp.message.register(handle_other_text)
 
     # Callback
