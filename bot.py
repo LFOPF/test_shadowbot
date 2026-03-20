@@ -202,7 +202,9 @@ async def is_user_blocked(user_id: int) -> bool:
 async def block_user(user_id: int):
     try:
         await redis_client.sadd(blocked_users_key, str(user_id))
-        logger.info(f"Пользователь {user_id} заблокирован")
+        # Также удаляем из подписчиков
+        await remove_subscriber(user_id)
+        logger.info(f"Пользователь {user_id} заблокирован и удалён из подписчиков")
     except Exception as e:
         logger.error(f"block_user error: {e}")
 
@@ -293,7 +295,12 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
         href = a['href']
         cid = extract_chapter_id(text)
         if cid and cid.isdigit():
+            # Формируем полную ссылку
             link = 'https://ranobes.net' + href if not href.startswith('http') else href
+            # Фильтр: ссылка должна вести на страницу глав нашего произведения
+            if not link.startswith('https://ranobes.net/chapters/1205249/'):
+                logger.debug(f"Пропущена ссылка на чужое произведение: {link}")
+                continue
             chapters.append({
                 'id': cid,
                 'raw_title': text,
@@ -792,7 +799,7 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
     response = ""
     if action == "block":
         await block_user(user_id)
-        response = f"Пользователь {user_id} заблокирован."
+        response = f"Пользователь {user_id} заблокирован и удалён из подписчиков."
     elif action == "unblock":
         await unblock_user(user_id)
         response = f"Пользователь {user_id} разблокирован."
@@ -805,8 +812,8 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
     else:
         response = "Неизвестное действие."
     await state.clear()
+    # Отправляем одно сообщение с результатом и меню (без дубляжа)
     await message.answer(response, reply_markup=admin_status_buttons)
-    await message.answer("Выберите действие:", reply_markup=admin_status_buttons)
 
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
