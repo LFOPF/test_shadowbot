@@ -773,10 +773,12 @@ async def admin_action_start(callback: types.CallbackQuery, state: FSMContext, a
         return
     await state.set_state(AdminActions.waiting_for_user_id)
     await state.update_data(action_type=action)
-    await callback.message.edit_text(
+    # Отправляем сообщение с запросом ID и сохраняем его ID в состоянии
+    msg = await callback.message.edit_text(
         "Введите ID пользователя (число):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
     )
+    await state.update_data(request_msg_id=msg.message_id)
     await callback.answer()
 
 async def admin_block(callback: types.CallbackQuery, state: FSMContext):
@@ -795,6 +797,7 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
     user_id = int(message.text)
     data = await state.get_data()
     action = data.get("action_type")
+    request_msg_id = data.get("request_msg_id")
     response = ""
     if action == "block":
         await block_user(user_id)
@@ -811,6 +814,13 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
     else:
         response = "Неизвестное действие."
     await state.clear()
+    # Удаляем сообщение с запросом ID, если оно сохранено
+    if request_msg_id:
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=request_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение с запросом: {e}")
+    # Отправляем результат
     await message.answer(response, reply_markup=admin_status_buttons)
 
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
