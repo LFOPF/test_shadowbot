@@ -707,8 +707,9 @@ async def admin_force_check(callback: types.CallbackQuery):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     await callback.answer("Запускаю принудительную проверку...", show_alert=False)
-    await callback.message.edit_text("🔄 Запущена принудительная проверка новых глав...", reply_markup=admin_status_buttons)
-    asyncio.create_task(force_monitor_run())
+    msg = await callback.message.edit_text("🔄 Запущена принудительная проверка новых глав...", reply_markup=admin_status_buttons)
+    # Запускаем мониторинг с передачей сообщения для последующего обновления
+    asyncio.create_task(force_monitor_run(msg))
 
 async def admin_show_subscribers(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -1131,12 +1132,14 @@ async def handle_other_text(message: types.Message, state: FSMContext):
             reply_markup=await get_main_menu(uid)
         )
 
-
 # ======================== ПРИНУДИТЕЛЬНЫЙ ЗАПУСК МОНИТОРИНГА ========================
-async def force_monitor_run():
+async def force_monitor_run(msg: types.Message):
     logger.info("Принудительный запуск мониторинга")
-    await monitor(check_once=True)
-
+    try:
+        await monitor(check_once=True)
+        await msg.edit_text("✅ Принудительная проверка завершена.", reply_markup=admin_status_buttons)
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка при проверке: {e}", reply_markup=admin_status_buttons)
 
 # ======================== МОНИТОРИНГ ========================
 async def monitor(check_once=False):
