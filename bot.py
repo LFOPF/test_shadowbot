@@ -5,6 +5,8 @@ import re
 import json
 from typing import Optional, Set, List, Dict, Any
 from urllib.parse import urlparse
+from collections import deque
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -42,10 +44,23 @@ TELEGRAPH_TITLE_MAX_LENGTH = 200
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Простой буфер для логов (последние 100 строк)
+log_buffer = deque(maxlen=100)
+
+class LogHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        log_buffer.append(log_entry)
+
+# Добавляем обработчик логов в корневой логгер
+logging.getLogger().addHandler(LogHandler())
+logging.getLogger().setLevel(logging.INFO)
+
 redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
 browser_context: Optional[BrowserContext] = None
+monitor_task: Optional[asyncio.Task] = None
 
 
 class ChapterSelection(StatesGroup):
@@ -527,12 +542,11 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
-        [KeyboardButton(text="❓ Помощь")],
     ]
-
-    # Кнопка статуса только для администратора
+    row3 = [KeyboardButton(text="❓ Помощь")]
     if is_admin:
-        buttons[2].insert(0, KeyboardButton(text="📊 Статус"))  # добавить статус перед помощью
+        row3.insert(0, KeyboardButton(text="📊 Статус"))
+    buttons.append(row3)
 
     if is_subscribed:
         buttons.append([KeyboardButton(text="❌ Отписаться")])
@@ -553,11 +567,14 @@ cancel_keyboard = ReplyKeyboardMarkup(
 )
 
 
-quick_actions = InlineKeyboardMarkup(
+# Инлайн-кнопки для админ-меню
+admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить статус", callback_data="refresh_status")],
-        [InlineKeyboardButton(text="🔗 Все главы", url="https://ranobes.net/chapters/1205249/")],
-        [InlineKeyboardButton(text="📢 Поделиться", switch_inline_query="Shadow Slave")]
+        [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
+        [InlineKeyboardButton(text="🚀 Принудительная проверка", callback_data="admin_force_check")],
+        [InlineKeyboardButton(text="📋 Список подписчиков", callback_data="admin_subscribers")],
+        [InlineKeyboardButton(text="📜 Последние логи", callback_data="admin_logs")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close")]
     ]
 )
 
@@ -621,42 +638,173 @@ async def button_unsubscribe(message: types.Message, state: FSMContext):
 async def button_status(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    # Дополнительная проверка на случай, если кнопка появилась не у админа (например, через старую версию)
     if ADMIN_ID is None or str(uid) != ADMIN_ID:
         await message.answer("У вас нет доступа к этой функции.")
         return
-    subs = await load_subscribers()
-    last = await get_last_chapter() or "пока нет"
-    text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
-    await message.answer(text, reply_markup=quick_actions)
+    # Показываем инлайн-меню с действиями
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=admin_status_buttons
+    )
 
 
-async def refresh_status(callback: types.CallbackQuery):
-    # Проверяем, что callback от админа
-    user_id = callback.from_user.id
-    if ADMIN_ID is None or str(user_id) != ADMIN_ID:
+# ========== Административные обработчики ==========
+async def admin_clear_cache(callback: types.CallbackQuery):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    try:
+        await redis_client.delete("first_chapter")
+        await callback.answer("Кэш очищен", show_alert=False)
+        await callback.message.edit_text(
+            "✅ Кэш первой главы очищен. При следующем поиске будет загружена актуальная информация.",
+            reply_markup=admin_status_buttons
+        )
+    except Exception as e:
+        logger.exception("Ошибка очистки кэша")
+        await callback.answer("Ошибка при очистке", show_alert=True)
+
+
+async def admin_force_check(callback: types.CallbackQuery):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await callback.answer("Запускаю принудительную проверку...", show_alert=False)
+    await callback.message.edit_text("🔄 Запущена принудительная проверка новых глав...", reply_markup=admin_status_buttons)
+    # Запускаем мониторинг вне расписания
+    asyncio.create_task(force_monitor_run())
+
+
+async def admin_show_subscribers(callback: types.CallbackQuery):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     subs = await load_subscribers()
-    last = await get_last_chapter() or "пока нет"
-    text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
-
-    if callback.message.text == text:
-        try:
-            await callback.answer("Данные актуальны", show_alert=False)
-        except TelegramBadRequest:
-            pass
+    if not subs:
+        text = "Нет подписчиков."
     else:
+        subs_list = list(subs)
+        subs_preview = subs_list[:20]
+        text = f"Всего подписчиков: {len(subs)}\n"
+        text += "Первые 20:\n" + "\n".join(str(uid) for uid in subs_preview)
+        if len(subs_list) > 20:
+            text += "\n..."
+    await callback.message.edit_text(text, reply_markup=admin_status_buttons)
+    await callback.answer()
+
+
+async def admin_show_logs(callback: types.CallbackQuery):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    if not log_buffer:
+        text = "Логи отсутствуют."
+    else:
+        logs = list(log_buffer)[-10:]  # последние 10
+        text = "Последние 10 записей лога:\n" + "\n".join(logs)
+        if len(text) > 4096:
+            text = text[:4093] + "..."
+    await callback.message.edit_text(text, reply_markup=admin_status_buttons)
+    await callback.answer()
+
+
+async def admin_close(callback: types.CallbackQuery):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await callback.message.delete()
+    await callback.answer()
+
+
+async def force_monitor_run():
+    logger.info("Принудительный запуск мониторинга")
+    await monitor(check_once=True)
+
+
+# ======================== МОНИТОРИНГ ========================
+async def monitor(check_once=False):
+    logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
+    while True:
+        logger.info("Начало проверки")
         try:
-            await callback.message.edit_text(text, reply_markup=quick_actions)
-            await callback.answer()
-        except TelegramBadRequest as e:
-            if "query is too old" in str(e) or "query ID is invalid" in str(e):
-                pass
+            html = await fetch_html(TARGET_URL)
+            chapters = parse_chapters(html)
+            last_str = await get_last_chapter()
+            last_int = int(last_str) if last_str and last_str.isdigit() else 0
+
+            new_chapters = [ch for ch in reversed(chapters) if int(ch['id']) > last_int]
+
+            if new_chapters:
+                logger.info(f"Новых глав: {len(new_chapters)}")
+                translated_urls = []
+                failed_chapters = []
+
+                for i, ch in enumerate(new_chapters):
+                    cid = ch['id']
+                    logger.info(f"Автоматическая обработка главы {cid}")
+                    try:
+                        url, success = await process_chapter_translation(ch)
+                        if success and url:
+                            translated_urls.append((cid, url))
+                        else:
+                            failed_chapters.append(cid)
+                    except Exception as e:
+                        logger.exception(f"Ошибка обработки новой главы {cid}")
+                        failed_chapters.append(cid)
+
+                    if i < len(new_chapters) - 1:
+                        await asyncio.sleep(10)
+
+                if ADMIN_ID:
+                    admin_id = int(ADMIN_ID)
+                    if translated_urls:
+                        msg_lines = ["✅ Переведены новые главы:"]
+                        for cid, url in translated_urls:
+                            msg_lines.append(f"• Глава {cid}: {url}")
+                        await bot.send_message(
+                            admin_id,
+                            "\n".join(msg_lines),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True
+                        )
+                    if failed_chapters:
+                        await bot.send_message(
+                            admin_id,
+                            f"❌ Не удалось перевести главы: {', '.join(map(str, failed_chapters))}",
+                            parse_mode="HTML"
+                        )
+
+                max_id = max(int(ch['id']) for ch in new_chapters)
+                await save_last_chapter(str(max_id))
+                logger.info(f"last_chapter обновлён до {max_id}")
+
+                for cid, url in translated_urls:
+                    chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
+                    if chapter_info:
+                        await notify_all_subscribers(
+                            f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}",
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await notify_all_subscribers(
+                            f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}",
+                            parse_mode="HTML"
+                        )
+
             else:
-                raise
+                logger.info("Новых глав нет")
+
+        except Exception as e:
+            logger.exception(f"Критическая ошибка мониторинга: {e}")
+            await asyncio.sleep(60)
+
+        if check_once:
+            break
+        logger.info(f"Проверка завершена. Ожидание {CHECK_INTERVAL} сек")
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
+# ======================== ОСТАЛЬНЫЕ ХЕНДЛЕРЫ ========================
 async def button_choose_chapter(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_chapter)
@@ -925,7 +1073,7 @@ async def button_help(message: types.Message, state: FSMContext):
         "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
     )
     if is_admin:
-        help_text += "📊 Статус – статистика подписчиков (только для администратора)\n"
+        help_text += "📊 Администрирование – дополнительные административные функции\n"
     help_text += "✅ Подписаться / ❌ Отписаться – управление уведомлениями\n"
     help_text += "❓ Помощь – это сообщение"
 
@@ -946,87 +1094,6 @@ async def handle_other_text(message: types.Message, state: FSMContext):
             "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
             reply_markup=await get_main_menu(uid)
         )
-
-
-# ======================== МОНИТОРИНГ ========================
-async def monitor():
-    logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
-    while True:
-        logger.info("Начало проверки")
-        try:
-            html = await fetch_html(TARGET_URL)
-            chapters = parse_chapters(html)
-            last_str = await get_last_chapter()
-            last_int = int(last_str) if last_str and last_str.isdigit() else 0
-
-            new_chapters = [ch for ch in reversed(chapters) if int(ch['id']) > last_int]
-
-            if new_chapters:
-                logger.info(f"Новых глав: {len(new_chapters)}")
-                translated_urls = []
-                failed_chapters = []
-
-                for i, ch in enumerate(new_chapters):
-                    cid = ch['id']
-                    logger.info(f"Автоматическая обработка главы {cid}")
-                    try:
-                        url, success = await process_chapter_translation(ch)
-                        if success and url:
-                            translated_urls.append((cid, url))
-                        else:
-                            failed_chapters.append(cid)
-                    except Exception as e:
-                        logger.exception(f"Ошибка обработки новой главы {cid}")
-                        failed_chapters.append(cid)
-
-                    if i < len(new_chapters) - 1:
-                        await asyncio.sleep(10)
-
-                if ADMIN_ID:
-                    admin_id = int(ADMIN_ID)
-                    if translated_urls:
-                        msg_lines = ["✅ Переведены новые главы:"]
-                        for cid, url in translated_urls:
-                            msg_lines.append(f"• Глава {cid}: {url}")
-                        await bot.send_message(
-                            admin_id,
-                            "\n".join(msg_lines),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True
-                        )
-                    if failed_chapters:
-                        await bot.send_message(
-                            admin_id,
-                            f"❌ Не удалось перевести главы: {', '.join(map(str, failed_chapters))}",
-                            parse_mode="HTML"
-                        )
-
-                max_id = max(int(ch['id']) for ch in new_chapters)
-                await save_last_chapter(str(max_id))
-                logger.info(f"last_chapter обновлён до {max_id}")
-
-                for cid, url in translated_urls:
-                    chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
-                    if chapter_info:
-                        await notify_all_subscribers(
-                            f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}",
-                            parse_mode="HTML"
-                        )
-                    else:
-                        await notify_all_subscribers(
-                            f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}",
-                            parse_mode="HTML"
-                        )
-
-            else:
-                logger.info("Новых глав нет")
-
-        except Exception as e:
-            logger.exception(f"Критическая ошибка мониторинга: {e}")
-            await asyncio.sleep(60)
-
-        logger.info(f"Проверка завершена. Ожидание {CHECK_INTERVAL} сек")
-        await asyncio.sleep(CHECK_INTERVAL)
 
 
 # ======================== LIFECYCLE ========================
@@ -1072,14 +1139,19 @@ async def main():
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
     dp.message.register(button_next, lambda m: m.text == "➡️ Следующая глава")
-    dp.message.register(button_status, lambda m: m.text == "📊 Статус")
+    dp.message.register(button_status, lambda m: m.text == "📊 Администрирование")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
 
     dp.message.register(handle_other_text)
 
-    dp.callback_query.register(refresh_status, lambda c: c.data == "refresh_status")
+    # Админ-колбэки
+    dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
+    dp.callback_query.register(admin_force_check, lambda c: c.data == "admin_force_check")
+    dp.callback_query.register(admin_show_subscribers, lambda c: c.data == "admin_subscribers")
+    dp.callback_query.register(admin_show_logs, lambda c: c.data == "admin_logs")
+    dp.callback_query.register(admin_close, lambda c: c.data == "admin_close")
 
     dp.message.register(cmd_start, Command("start"))
 
