@@ -42,7 +42,6 @@ NOVELS = {
         "chapters_per_page": 25,
         "novel_id_in_url": "1205249",
     }
-    # Добавляй новые романы сюда
 }
 
 CURRENT_NOVEL_ID = "1205249"
@@ -149,6 +148,36 @@ async def check_rate_limit(user_id: int) -> bool:
         return False
     return True
 
+# ======================== НОВАЯ ФУНКЦИЯ: ОСТАВШЕЕСЯ ВРЕМЯ ПРЕМИУМА ========================
+async def get_premium_remaining(user_id: int) -> str:
+    try:
+        value = await redis_client.hget(PREMIUM_KEY, str(user_id))
+        if not value:
+            return "У вас нет активной премиум-подписки.\n\n💎 Нажми «Стать премиум», чтобы оформить."
+
+        expire = float(value.decode())
+        now = time.time()
+
+        if expire <= now:
+            # await redis_client.hdel(PREMIUM_KEY, str(user_id))  # можно раскомментировать для автоочистки
+            return "Премиум истёк.\n\n💎 Оформи новую подписку через кнопку «Стать премиум»."
+
+        remaining = expire - now
+        days = int(remaining // 86400)
+        hours = int((remaining % 86400) // 3600)
+        minutes = int((remaining % 3600) // 60)
+
+        if days >= 1:
+            return f"Твой премиум действителен еще: {days}д и {hours}ч"
+        elif hours >= 1:
+            return f"Твой премиум действителен еще: {hours}ч и {minutes}мин"
+        else:
+            return f"Твой премиум действителен еще: {minutes}мин"
+
+    except Exception as e:
+        logger.error(f"get_premium_remaining error: {e}")
+        return "Ошибка проверки статуса премиум."
+
 # ======================== REDIS ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
@@ -161,7 +190,6 @@ async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
 async def save_telegraph_url(chapter_id: str, url: str):
     try:
         await redis_client.hset("telegraph_urls", chapter_id, url)
-        logger.info(f"Сохранён URL для главы {chapter_id}: {url}")
     except Exception as e:
         logger.error(f"save_telegraph_url error: {e}")
 
@@ -182,11 +210,8 @@ async def save_cached_title(chapter_id: str, title: str):
 async def load_subscribers() -> Set[int]:
     try:
         data = await redis_client.get("subscribers")
-        if data:
-            return set(json.loads(data.decode()))
-        return set()
-    except Exception as e:
-        logger.error(f"load_subscribers error: {e}")
+        return set(json.loads(data.decode())) if data else set()
+    except Exception:
         return set()
 
 async def save_subscribers(subs: Set[int]):
@@ -199,8 +224,7 @@ async def get_last_chapter() -> Optional[str]:
     try:
         value = await redis_client.get("last_chapter")
         return value.decode() if value else None
-    except Exception as e:
-        logger.error(f"get_last_chapter error: {e}")
+    except Exception:
         return None
 
 async def save_last_chapter(ch_id: str):
@@ -229,31 +253,21 @@ blocked_users_key = "blocked_users"
 async def is_user_blocked(user_id: int) -> bool:
     try:
         return await redis_client.sismember(blocked_users_key, str(user_id))
-    except Exception as e:
-        logger.error(f"is_user_blocked error: {e}")
+    except Exception:
         return False
 
 async def block_user(user_id: int):
-    try:
-        await redis_client.sadd(blocked_users_key, str(user_id))
-        await remove_subscriber(user_id)
-        logger.info(f"Пользователь {user_id} заблокирован")
-    except Exception as e:
-        logger.error(f"block_user error: {e}")
+    await redis_client.sadd(blocked_users_key, str(user_id))
+    await remove_subscriber(user_id)
 
 async def unblock_user(user_id: int):
-    try:
-        await redis_client.srem(blocked_users_key, str(user_id))
-        logger.info(f"Пользователь {user_id} разблокирован")
-    except Exception as e:
-        logger.error(f"unblock_user error: {e}")
+    await redis_client.srem(blocked_users_key, str(user_id))
 
 async def remove_subscriber(user_id: int) -> bool:
     subs = await load_subscribers()
     if user_id in subs:
         subs.remove(user_id)
         await save_subscribers(subs)
-        logger.info(f"Пользователь {user_id} удалён из подписчиков")
         return True
     return False
 
@@ -262,15 +276,11 @@ async def get_user_bookmark(user_id: int) -> Optional[str]:
     try:
         value = await redis_client.hget("user_bookmarks", str(user_id))
         return value.decode() if value else None
-    except Exception as e:
-        logger.error(f"get_user_bookmark error: {e}")
+    except Exception:
         return None
 
 async def save_user_bookmark(user_id: int, chapter_id: str):
-    try:
-        await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
-    except Exception as e:
-        logger.error(f"save_user_bookmark error: {e}")
+    await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
 
 # ======================== PLAYWRIGHT ========================
 async def fetch_html(url: str, retries: int = 2) -> str:
@@ -429,14 +439,11 @@ async def translate_text(text: str, retries: int = 3) -> str:
                     elif resp.status == 429:
                         await asyncio.sleep(2 ** attempt)
                     else:
-                        logger.error(f"Перевод {resp.status}: {await resp.text()}")
                         return f"[Ошибка перевода {resp.status}]"
-        except asyncio.TimeoutError:
+        except Exception:
             if attempt == retries - 1:
-                return "[Таймаут]"
+                return "[Не удалось перевести]"
             await asyncio.sleep(2 ** attempt)
-        except Exception as e:
-            logger.exception(f"Исключение перевода: {e}")
     return "[Не удалось перевести]"
 
 # ======================== TELEGRAPH ========================
@@ -455,36 +462,21 @@ async def create_telegraph_page(title: str, content_html: str) -> Optional[str]:
                 async with session.post("https://api.telegra.ph/createPage", json=payload, timeout=30) as resp:
                     data = await resp.json()
                     if data.get("ok"):
-                        url = data["result"]["url"]
-                        logger.info(f"Создана страница Telegraph: {url}")
-                        return url
-                    else:
-                        error = data.get('error')
-                        if error == 'TITLE_TOO_LONG' and attempt == 0:
-                            clean_title_text = clean_title_text[:150] + "..."
-                            payload["title"] = clean_title_text
-                            continue
-                        else:
-                            return None
+                        return data["result"]["url"]
+                    if data.get('error') == 'TITLE_TOO_LONG' and attempt == 0:
+                        payload["title"] = clean_title_text[:150] + "..."
+                        continue
         except Exception as e:
-            logger.exception(f"Ошибка при создании страницы Telegraph: {e}")
-            return None
+            logger.exception(f"Telegraph error: {e}")
     return None
 
 # ======================== ОБРАБОТКА ПЕРЕВОДА ГЛАВЫ ========================
 async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
     cid = ch['id']
-    url = await get_cached_telegraph(cid)
-    if url:
-        logger.info(f"Глава {cid} найдена в кэше")
+    if url := await get_cached_telegraph(cid):
         return url, True
 
-    try:
-        text = await fetch_chapter_text(ch['link'])
-    except Exception as e:
-        logger.exception(f"Ошибка загрузки главы {cid}")
-        return None, False
-
+    text = await fetch_chapter_text(ch['link'])
     translated = await translate_text(text)
     translated_title = await translate_text(ch['title'])
     translated_title_clean = clean_title_for_telegraph(translated_title)
@@ -492,70 +484,47 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
     await save_cached_title(cid, translated_title_clean)
 
     html = text_to_html(translated)
-    new_url = await create_telegraph_page(
-        title=translated_title_clean,
-        content_html=html
-    )
+    new_url = await create_telegraph_page(translated_title_clean, html)
 
     if new_url:
         await save_telegraph_url(cid, new_url)
         return new_url, True
-    else:
-        logger.error(f"Не удалось создать Telegraph для главы {cid}")
-        return None, False
+    return None, False
 
 # ======================== РАССЫЛКА ========================
-async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
+async def notify_all_subscribers(text: str, parse_mode: str = "HTML"):
     subs = await load_subscribers()
-    if not subs:
-        logger.info("Нет подписчиков")
-        return
-
     semaphore = asyncio.Semaphore(10)
 
-    async def send_with_limit(uid):
+    async def send(uid):
         if await is_user_blocked(uid):
             return
         async with semaphore:
             try:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=text,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                    disable_web_page_preview=True
-                )
+                await bot.send_message(uid, text, parse_mode=parse_mode, disable_web_page_preview=True)
             except (TelegramForbiddenError, TelegramBadRequest):
                 await remove_subscriber(uid)
             except Exception as e:
                 logger.error(f"Ошибка отправки {uid}: {e}")
 
-    tasks = [send_with_limit(uid) for uid in subs]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*[send(uid) for uid in subs], return_exceptions=True)
 
 # ======================== КЛАВИАТУРЫ ========================
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     subs = await load_subscribers()
     is_subscribed = user_id in subs
-    is_premium_user = await is_premium(user_id)
     is_admin = ADMIN_ID is not None and str(user_id) == ADMIN_ID
 
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
-        [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
+        [KeyboardButton(text="💎 Мой премиум"), KeyboardButton(text="⬅️ Предыдущая глава")],
+        [KeyboardButton(text="➡️ Следующая глава"), KeyboardButton(text="❓ Помощь")],
     ]
-    row3 = [KeyboardButton(text="❓ Помощь")]
     if is_admin:
-        row3.insert(0, KeyboardButton(text="📊 Статус"))
-    buttons.append(row3)
+        buttons[2].insert(0, KeyboardButton(text="📊 Статус"))
 
-    if is_subscribed:
-        buttons.append([KeyboardButton(text="❌ Отписаться")])
-    else:
-        buttons.append([KeyboardButton(text="✅ Подписаться")])
-
-    if not is_premium_user:
-        buttons.append([KeyboardButton(text="💎 Стать премиум")])
+    buttons.append([KeyboardButton(text="❌ Отписаться" if is_subscribed else "✅ Подписаться")])
+    buttons.append([KeyboardButton(text="💎 Стать премиум")])
 
     return ReplyKeyboardMarkup(
         keyboard=buttons,
@@ -565,8 +534,7 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
-    resize_keyboard=True,
-    input_field_placeholder="Введите номер главы или нажмите Отмена"
+    resize_keyboard=True
 )
 
 admin_status_buttons = InlineKeyboardMarkup(
@@ -595,22 +563,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
-        await message.answer("Вы заблокированы. Обратитесь к администратору.")
+        await message.answer("Вы заблокированы.")
         return
     subs = await load_subscribers()
     if uid not in subs:
         subs.add(uid)
         await save_subscribers(subs)
-        await message.answer(
-            "✅ Подписка оформлена!\n\n"
-            "Используйте кнопки меню для навигации.",
-            reply_markup=await get_main_menu(uid)
-        )
-    else:
-        await message.answer(
-            "Вы уже подписаны!",
-            reply_markup=await get_main_menu(uid)
-        )
+    await message.answer("✅ Добро пожаловать!", reply_markup=await get_main_menu(uid))
+
+async def button_my_premium(message: types.Message):
+    """Новая кнопка для пользователей — показывает оставшееся время премиума"""
+    status_text = await get_premium_remaining(message.from_user.id)
+    await message.answer(status_text, reply_markup=await get_main_menu(message.from_user.id))
 
 async def button_subscribe(message: types.Message, state: FSMContext):
     await state.clear()
@@ -663,15 +627,14 @@ async def button_status(message: types.Message, state: FSMContext):
         reply_markup=admin_status_buttons
     )
 
-async def button_premium(message: types.Message, state: FSMContext):
-    await state.clear()
+async def button_premium(message: types.Message):
     await message.answer(
         "💎 <b>Премиум-подписка</b>\n\n"
-        "✅ Безлимитные главы\n"
-        "✅ Доступ ко всем романам в будущем\n"
+        "✅ Безлимит глав\n"
+        "✅ Будущие романы\n"
         "✅ Приоритетный перевод\n\n"
-        "👉 <a href='https://boosty.to/your_boosty'>Оплатить на Boosty</a>\n\n"
-        "После оплаты напиши админу — активирую за 1 минуту!",
+        "👉 Оплата: <a href='https://boosty.to/your_boosty'>Boosty</a>\n"
+        "После оплаты напиши админу!",
         parse_mode="HTML",
         reply_markup=await get_main_menu(message.from_user.id)
     )
@@ -1207,7 +1170,7 @@ async def on_shutdown():
 
 # ======================== ЗАПУСК ========================
 async def main():
-    global redis_client, bot
+    global redis_client, bot, PLAYWRIGHT_SEMAPHORE
     redis_client = await redis.from_url(REDIS_URL)
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
@@ -1215,7 +1178,8 @@ async def main():
     # Регистрация всех хендлеров
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
-
+    dp.message.register(button_my_premium, lambda m: m.text == "💎 Мой премиум")
+    dp.message.register(button_premium, lambda m: m.text == "💎 Стать премиум")
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
@@ -1224,7 +1188,6 @@ async def main():
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
-    dp.message.register(button_premium, lambda m: m.text == "💎 Стать премиум")
     dp.message.register(handle_other_text)
     dp.message.register(cmd_start, Command("start"))
 
