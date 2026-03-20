@@ -295,10 +295,11 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
         href = a['href']
         cid = extract_chapter_id(text)
         if cid and cid.isdigit():
-            # Формируем полную ссылку
             link = 'https://ranobes.net' + href if not href.startswith('http') else href
-            # Фильтр: ссылка должна вести на страницу глав нашего произведения
-            if not link.startswith('https://ranobes.net/chapters/1205249/'):
+            # Фильтр: оставляем только ссылки на главы нашего произведения
+            # Проверяем оба возможных варианта URL (с chapter/ или chapters/)
+            if not (link.startswith('https://ranobes.net/chapter/1205249/') or
+                    link.startswith('https://ranobes.net/chapters/1205249/')):
                 logger.debug(f"Пропущена ссылка на чужое произведение: {link}")
                 continue
             chapters.append({
@@ -812,7 +813,6 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
     else:
         response = "Неизвестное действие."
     await state.clear()
-    # Отправляем одно сообщение с результатом и меню (без дубляжа)
     await message.answer(response, reply_markup=admin_status_buttons)
 
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
