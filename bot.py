@@ -392,7 +392,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+        "model": "minimax/minimax-m2.5:free",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
