@@ -65,7 +65,7 @@ class ChapterSelection(StatesGroup):
 
 class AdminActions(StatesGroup):
     waiting_for_user_id = State()
-    action_type = State()  # 'block', 'unblock', 'remove'
+    action_type = State()
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -79,7 +79,6 @@ def extract_chapter_id(text: str) -> Optional[str]:
             return m.group(1)
     return None
 
-
 def clean_title(raw_title: str) -> str:
     return re.sub(
         r'\s*\d+\s*(?:minute|hour|day|week|month|year)s?\s+ago$',
@@ -88,25 +87,21 @@ def clean_title(raw_title: str) -> str:
         flags=re.IGNORECASE
     ).strip()
 
-
 def clean_title_for_telegraph(title: str) -> str:
     title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
     return title
 
-
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
     return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
-
 
 def get_page_url(page_num: int) -> str:
     if page_num == 1:
         return TARGET_URL
     base = TARGET_URL.rstrip('/')
     return f"{base}/page/{page_num}/"
-
 
 def get_telegraph_path(url: str) -> str:
     return urlparse(url).path.split('/')[-1]
@@ -121,14 +116,12 @@ async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
         logger.error(f"get_cached_telegraph error: {e}")
         return None
 
-
 async def save_telegraph_url(chapter_id: str, url: str):
     try:
         await redis_client.hset("telegraph_urls", chapter_id, url)
         logger.info(f"Сохранён URL для главы {chapter_id}: {url}")
     except Exception as e:
         logger.error(f"save_telegraph_url error: {e}")
-
 
 async def get_cached_title(chapter_id: str) -> Optional[str]:
     try:
@@ -138,13 +131,11 @@ async def get_cached_title(chapter_id: str) -> Optional[str]:
         logger.error(f"get_cached_title error: {e}")
         return None
 
-
 async def save_cached_title(chapter_id: str, title: str):
     try:
         await redis_client.hset("chapter_titles", chapter_id, title)
     except Exception as e:
         logger.error(f"save_cached_title error: {e}")
-
 
 async def load_subscribers() -> Set[int]:
     try:
@@ -156,13 +147,11 @@ async def load_subscribers() -> Set[int]:
         logger.error(f"load_subscribers error: {e}")
         return set()
 
-
 async def save_subscribers(subs: Set[int]):
     try:
         await redis_client.set("subscribers", json.dumps(list(subs)))
     except Exception as e:
         logger.error(f"save_subscribers error: {e}")
-
 
 async def get_last_chapter() -> Optional[str]:
     try:
@@ -172,13 +161,11 @@ async def get_last_chapter() -> Optional[str]:
         logger.error(f"get_last_chapter error: {e}")
         return None
 
-
 async def save_last_chapter(ch_id: str):
     try:
         await redis_client.set("last_chapter", ch_id)
     except Exception as e:
         logger.error(f"save_last_chapter error: {e}")
-
 
 async def get_first_chapter() -> Optional[int]:
     try:
@@ -273,7 +260,6 @@ async def fetch_html(url: str, retries: int = 2) -> str:
             await page.close()
     return ""
 
-
 async def fetch_chapter_text(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
@@ -299,7 +285,6 @@ async def fetch_chapter_text(url: str) -> str:
     finally:
         await page.close()
 
-
 def parse_chapters(html: str) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, 'html.parser')
     chapters = []
@@ -322,7 +307,6 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     else:
         logger.error("Не найдено ни одной главы — структура сайта изменилась?")
     return chapters
-
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
     first_chapter = await get_first_chapter()
@@ -347,7 +331,6 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
 
     logger.info(f"Глава не на странице {page_estimate}, запускаю бинарный поиск")
     return await find_chapter_by_number_binary(chapter_number)
-
 
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
     left, right = 1, MAX_PAGES
@@ -391,7 +374,6 @@ USER_PROMPT_TEMPLATE = (
     "Не добавляй ничего от себя, только перевод. "
     "Текст:\n\n{text}"
 )
-
 
 async def translate_text(text: str, retries: int = 3) -> str:
     if len(text) > 120000:
@@ -541,7 +523,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         return None, False
 
 
-# ======================== РАССЫЛКА (с учётом блокировок) ========================
+# ======================== РАССЫЛКА ========================
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
     subs = await load_subscribers()
     if not subs:
@@ -597,15 +579,12 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         input_field_placeholder="Выберите действие..."
     )
 
-
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
     resize_keyboard=True,
     input_field_placeholder="Введите номер главы или нажмите Отмена"
 )
 
-
-# Инлайн-кнопки для админ-меню
 admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
@@ -616,7 +595,6 @@ admin_status_buttons = InlineKeyboardMarkup(
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close")]
     ]
 )
-
 
 admin_user_manage_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -650,8 +628,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             reply_markup=await get_main_menu(uid)
         )
 
-
-async button_subscribe(message: types.Message, state: FSMContext):
+async def button_subscribe(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -671,8 +648,7 @@ async button_subscribe(message: types.Message, state: FSMContext):
             reply_markup=await get_main_menu(uid)
         )
 
-
-async button_unsubscribe(message: types.Message, state: FSMContext):
+async def button_unsubscribe(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -691,7 +667,6 @@ async button_unsubscribe(message: types.Message, state: FSMContext):
             "Вы не были подписаны.",
             reply_markup=await get_main_menu(uid)
         )
-
 
 async def button_status(message: types.Message, state: FSMContext):
     await state.clear()
@@ -721,7 +696,6 @@ async def admin_clear_cache(callback: types.CallbackQuery):
         logger.exception("Ошибка очистки кэша")
         await callback.answer("Ошибка при очистке", show_alert=True)
 
-
 async def admin_force_check(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -729,7 +703,6 @@ async def admin_force_check(callback: types.CallbackQuery):
     await callback.answer("Запускаю принудительную проверку...", show_alert=False)
     await callback.message.edit_text("🔄 Запущена принудительная проверка новых глав...", reply_markup=admin_status_buttons)
     asyncio.create_task(force_monitor_run())
-
 
 async def admin_show_subscribers(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -748,7 +721,6 @@ async def admin_show_subscribers(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=admin_status_buttons)
     await callback.answer()
 
-
 async def admin_show_logs(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -763,7 +735,6 @@ async def admin_show_logs(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=admin_status_buttons)
     await callback.answer()
 
-
 async def admin_user_manage(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -774,14 +745,12 @@ async def admin_user_manage(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-
 async def admin_back_to_main(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     await callback.message.edit_text("Выберите действие:", reply_markup=admin_status_buttons)
     await callback.answer()
-
 
 async def admin_close(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -804,18 +773,14 @@ async def admin_action_start(callback: types.CallbackQuery, state: FSMContext, a
     )
     await callback.answer()
 
-
 async def admin_block(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "block")
-
 
 async def admin_unblock(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "unblock")
 
-
 async def admin_remove_sub(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "remove")
-
 
 async def process_admin_user_id(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
@@ -843,7 +808,6 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
     await message.answer(response, reply_markup=admin_status_buttons)
     await message.answer("Выберите действие:", reply_markup=admin_status_buttons)
 
-
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("Действие отменено.", reply_markup=admin_status_buttons)
@@ -862,7 +826,6 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
         f"Введите номер главы для перевода (от 1 до {last_chapter}):",
         reply_markup=cancel_keyboard
     )
-
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -937,7 +900,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
     finally:
         await state.clear()
 
-
 async def button_bookmark(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -994,7 +956,6 @@ async def button_bookmark(message: types.Message, state: FSMContext):
             "❌ Ошибка при загрузке главы.",
             reply_markup=await get_main_menu(uid)
         )
-
 
 async def button_prev(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -1062,7 +1023,6 @@ async def button_prev(message: types.Message, state: FSMContext):
             reply_markup=await get_main_menu(uid)
         )
 
-
 async def button_next(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -1123,7 +1083,6 @@ async def button_next(message: types.Message, state: FSMContext):
             reply_markup=await get_main_menu(uid)
         )
 
-
 async def button_help(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
@@ -1141,7 +1100,6 @@ async def button_help(message: types.Message, state: FSMContext):
     help_text += "❓ Помощь – это сообщение"
 
     await message.answer(help_text, reply_markup=await get_main_menu(uid))
-
 
 async def handle_other_text(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
@@ -1266,7 +1224,6 @@ async def on_startup():
     asyncio.create_task(monitor())
     logger.info("Мониторинг запущен")
 
-
 async def on_shutdown():
     logger.info("Бот остановлен. Закрытие ресурсов...")
     global playwright_instance, browser_context
@@ -1298,7 +1255,6 @@ async def main():
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
     dp.message.register(handle_other_text)
 
-    # Админ-колбэки
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
     dp.callback_query.register(admin_force_check, lambda c: c.data == "admin_force_check")
     dp.callback_query.register(admin_show_subscribers, lambda c: c.data == "admin_subscribers")
