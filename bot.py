@@ -393,7 +393,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "stepfun/step-3.5-flash:free",
+        "model": "deepseek/deepseek-v3.2",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
