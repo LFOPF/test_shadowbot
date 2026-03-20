@@ -540,12 +540,13 @@ cancel_keyboard = ReplyKeyboardMarkup(
 
 premium_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💎 Стать премиум")],
-        [KeyboardButton(text="💎 Мой премиум")],
+        [KeyboardButton(text="Стать премиум")],
+        [KeyboardButton(text="Мой премиум")],
         [KeyboardButton(text="← Назад в главное меню")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Премиум-раздел"
+)
 
     
 admin_status_buttons = InlineKeyboardMarkup(
