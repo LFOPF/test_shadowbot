@@ -26,33 +26,32 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID администратора (для тестовой рассылки)
+ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID администратора
 
 if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
-CHECK_INTERVAL = 3600  # 1 час
+CHECK_INTERVAL = 3600
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
-MAX_PAGES = 120  # Максимальное количество страниц для поиска (с сайта)
-CHAPTERS_PER_PAGE = 25  # Количество глав на одной странице
-TELEGRAPH_TITLE_MAX_LENGTH = 200  # Безопасный лимит (реальный 256, оставляем запас)
+MAX_PAGES = 120
+CHAPTERS_PER_PAGE = 25
+TELEGRAPH_TITLE_MAX_LENGTH = 200
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ======================== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ========================
 redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
 browser_context: Optional[BrowserContext] = None
 
-# ======================== FSM СОСТОЯНИЯ ========================
-class ChapterSelection(StatesGroup):
-    waiting_for_chapter = State()  # ожидание номера главы для перевода
 
-# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
+class ChapterSelection(StatesGroup):
+    waiting_for_chapter = State()
+
+
 def extract_chapter_id(text: str) -> Optional[str]:
     text = text.strip()
     patterns = [
@@ -66,7 +65,6 @@ def extract_chapter_id(text: str) -> Optional[str]:
 
 
 def clean_title(raw_title: str) -> str:
-    # Удаляем в конце строки временные метки типа "X minutes/hours/days/weeks/months/years ago"
     return re.sub(
         r'\s*\d+\s*(?:minute|hour|day|week|month|year)s?\s+ago$',
         '',
@@ -76,10 +74,7 @@ def clean_title(raw_title: str) -> str:
 
 
 def clean_title_for_telegraph(title: str) -> str:
-    """Очищает заголовок для Telegraph от лишних комментариев и обрезает до безопасной длины."""
-    # Удаляем текст в скобках в конце (часто модели добавляют пояснения)
     title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
-    # Также удаляем текст после двоеточия, если это комментарий? Нет, оставим.
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
     return title
@@ -91,7 +86,6 @@ def text_to_html(text: str) -> str:
 
 
 def get_page_url(page_num: int) -> str:
-    """Возвращает URL страницы с главами по номеру страницы."""
     if page_num == 1:
         return TARGET_URL
     base = TARGET_URL.rstrip('/')
@@ -99,11 +93,10 @@ def get_page_url(page_num: int) -> str:
 
 
 def get_telegraph_path(url: str) -> str:
-    """Извлекает путь из URL Telegraph (последняя часть)."""
     return urlparse(url).path.split('/')[-1]
 
 
-# ======================== REDIS (общие данные) с декодированием ========================
+# ======================== REDIS ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
         value = await redis_client.hget("telegraph_urls", chapter_id)
@@ -193,34 +186,6 @@ async def get_first_chapter() -> Optional[int]:
     return first
 
 
-# ======================== КЭШ СТРАНИЦ (в хеше) ========================
-async def validate_html(html: str) -> bool:
-    """Проверяет, содержит ли HTML хотя бы одну ссылку на главу."""
-    soup = BeautifulSoup(html, 'html.parser')
-    for a in soup.find_all('a', href=True):
-        text = a.get_text(strip=True)
-        if extract_chapter_id(text):
-            return True
-    return False
-
-
-async def get_cached_page(page_num: int) -> Optional[str]:
-    try:
-        value = await redis_client.hget("page_cache", str(page_num))
-        return value.decode() if value else None
-    except Exception as e:
-        logger.error(f"get_cached_page error: {e}")
-        return None
-
-
-async def save_page_cache(page_num: int, html: str):
-    try:
-        await redis_client.hset("page_cache", str(page_num), html)
-    except Exception as e:
-        logger.error(f"save_page_cache error: {e}")
-
-
-# ======================== REDIS (закладки пользователей) ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
     try:
         value = await redis_client.hget("user_bookmarks", str(user_id))
@@ -239,7 +204,6 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 # ======================== PLAYWRIGHT ========================
 async def fetch_html(url: str, retries: int = 2) -> str:
-    """Загружает HTML страницы через Playwright с повторными попытками."""
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
 
@@ -247,9 +211,7 @@ async def fetch_html(url: str, retries: int = 2) -> str:
         page = await browser_context.new_page()
         try:
             await page.goto(url, timeout=60000)
-            # Ждём появления ссылок на главы
             await page.wait_for_selector('a:has-text("Chapter")', timeout=30000)
-            # Дадим дополнительное время на загрузку всех элементов
             await page.wait_for_timeout(2000)
             return await page.content()
         except Exception as e:
@@ -262,25 +224,7 @@ async def fetch_html(url: str, retries: int = 2) -> str:
     return ""
 
 
-async def fetch_html_cached(url: str, page_num: int) -> str:
-    """Загружает страницу с кэшированием, только если HTML содержит главы."""
-    cached = await get_cached_page(page_num)
-    if cached:
-        # Доверяем кэшу, предполагая, что он уже валидный
-        return cached
-
-    html = await fetch_html(url)
-    if html:
-        if await validate_html(html):
-            await save_page_cache(page_num, html)
-            return html
-        else:
-            logger.warning(f"Загруженный HTML для страницы {page_num} не содержит глав, не сохраняем")
-    return ""
-
-
 async def fetch_chapter_text(url: str) -> str:
-    """Загружает текст конкретной главы через Playwright."""
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
 
@@ -343,7 +287,7 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
         page_estimate = MAX_PAGES
 
     url = get_page_url(page_estimate)
-    html = await fetch_html_cached(url, page_estimate)
+    html = await fetch_html(url)
     if html:
         chapters = parse_chapters(html)
         for ch in chapters:
@@ -360,7 +304,7 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
     while left <= right:
         mid = (left + right) // 2
         url = get_page_url(mid)
-        html = await fetch_html_cached(url, mid)
+        html = await fetch_html(url)
         if not html:
             right = mid - 1
             continue
@@ -383,7 +327,7 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
     return None
 
 
-# ======================== ПЕРЕВОД (с улучшенным промтом) ========================
+# ======================== ПЕРЕВОД ========================
 SYSTEM_PROMPT = (
     "Ты профессиональный переводчик художественной литературы. "
     "Переводи точно и сохраняй стиль. "
@@ -452,18 +396,11 @@ async def translate_text(text: str, retries: int = 3) -> str:
 async def create_telegraph_page(
     title: str,
     content_html: str,
-    author: str = "Shadow Slave Bot",
-    chapter_number: Optional[str] = None,
-    user_id: Optional[int] = None
+    author: str = "Shadow Slave Bot"
 ) -> Optional[str]:
-    """
-    Создаёт страницу Telegraph без номера главы и водяного знака.
-    """
     clean_title_text = clean_title_for_telegraph(title)
 
-    full_html = content_html
-
-    soup = BeautifulSoup(full_html, 'html.parser')
+    soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
     for elem in soup.children:
         if elem.name == 'p':
@@ -484,7 +421,7 @@ async def create_telegraph_page(
             pass
 
     if not nodes:
-        nodes = [{"tag": "p", "children": [full_html]}]
+        nodes = [{"tag": "p", "children": [content_html]}]
 
     payload = {
         "access_token": TELEGRAPH_ACCESS_TOKEN,
@@ -518,11 +455,8 @@ async def create_telegraph_page(
     return None
 
 
-# ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ (перевод) ========================
-async def process_chapter_translation(ch: Dict[str, str], user_id: Optional[int] = None) -> tuple[Optional[str], bool]:
-    """
-    Возвращает (URL страницы, успех). Если не удалось создать страницу, URL = None.
-    """
+# ======================== ОБЩАЯ ЛОГИКА ОБРАБОТКИ ГЛАВЫ ========================
+async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
     cid = ch['id']
     title = ch['title']
 
@@ -546,9 +480,7 @@ async def process_chapter_translation(ch: Dict[str, str], user_id: Optional[int]
     html = text_to_html(translated)
     new_url = await create_telegraph_page(
         title=translated_title_clean,
-        content_html=html,
-        chapter_number=cid,
-        user_id=user_id
+        content_html=html
     )
 
     if new_url:
@@ -590,12 +522,17 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     subs = await load_subscribers()
     is_subscribed = user_id in subs
+    is_admin = ADMIN_ID is not None and str(user_id) == ADMIN_ID
 
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
-        [KeyboardButton(text="📊 Статус"), KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="❓ Помощь")],
     ]
+
+    # Кнопка статуса только для администратора
+    if is_admin:
+        buttons[2].insert(0, KeyboardButton(text="📊 Статус"))  # добавить статус перед помощью
 
     if is_subscribed:
         buttons.append([KeyboardButton(text="❌ Отписаться")])
@@ -684,6 +621,10 @@ async def button_unsubscribe(message: types.Message, state: FSMContext):
 async def button_status(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
+    # Дополнительная проверка на случай, если кнопка появилась не у админа (например, через старую версию)
+    if ADMIN_ID is None or str(uid) != ADMIN_ID:
+        await message.answer("У вас нет доступа к этой функции.")
+        return
     subs = await load_subscribers()
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
@@ -691,6 +632,11 @@ async def button_status(message: types.Message, state: FSMContext):
 
 
 async def refresh_status(callback: types.CallbackQuery):
+    # Проверяем, что callback от админа
+    user_id = callback.from_user.id
+    if ADMIN_ID is None or str(user_id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
     subs = await load_subscribers()
     last = await get_last_chapter() or "пока нет"
     text = f"📊 Подписчиков: {len(subs)}\nПоследняя глава: {last}"
@@ -766,7 +712,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
     try:
-        url, success = await process_chapter_translation(chapter, user_id=uid)
+        url, success = await process_chapter_translation(chapter)
         await status_msg.delete()
         if success and url:
             await message.answer(
@@ -823,7 +769,7 @@ async def button_bookmark(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {bookmark}...")
     try:
-        url, success = await process_chapter_translation(chapter, user_id=uid)
+        url, success = await process_chapter_translation(chapter)
         await status_msg.delete()
         if success and url:
             await message.answer(
@@ -887,7 +833,7 @@ async def button_prev(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {prev_num}...")
     try:
-        url, success = await process_chapter_translation(chapter, user_id=uid)
+        url, success = await process_chapter_translation(chapter)
         await status_msg.delete()
         if success and url:
             await message.answer(
@@ -945,7 +891,7 @@ async def button_next(message: types.Message, state: FSMContext):
 
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {next_num}...")
     try:
-        url, success = await process_chapter_translation(chapter, user_id=uid)
+        url, success = await process_chapter_translation(chapter)
         await status_msg.delete()
         if success and url:
             await message.answer(
@@ -970,17 +916,20 @@ async def button_next(message: types.Message, state: FSMContext):
 async def button_help(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    await message.answer(
+    is_admin = ADMIN_ID is not None and str(uid) == ADMIN_ID
+    help_text = (
         "🤖 Доступные действия через кнопки:\n"
         "📌 Моя закладка – показать перевод текущей сохранённой главы\n"
         "📖 Выбор главы – ввести номер главы и получить перевод\n"
         "⬅️ Предыдущая глава – перевод предыдущей главы (относительно закладки)\n"
         "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
-        "📊 Статус – статистика подписчиков\n"
-        "✅ Подписаться / ❌ Отписаться – управление уведомлениями\n"
-        "❓ Помощь – это сообщение",
-        reply_markup=await get_main_menu(uid)
     )
+    if is_admin:
+        help_text += "📊 Статус – статистика подписчиков (только для администратора)\n"
+    help_text += "✅ Подписаться / ❌ Отписаться – управление уведомлениями\n"
+    help_text += "❓ Помощь – это сообщение"
+
+    await message.answer(help_text, reply_markup=await get_main_menu(uid))
 
 
 async def handle_other_text(message: types.Message, state: FSMContext):
@@ -999,7 +948,7 @@ async def handle_other_text(message: types.Message, state: FSMContext):
         )
 
 
-# ======================== МОНИТОРИНГ (с отправкой админу перед рассылкой) ========================
+# ======================== МОНИТОРИНГ ========================
 async def monitor():
     logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
     while True:
@@ -1014,14 +963,14 @@ async def monitor():
 
             if new_chapters:
                 logger.info(f"Новых глав: {len(new_chapters)}")
-                translated_urls = []  # список (номер главы, url) для успешно переведённых
-                failed_chapters = []  # список номеров глав, которые не удалось перевести
+                translated_urls = []
+                failed_chapters = []
 
                 for i, ch in enumerate(new_chapters):
                     cid = ch['id']
                     logger.info(f"Автоматическая обработка главы {cid}")
                     try:
-                        url, success = await process_chapter_translation(ch, user_id=None)
+                        url, success = await process_chapter_translation(ch)
                         if success and url:
                             translated_urls.append((cid, url))
                         else:
@@ -1094,12 +1043,6 @@ async def on_startup():
     except Exception as e:
         logger.exception(f"Ошибка инициализации Playwright: {e}")
         raise
-
-    try:
-        await redis_client.delete("page_cache")
-        logger.info("Кэш страниц очищен при запуске")
-    except:
-        pass
 
     asyncio.create_task(monitor())
     logger.info("Мониторинг запущен")
