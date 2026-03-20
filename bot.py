@@ -79,6 +79,7 @@ def clean_title_for_telegraph(title: str) -> str:
     """Очищает заголовок для Telegraph от лишних комментариев и обрезает до безопасной длины."""
     # Удаляем текст в скобках в конце (часто модели добавляют пояснения)
     title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
+    # Также удаляем текст после двоеточия, если это комментарий? Нет, оставим.
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
     return title
@@ -193,6 +194,16 @@ async def get_first_chapter() -> Optional[int]:
 
 
 # ======================== КЭШ СТРАНИЦ (в хеше) ========================
+async def validate_html(html: str) -> bool:
+    """Проверяет, содержит ли HTML хотя бы одну ссылку на главу."""
+    soup = BeautifulSoup(html, 'html.parser')
+    for a in soup.find_all('a', href=True):
+        text = a.get_text(strip=True)
+        if extract_chapter_id(text):
+            return True
+    return False
+
+
 async def get_cached_page(page_num: int) -> Optional[str]:
     try:
         value = await redis_client.hget("page_cache", str(page_num))
@@ -251,17 +262,6 @@ async def fetch_html(url: str, retries: int = 2) -> str:
     return ""
 
 
-# Добавляем функцию validate_html
-async def validate_html(html: str) -> bool:
-    """Проверяет, содержит ли HTML хотя бы одну ссылку на главу."""
-    soup = BeautifulSoup(html, 'html.parser')
-    for a in soup.find_all('a', href=True):
-        text = a.get_text(strip=True)
-        if extract_chapter_id(text):
-            return True
-    return False
-
-# Исправляем fetch_html_cached
 async def fetch_html_cached(url: str, page_num: int) -> str:
     """Загружает страницу с кэшированием, только если HTML содержит главы."""
     cached = await get_cached_page(page_num)
@@ -383,13 +383,27 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
     return None
 
 
-# ======================== ПЕРЕВОД ========================
+# ======================== ПЕРЕВОД (с улучшенным промтом) ========================
+SYSTEM_PROMPT = (
+    "Ты профессиональный переводчик художественной литературы. "
+    "Переводи точно и сохраняй стиль. "
+    "НЕ ДОБАВЛЯЙ никаких пояснений, примечаний, комментариев в скобках. "
+    "Передавай ТОЛЬКО переведённый текст, без лишних слов."
+)
+
+USER_PROMPT_TEMPLATE = (
+    "Переведи следующий текст на русский язык. "
+    "Сохрани абзацы и форматирование. "
+    "Не добавляй ничего от себя, только перевод. "
+    "Текст:\n\n{text}"
+)
+
+
 async def translate_text(text: str, retries: int = 3) -> str:
     if len(text) > 120000:
         logger.warning("Текст слишком длинный, обрезаем")
         text = text[:120000] + "\n... [обрезано]"
 
-    prompt = f"Переведи следующий текст художественной литературы на русский язык. Сохрани абзацы и форматирование. Текст:\n\n{text}"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": SITE_URL,
@@ -399,8 +413,8 @@ async def translate_text(text: str, retries: int = 3) -> str:
     payload = {
         "model": "stepfun/step-3.5-flash:free",
         "messages": [
-            {"role": "system", "content": "Ты профессиональный переводчик художественной литературы. Переводи точно и сохраняй стиль."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
         "temperature": 0.3,
         "max_tokens": 8000
@@ -1016,14 +1030,11 @@ async def monitor():
                         logger.exception(f"Ошибка обработки новой главы {cid}")
                         failed_chapters.append(cid)
 
-                    # Задержка между главами, чтобы не перегружать API
                     if i < len(new_chapters) - 1:
                         await asyncio.sleep(10)
 
-                # Отправляем администратору результаты перевода
                 if ADMIN_ID:
                     admin_id = int(ADMIN_ID)
-                    # Сообщение об успешно переведённых главах
                     if translated_urls:
                         msg_lines = ["✅ Переведены новые главы:"]
                         for cid, url in translated_urls:
@@ -1034,22 +1045,18 @@ async def monitor():
                             parse_mode="HTML",
                             disable_web_page_preview=True
                         )
-                    # Сообщение о главах, которые не удалось перевести
                     if failed_chapters:
                         await bot.send_message(
                             admin_id,
-                            f"❌ Не удалось перевести главы: {', '.join(failed_chapters)}",
+                            f"❌ Не удалось перевести главы: {', '.join(map(str, failed_chapters))}",
                             parse_mode="HTML"
                         )
 
-                # Обновляем last_chapter (максимальный из всех новых)
                 max_id = max(int(ch['id']) for ch in new_chapters)
                 await save_last_chapter(str(max_id))
                 logger.info(f"last_chapter обновлён до {max_id}")
 
-                # Теперь рассылаем подписчикам только успешно переведённые главы
                 for cid, url in translated_urls:
-                    # Ищем оригинальный заголовок главы (можно взять из chapters по id)
                     chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
                     if chapter_info:
                         await notify_all_subscribers(
@@ -1057,7 +1064,6 @@ async def monitor():
                             parse_mode="HTML"
                         )
                     else:
-                        # На всякий случай, если не нашли
                         await notify_all_subscribers(
                             f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}",
                             parse_mode="HTML"
@@ -1089,7 +1095,6 @@ async def on_startup():
         logger.exception(f"Ошибка инициализации Playwright: {e}")
         raise
 
-    # Очистка повреждённого кэша при запуске (опционально)
     try:
         await redis_client.delete("page_cache")
         logger.info("Кэш страниц очищен при запуске")
