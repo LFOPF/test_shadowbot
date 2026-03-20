@@ -26,6 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
+ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID администратора (для тестовой рассылки)
 
 if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
@@ -250,28 +251,32 @@ async def fetch_html(url: str, retries: int = 2) -> str:
     return ""
 
 
+# Добавляем функцию validate_html
+async def validate_html(html: str) -> bool:
+    """Проверяет, содержит ли HTML хотя бы одну ссылку на главу."""
+    soup = BeautifulSoup(html, 'html.parser')
+    for a in soup.find_all('a', href=True):
+        text = a.get_text(strip=True)
+        if extract_chapter_id(text):
+            return True
+    return False
+
+# Исправляем fetch_html_cached
 async def fetch_html_cached(url: str, page_num: int) -> str:
     """Загружает страницу с кэшированием, только если HTML содержит главы."""
-    # Проверяем кэш
     cached = await get_cached_page(page_num)
     if cached:
-        # Быстрая проверка, что в кэше действительно есть главы
-        if 'Chapter' in cached or 'Глава' in cached:
-            return cached
-        else:
-            logger.warning(f"Кэш страницы {page_num} повреждён, удаляем")
-            await redis_client.hdel("page_cache", str(page_num))
+        # Доверяем кэшу, предполагая, что он уже валидный
+        return cached
 
-    # Загружаем заново
     html = await fetch_html(url)
     if html:
-        # Проверяем, что HTML содержит главы
-        if 'Chapter' in html or 'Глава' in html:
+        if await validate_html(html):
             await save_page_cache(page_num, html)
             return html
         else:
             logger.warning(f"Загруженный HTML для страницы {page_num} не содержит глав, не сохраняем")
-    return html
+    return ""
 
 
 async def fetch_chapter_text(url: str) -> str:
@@ -429,7 +434,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Не удалось перевести]"
 
 
-# ======================== TELEGRAPH (без номера главы и водяного знака) ========================
+# ======================== TELEGRAPH ========================
 async def create_telegraph_page(
     title: str,
     content_html: str,
@@ -442,10 +447,8 @@ async def create_telegraph_page(
     """
     clean_title_text = clean_title_for_telegraph(title)
 
-    # Просто текст, без дополнительных элементов
     full_html = content_html
 
-    # Конвертируем в узлы Telegraph
     soup = BeautifulSoup(full_html, 'html.parser')
     nodes = []
     for elem in soup.children:
@@ -464,7 +467,6 @@ async def create_telegraph_page(
                         children.append(text)
             nodes.append({"tag": "p", "children": children})
         else:
-            # Другие теги игнорируем
             pass
 
     if not nodes:
@@ -510,28 +512,23 @@ async def process_chapter_translation(ch: Dict[str, str], user_id: Optional[int]
     cid = ch['id']
     title = ch['title']
 
-    # Проверяем кэш
     url = await get_cached_telegraph(cid)
     if url:
         logger.info(f"Глава {cid} найдена в кэше")
         return url, True
 
-    # Загружаем текст
     try:
         text = await fetch_chapter_text(ch['link'])
     except Exception as e:
         logger.exception(f"Ошибка загрузки главы {cid}")
         return None, False
 
-    # Переводим
     translated = await translate_text(text)
     translated_title = await translate_text(title)
     translated_title_clean = clean_title_for_telegraph(translated_title)
 
-    # Сохраняем заголовок
     await save_cached_title(cid, translated_title_clean)
 
-    # Создаём страницу
     html = text_to_html(translated)
     new_url = await create_telegraph_page(
         title=translated_title_clean,
@@ -598,7 +595,6 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     )
 
 
-# Клавиатура для отмены во время ввода номера
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
     resize_keyboard=True,
@@ -702,7 +698,6 @@ async def refresh_status(callback: types.CallbackQuery):
 
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
-    """Обработчик кнопки '📖 Выбор главы' — сразу запрашивает номер для перевода."""
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_chapter)
     last_chapter = await get_last_chapter() or "?"
@@ -713,7 +708,6 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
-    """Обработка введённого номера главы для перевода."""
     if message.text == "❌ Отмена":
         await state.clear()
         await message.answer(
@@ -734,7 +728,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
 
     status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
 
-    # Проверяем кэш
     cached_url = await get_cached_telegraph(str(chapter_num))
     if cached_url:
         await status_msg.delete()
@@ -747,7 +740,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Ищем главу на сайте
     chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
         await status_msg.delete()
@@ -758,7 +750,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Переводим
     await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
     try:
         url, success = await process_chapter_translation(chapter, user_id=uid)
@@ -994,7 +985,7 @@ async def handle_other_text(message: types.Message, state: FSMContext):
         )
 
 
-# ======================== МОНИТОРИНГ ========================
+# ======================== МОНИТОРИНГ (с отправкой админу перед рассылкой) ========================
 async def monitor():
     logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
     while True:
@@ -1009,33 +1000,68 @@ async def monitor():
 
             if new_chapters:
                 logger.info(f"Новых глав: {len(new_chapters)}")
+                translated_urls = []  # список (номер главы, url) для успешно переведённых
+                failed_chapters = []  # список номеров глав, которые не удалось перевести
+
                 for i, ch in enumerate(new_chapters):
                     cid = ch['id']
                     logger.info(f"Автоматическая обработка главы {cid}")
                     try:
                         url, success = await process_chapter_translation(ch, user_id=None)
                         if success and url:
-                            await notify_all_subscribers(
-                                f"📢 <b>Новая глава!</b>\n\n📖 <b>{ch['title']}</b>\n\n🔗 {url}",
-                                parse_mode="HTML"
-                            )
+                            translated_urls.append((cid, url))
                         else:
-                            await notify_all_subscribers(
-                                f"📢 <b>Новая глава!</b>\n\n<b>{ch['title']}</b>\n\n❌ Перевод временно недоступен.",
-                                parse_mode="HTML"
-                            )
+                            failed_chapters.append(cid)
                     except Exception as e:
                         logger.exception(f"Ошибка обработки новой главы {cid}")
-                        await notify_all_subscribers(
-                            f"📢 <b>Новая глава!</b>\n\n<b>{ch['title']}</b>\n\n❌ Перевод временно недоступен.",
-                            parse_mode="HTML"
-                        )
+                        failed_chapters.append(cid)
+
+                    # Задержка между главами, чтобы не перегружать API
                     if i < len(new_chapters) - 1:
                         await asyncio.sleep(10)
 
+                # Отправляем администратору результаты перевода
+                if ADMIN_ID:
+                    admin_id = int(ADMIN_ID)
+                    # Сообщение об успешно переведённых главах
+                    if translated_urls:
+                        msg_lines = ["✅ Переведены новые главы:"]
+                        for cid, url in translated_urls:
+                            msg_lines.append(f"• Глава {cid}: {url}")
+                        await bot.send_message(
+                            admin_id,
+                            "\n".join(msg_lines),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True
+                        )
+                    # Сообщение о главах, которые не удалось перевести
+                    if failed_chapters:
+                        await bot.send_message(
+                            admin_id,
+                            f"❌ Не удалось перевести главы: {', '.join(failed_chapters)}",
+                            parse_mode="HTML"
+                        )
+
+                # Обновляем last_chapter (максимальный из всех новых)
                 max_id = max(int(ch['id']) for ch in new_chapters)
                 await save_last_chapter(str(max_id))
                 logger.info(f"last_chapter обновлён до {max_id}")
+
+                # Теперь рассылаем подписчикам только успешно переведённые главы
+                for cid, url in translated_urls:
+                    # Ищем оригинальный заголовок главы (можно взять из chapters по id)
+                    chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
+                    if chapter_info:
+                        await notify_all_subscribers(
+                            f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}",
+                            parse_mode="HTML"
+                        )
+                    else:
+                        # На всякий случай, если не нашли
+                        await notify_all_subscribers(
+                            f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}",
+                            parse_mode="HTML"
+                        )
 
             else:
                 logger.info("Новых глав нет")
