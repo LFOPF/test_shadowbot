@@ -540,8 +540,8 @@ cancel_keyboard = ReplyKeyboardMarkup(
 
 premium_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Стать премиум")],
-        [KeyboardButton(text="Мой премиум")],
+        [KeyboardButton(text="💎 Стать премиум")],
+        [KeyboardButton(text="💎 Мой премиум")],
         [KeyboardButton(text="← Назад в главное меню")],
     ],
     resize_keyboard=True,
