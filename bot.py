@@ -545,7 +545,7 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     ]
     row3 = [KeyboardButton(text="❓ Помощь")]
     if is_admin:
-        row3.insert(0, KeyboardButton(text="📊 Статус"))
+        row3.insert(0, KeyboardButton(text="📊 Администрирование"))
     buttons.append(row3)
 
     if is_subscribed:
