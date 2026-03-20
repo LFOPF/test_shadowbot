@@ -39,6 +39,7 @@ SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
 CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
+NOVEL_ID = "1205249"  # ID нашего романа
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -202,7 +203,6 @@ async def is_user_blocked(user_id: int) -> bool:
 async def block_user(user_id: int):
     try:
         await redis_client.sadd(blocked_users_key, str(user_id))
-        # Также удаляем из подписчиков
         await remove_subscriber(user_id)
         logger.info(f"Пользователь {user_id} заблокирован и удалён из подписчиков")
     except Exception as e:
@@ -296,10 +296,8 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
         cid = extract_chapter_id(text)
         if cid and cid.isdigit():
             link = 'https://ranobes.net' + href if not href.startswith('http') else href
-            # Фильтр: оставляем только ссылки на главы нашего произведения
-            # Проверяем оба возможных варианта URL (с chapter/ или chapters/)
-            if not (link.startswith('https://ranobes.net/chapter/1205249/') or
-                    link.startswith('https://ranobes.net/chapters/1205249/')):
+            # Фильтр: оставляем только ссылки на главы нашего романа (содержат ID 1205249)
+            if NOVEL_ID not in link:
                 logger.debug(f"Пропущена ссылка на чужое произведение: {link}")
                 continue
             chapters.append({
