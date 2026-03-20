@@ -392,12 +392,12 @@ async def translate_text(text: str, retries: int = 3) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "arcee-ai/trinity-large-preview:free",
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
-        "temperature": 0.6,  # Вернули к умеренному значению
+        "temperature": 0.5,  # Вернули к умеренному значению
         "max_tokens": 8000
     }
 
