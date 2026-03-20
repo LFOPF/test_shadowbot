@@ -319,6 +319,7 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
         logger.warning("Не удалось получить первую главу, переключаюсь на бинарный поиск")
         return await find_chapter_by_number_binary(chapter_number)
 
+    # Быстрый математический расчёт страницы
     page_estimate = 1 + (first_chapter - chapter_number) // CHAPTERS_PER_PAGE
     if page_estimate < 1:
         page_estimate = 1
@@ -392,12 +393,12 @@ async def translate_text(text: str, retries: int = 3) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "minimax/minimax-m2.5:free",
+        "model": "stepfun/step-3.5-flash:free",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
-        "temperature": 0.5,  # Вернули к умеренному значению
+        "temperature": 0.5,  # оптимальная температура – не слишком сухо, не слишком хаотично
         "max_tokens": 8000
     }
 
@@ -412,15 +413,16 @@ async def translate_text(text: str, retries: int = 3) -> str:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # Проверяем наличие поля content
-                        content = data.get("choices", [{}])[0].get("message", {}).get("content")
-                        if content is not None:
-                            return content.strip()
-                        else:
-                            logger.error("API вернул пустой ответ")
-                            if attempt == retries - 1:
-                                return "[Не удалось перевести: пустой ответ]"
-                            continue
+                        try:
+                            content = data["choices"][0]["message"]["content"]
+                            if content is not None:
+                                return content.strip()
+                            else:
+                                logger.error("Перевод вернул пустой контент")
+                                return "[Ошибка: пустой ответ]"
+                        except (KeyError, IndexError, AttributeError) as e:
+                            logger.error(f"Ошибка парсинга ответа: {e}")
+                            return "[Ошибка формата ответа]"
                     elif resp.status == 429:
                         logger.warning(f"Rate limit (попытка {attempt+1})")
                         await asyncio.sleep(2 ** attempt)
@@ -447,10 +449,8 @@ async def create_telegraph_page(
 
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
-    # Проходим по всем элементам внутри контейнера
     for elem in soup.children:
         if elem.name == 'p':
-            # Для каждого абзаца создаём узел Telegraph
             children = []
             for sub in elem.children:
                 if sub.name == 'a':
@@ -464,6 +464,9 @@ async def create_telegraph_page(
                     if text:
                         children.append(text)
             nodes.append({"tag": "p", "children": children})
+        else:
+            pass
+
     if not nodes:
         nodes = [{"tag": "p", "children": [content_html]}]
 
@@ -515,9 +518,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         logger.exception(f"Ошибка загрузки главы {cid}")
         return None, False
 
-    # Переводим текст
     translated = await translate_text(text)
-    # Переводим заголовок (отдельный вызов, но с проверками)
     translated_title = await translate_text(title)
     translated_title_clean = clean_title_for_telegraph(translated_title)
 
@@ -576,7 +577,7 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
-        [KeyboardButton(text="🤝 Поддержать")],  # Кнопка поддержки вместо премиум
+        [KeyboardButton(text="🤝 Поддержать")],
     ]
     row3 = [KeyboardButton(text="❓ Помощь")]
     if is_admin:
@@ -645,7 +646,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
 
 async def button_support(message: types.Message, state: FSMContext):
-    """Кнопка поддержки – отправляет ссылку на Boosty без упоминания админа."""
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -1253,7 +1253,6 @@ async def monitor(check_once=False):
                     if i < len(new_chapters) - 1:
                         await asyncio.sleep(10)
 
-                # Отправляем отчёт администратору
                 if ADMIN_ID:
                     admin_id = int(ADMIN_ID)
                     if translated_urls:
@@ -1273,12 +1272,10 @@ async def monitor(check_once=False):
                             parse_mode="HTML"
                         )
 
-                # Обновляем last_chapter (максимальный номер из новых)
                 max_id = max(int(ch['id']) for ch in new_chapters)
                 await save_last_chapter(str(max_id))
                 logger.info(f"last_chapter обновлён до {max_id}")
 
-                # Рассылаем подписчикам
                 for cid, url in translated_urls:
                     chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
                     if chapter_info:
