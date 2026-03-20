@@ -1209,11 +1209,14 @@ async def main():
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     # Регистрация всех хендлеров
-    dp.message.register(button_premium_section, lambda m: m.text == "💎 Премиум")
+    # Состояния
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
-    dp.message.register(button_my_premium, lambda m: m.text == "💎 Мой премиум")
-    dp.message.register(button_become_premium, lambda m: m.text == "💎 Стать премиум")
+    
+    # Старт
+    dp.message.register(cmd_start, Command("start"))
+
+    # Основное меню
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
@@ -1222,9 +1225,14 @@ async def main():
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
-    dp.message.register(handle_other_text)
-    dp.message.register(cmd_start, Command("start"))
+    
+    # Премиум меню
+    dp.message.register(button_premium_section, lambda m: m.text == "💎 Премиум")
+    dp.message.register(button_my_premium, lambda m: m.text == "💎 Мой премиум")
+    dp.message.register(button_become_premium, lambda m: m.text == "💎 Стать премиум")
     dp.message.register(button_back_to_main, lambda m: m.text == "← Назад в главное меню")
+
+    dp.message.register(handle_other_text)
 
     # Callback'ы
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
