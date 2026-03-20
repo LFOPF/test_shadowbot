@@ -65,6 +65,7 @@ monitor_task: Optional[asyncio.Task] = None
 
 class ChapterSelection(StatesGroup):
     waiting_for_chapter = State()
+    admin_waiting_for_user_id = State()  # для ввода ID пользователя
 
 
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -215,6 +216,50 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
         await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
     except Exception as e:
         logger.error(f"save_user_bookmark error: {e}")
+
+
+# ======================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ========================
+async def is_user_blocked(user_id: int) -> bool:
+    """Проверяет, заблокирован ли пользователь."""
+    try:
+        value = await redis_client.hget("blocked_users", str(user_id))
+        return value is not None
+    except Exception as e:
+        logger.error(f"is_user_blocked error: {e}")
+        return False
+
+
+async def block_user(user_id: int):
+    """Блокирует пользователя."""
+    try:
+        await redis_client.hset("blocked_users", str(user_id), "1")
+        # Также удаляем из подписчиков, если был
+        subs = await load_subscribers()
+        if user_id in subs:
+            subs.remove(user_id)
+            await save_subscribers(subs)
+        logger.info(f"Пользователь {user_id} заблокирован")
+    except Exception as e:
+        logger.error(f"block_user error: {e}")
+
+
+async def unblock_user(user_id: int):
+    """Разблокирует пользователя."""
+    try:
+        await redis_client.hdel("blocked_users", str(user_id))
+        logger.info(f"Пользователь {user_id} разблокирован")
+    except Exception as e:
+        logger.error(f"unblock_user error: {e}")
+
+
+async def get_blocked_users() -> Set[int]:
+    """Возвращает множество заблокированных пользователей."""
+    try:
+        keys = await redis_client.hkeys("blocked_users")
+        return {int(key.decode()) for key in keys}
+    except Exception as e:
+        logger.error(f"get_blocked_users error: {e}")
+        return set()
 
 
 # ======================== PLAYWRIGHT ========================
@@ -517,6 +562,10 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
 
     async def send_with_limit(uid):
         async with semaphore:
+            # Пропускаем заблокированных
+            if await is_user_blocked(uid):
+                logger.info(f"Пользователь {uid} заблокирован, пропускаем рассылку")
+                return
             try:
                 await bot.send_message(
                     chat_id=uid,
@@ -535,6 +584,14 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
 
 # ======================== КЛАВИАТУРЫ ========================
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
+    # Если пользователь заблокирован, он не должен видеть меню, но пусть видит только сообщение о блокировке
+    if await is_user_blocked(user_id):
+        # Возвращаем меню только с кнопкой помощи (или вообще без кнопок)
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❓ Помощь")]],
+            resize_keyboard=True
+        )
+
     subs = await load_subscribers()
     is_subscribed = user_id in subs
     is_admin = ADMIN_ID is not None and str(user_id) == ADMIN_ID
@@ -545,7 +602,7 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     ]
     row3 = [KeyboardButton(text="❓ Помощь")]
     if is_admin:
-        row3.insert(0, KeyboardButton(text="📊 Администрирование"))
+        row3.insert(0, KeyboardButton(text="📊 Статус"))
     buttons.append(row3)
 
     if is_subscribed:
@@ -567,12 +624,17 @@ cancel_keyboard = ReplyKeyboardMarkup(
 )
 
 
-# Инлайн-кнопки для админ-меню
+# Админ-меню с расширенными функциями
 admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
         [InlineKeyboardButton(text="🚀 Принудительная проверка", callback_data="admin_force_check")],
         [InlineKeyboardButton(text="📋 Список подписчиков", callback_data="admin_subscribers")],
+        [InlineKeyboardButton(text="🚫 Заблокированные", callback_data="admin_blocked")],
+        [InlineKeyboardButton(text="➕ Добавить подписчика", callback_data="admin_add_user")],
+        [InlineKeyboardButton(text="➖ Удалить подписчика", callback_data="admin_remove_user")],
+        [InlineKeyboardButton(text="🚫 Заблокировать пользователя", callback_data="admin_block_user")],
+        [InlineKeyboardButton(text="✅ Разблокировать пользователя", callback_data="admin_unblock_user")],
         [InlineKeyboardButton(text="📜 Последние логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close")]
     ]
@@ -583,6 +645,15 @@ admin_status_buttons = InlineKeyboardMarkup(
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
+
+    # Проверяем, заблокирован ли пользователь
+    if await is_user_blocked(uid):
+        await message.answer(
+            "⛔ Ваш доступ ограничен администратором. Если считаете это ошибкой, обратитесь к администратору.",
+            reply_markup=await get_main_menu(uid)
+        )
+        return
+
     subs = await load_subscribers()
     if uid not in subs:
         subs.add(uid)
@@ -602,6 +673,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def button_subscribe(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
+
+    if await is_user_blocked(uid):
+        await message.answer(
+            "⛔ Вы заблокированы и не можете подписаться.",
+            reply_markup=await get_main_menu(uid)
+        )
+        return
+
     subs = await load_subscribers()
     if uid in subs:
         await message.answer(
@@ -620,6 +699,14 @@ async def button_subscribe(message: types.Message, state: FSMContext):
 async def button_unsubscribe(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
+
+    if await is_user_blocked(uid):
+        await message.answer(
+            "Вы заблокированы, отписка не требуется.",
+            reply_markup=await get_main_menu(uid)
+        )
+        return
+
     subs = await load_subscribers()
     if uid in subs:
         subs.remove(uid)
@@ -641,7 +728,6 @@ async def button_status(message: types.Message, state: FSMContext):
     if ADMIN_ID is None or str(uid) != ADMIN_ID:
         await message.answer("У вас нет доступа к этой функции.")
         return
-    # Показываем инлайн-меню с действиями
     await message.answer(
         "Выберите действие:",
         reply_markup=admin_status_buttons
@@ -671,7 +757,6 @@ async def admin_force_check(callback: types.CallbackQuery):
         return
     await callback.answer("Запускаю принудительную проверку...", show_alert=False)
     await callback.message.edit_text("🔄 Запущена принудительная проверка новых глав...", reply_markup=admin_status_buttons)
-    # Запускаем мониторинг вне расписания
     asyncio.create_task(force_monitor_run())
 
 
@@ -693,6 +778,125 @@ async def admin_show_subscribers(callback: types.CallbackQuery):
     await callback.answer()
 
 
+async def admin_show_blocked(callback: types.CallbackQuery):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    blocked = await get_blocked_users()
+    if not blocked:
+        text = "Нет заблокированных пользователей."
+    else:
+        blocked_list = list(blocked)
+        text = f"Заблокировано: {len(blocked)}\n" + "\n".join(str(uid) for uid in blocked_list[:20])
+        if len(blocked_list) > 20:
+            text += "\n..."
+    await callback.message.edit_text(text, reply_markup=admin_status_buttons)
+    await callback.answer()
+
+
+async def admin_add_user(callback: types.CallbackQuery, state: FSMContext):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(ChapterSelection.admin_waiting_for_user_id)
+    await callback.message.edit_text(
+        "Введите Telegram ID пользователя, которого нужно добавить в подписчики:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
+    )
+    await callback.answer()
+
+
+async def admin_remove_user(callback: types.CallbackQuery, state: FSMContext):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(ChapterSelection.admin_waiting_for_user_id)
+    await callback.message.edit_text(
+        "Введите Telegram ID пользователя, которого нужно удалить из подписчиков:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
+    )
+    await callback.answer()
+
+
+async def admin_block_user(callback: types.CallbackQuery, state: FSMContext):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(ChapterSelection.admin_waiting_for_user_id)
+    await callback.message.edit_text(
+        "Введите Telegram ID пользователя, которого нужно заблокировать:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
+    )
+    await callback.answer()
+
+
+async def admin_unblock_user(callback: types.CallbackQuery, state: FSMContext):
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(ChapterSelection.admin_waiting_for_user_id)
+    await callback.message.edit_text(
+        "Введите Telegram ID пользователя, которого нужно разблокировать:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
+    )
+    await callback.answer()
+
+
+async def admin_process_user_id(message: types.Message, state: FSMContext):
+    """Обработка ввода ID пользователя для админ-действий."""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Операция отменена.", reply_markup=await get_main_menu(message.from_user.id))
+        return
+
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите числовой ID. Попробуйте ещё раз или нажмите Отмена.")
+        return
+
+    target_id = int(message.text)
+    current_state = await state.get_state()
+
+    if current_state == ChapterSelection.admin_waiting_for_user_id:
+        # Определяем, какое действие вызвало ввод
+        # Проще всего получить из контекста или хранить в данных состояния. Сделаем через data.
+        data = await state.get_data()
+        action = data.get("admin_action")
+        if not action:
+            await message.answer("Неизвестная операция. Попробуйте заново.")
+            await state.clear()
+            return
+
+        if action == "add":
+            subs = await load_subscribers()
+            if target_id in subs:
+                await message.answer(f"Пользователь {target_id} уже в подписчиках.")
+            else:
+                subs.add(target_id)
+                await save_subscribers(subs)
+                await message.answer(f"✅ Пользователь {target_id} добавлен в подписчики.")
+        elif action == "remove":
+            subs = await load_subscribers()
+            if target_id not in subs:
+                await message.answer(f"Пользователь {target_id} не является подписчиком.")
+            else:
+                subs.remove(target_id)
+                await save_subscribers(subs)
+                await message.answer(f"✅ Пользователь {target_id} удалён из подписчиков.")
+        elif action == "block":
+            if target_id == message.from_user.id:
+                await message.answer("Нельзя заблокировать самого себя.")
+            else:
+                await block_user(target_id)
+                await message.answer(f"🚫 Пользователь {target_id} заблокирован.")
+        elif action == "unblock":
+            await unblock_user(target_id)
+            await message.answer(f"✅ Пользователь {target_id} разблокирован.")
+
+        await state.clear()
+        # Возвращаем админ-меню
+        await message.answer("Выберите дальнейшее действие:", reply_markup=admin_status_buttons)
+
+
 async def admin_show_logs(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -705,6 +909,12 @@ async def admin_show_logs(callback: types.CallbackQuery):
         if len(text) > 4096:
             text = text[:4093] + "..."
     await callback.message.edit_text(text, reply_markup=admin_status_buttons)
+    await callback.answer()
+
+
+async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Операция отменена.", reply_markup=admin_status_buttons)
     await callback.answer()
 
 
@@ -806,6 +1016,10 @@ async def monitor(check_once=False):
 
 # ======================== ОСТАЛЬНЫЕ ХЕНДЛЕРЫ ========================
 async def button_choose_chapter(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("⛔ Вы заблокированы и не можете использовать бота.")
+        return
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_chapter)
     last_chapter = await get_last_chapter() or "?"
@@ -816,11 +1030,16 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("⛔ Вы заблокированы и не можете использовать бота.")
+        return
+
     if message.text == "❌ Отмена":
         await state.clear()
         await message.answer(
             "Ввод отменён.",
-            reply_markup=await get_main_menu(message.from_user.id)
+            reply_markup=await get_main_menu(uid)
         )
         return
 
@@ -832,7 +1051,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     chapter_num = int(message.text)
-    uid = message.from_user.id
 
     status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
 
@@ -885,8 +1103,11 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
 
 
 async def button_bookmark(message: types.Message, state: FSMContext):
-    await state.clear()
     uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("⛔ Вы заблокированы и не можете использовать бота.")
+        return
+    await state.clear()
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer(
@@ -940,8 +1161,11 @@ async def button_bookmark(message: types.Message, state: FSMContext):
 
 
 async def button_prev(message: types.Message, state: FSMContext):
-    await state.clear()
     uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("⛔ Вы заблокированы и не можете использовать бота.")
+        return
+    await state.clear()
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer(
@@ -1004,8 +1228,11 @@ async def button_prev(message: types.Message, state: FSMContext):
 
 
 async def button_next(message: types.Message, state: FSMContext):
-    await state.clear()
     uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("⛔ Вы заблокированы и не можете использовать бота.")
+        return
+    await state.clear()
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer(
@@ -1073,7 +1300,7 @@ async def button_help(message: types.Message, state: FSMContext):
         "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
     )
     if is_admin:
-        help_text += "📊 Администрирование – дополнительные административные функции\n"
+        help_text += "📊 Статус – дополнительные административные функции\n"
     help_text += "✅ Подписаться / ❌ Отписаться – управление уведомлениями\n"
     help_text += "❓ Помощь – это сообщение"
 
@@ -1134,12 +1361,13 @@ async def main():
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
+    dp.message.register(admin_process_user_id, ChapterSelection.admin_waiting_for_user_id)
 
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
     dp.message.register(button_next, lambda m: m.text == "➡️ Следующая глава")
-    dp.message.register(button_status, lambda m: m.text == "📊 Администрирование")
+    dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
@@ -1150,8 +1378,15 @@ async def main():
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
     dp.callback_query.register(admin_force_check, lambda c: c.data == "admin_force_check")
     dp.callback_query.register(admin_show_subscribers, lambda c: c.data == "admin_subscribers")
+    dp.callback_query.register(admin_show_blocked, lambda c: c.data == "admin_blocked")
     dp.callback_query.register(admin_show_logs, lambda c: c.data == "admin_logs")
     dp.callback_query.register(admin_close, lambda c: c.data == "admin_close")
+    dp.callback_query.register(admin_cancel, lambda c: c.data == "admin_cancel")
+    # Обработчики, требующие ввода ID
+    dp.callback_query.register(lambda c, state: admin_add_user(c, state), lambda c: c.data == "admin_add_user")
+    dp.callback_query.register(lambda c, state: admin_remove_user(c, state), lambda c: c.data == "admin_remove_user")
+    dp.callback_query.register(lambda c, state: admin_block_user(c, state), lambda c: c.data == "admin_block_user")
+    dp.callback_query.register(lambda c, state: admin_unblock_user(c, state), lambda c: c.data == "admin_unblock_user")
 
     dp.message.register(cmd_start, Command("start"))
 
