@@ -296,7 +296,6 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
         cid = extract_chapter_id(text)
         if cid and cid.isdigit():
             link = 'https://ranobes.net' + href if not href.startswith('http') else href
-            # Фильтр: оставляем только ссылки на главы нашего романа (содержат ID 1205249)
             if NOVEL_ID not in link:
                 logger.debug(f"Пропущена ссылка на чужое произведение: {link}")
                 continue
@@ -398,7 +397,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
-        "temperature": 1.3,
+        "temperature": 0.5,  # Вернули к умеренному значению
         "max_tokens": 8000
     }
 
@@ -413,7 +412,15 @@ async def translate_text(text: str, retries: int = 3) -> str:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return data["choices"][0]["message"]["content"].strip()
+                        # Проверяем наличие поля content
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                        if content is not None:
+                            return content.strip()
+                        else:
+                            logger.error("API вернул пустой ответ")
+                            if attempt == retries - 1:
+                                return "[Не удалось перевести: пустой ответ]"
+                            continue
                     elif resp.status == 429:
                         logger.warning(f"Rate limit (попытка {attempt+1})")
                         await asyncio.sleep(2 ** attempt)
@@ -440,8 +447,10 @@ async def create_telegraph_page(
 
     soup = BeautifulSoup(content_html, 'html.parser')
     nodes = []
+    # Проходим по всем элементам внутри контейнера
     for elem in soup.children:
         if elem.name == 'p':
+            # Для каждого абзаца создаём узел Telegraph
             children = []
             for sub in elem.children:
                 if sub.name == 'a':
@@ -455,9 +464,6 @@ async def create_telegraph_page(
                     if text:
                         children.append(text)
             nodes.append({"tag": "p", "children": children})
-        else:
-            pass
-
     if not nodes:
         nodes = [{"tag": "p", "children": [content_html]}]
 
@@ -509,8 +515,9 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         logger.exception(f"Ошибка загрузки главы {cid}")
         return None, False
 
+    # Переводим текст
     translated = await translate_text(text)
-    # Переводим заголовок тем же способом, без отдельного запроса
+    # Переводим заголовок (отдельный вызов, но с проверками)
     translated_title = await translate_text(title)
     translated_title_clean = clean_title_for_telegraph(translated_title)
 
@@ -730,7 +737,6 @@ async def admin_force_check(callback: types.CallbackQuery):
     asyncio.create_task(force_monitor_run(msg))
 
 async def admin_bulk_translate(callback: types.CallbackQuery):
-    """Переводит последние 10 глав без рассылки (для заполнения базы)."""
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
@@ -1338,8 +1344,6 @@ async def main():
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
 
-    dp.message.register(cmd_start, Command("start"))
-    
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
@@ -1364,6 +1368,7 @@ async def main():
     dp.callback_query.register(admin_remove_sub, lambda c: c.data == "admin_remove_sub")
     dp.callback_query.register(admin_cancel, lambda c: c.data == "admin_cancel")
 
+    dp.message.register(cmd_start, Command("start"))
 
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
