@@ -397,7 +397,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
-        "temperature": 0.5,  # Вернули к умеренному значению
+        "temperature": 0.7,  # Вернули к умеренному значению
         "max_tokens": 8000
     }
 
