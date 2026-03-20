@@ -605,7 +605,7 @@ async def button_my_premium(message: types.Message):
 async def button_back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Вернулись в главное меню",
+        text="←",
         reply_markup=await get_main_menu(message.from_user.id)
     )
 
@@ -667,7 +667,7 @@ async def button_become_premium(message: types.Message):
         "💎 Приоритетный перевод\n"
         "💎 Доступ к будущим романам\n\n"
         "👉 Оплатить: https://boosty.to/1h8u\n\n"
-        "После оплаты напишите администратору (@admin_username) — активируем за 1–5 минут.",
+        "После оплаты напишите администратору (@Ihateey0u) — активируем за 1–5 минут.",
         parse_mode="HTML",
         reply_markup=premium_menu  # остаёмся в премиум-меню
     )
