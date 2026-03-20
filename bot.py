@@ -28,7 +28,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID администратора
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
@@ -56,6 +56,7 @@ TELEGRAPH_TITLE_MAX_LENGTH = 200
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Буфер логов для админа
 log_buffer = deque(maxlen=100)
 
 class LogHandler(logging.Handler):
@@ -101,6 +102,7 @@ def clean_title(raw_title: str) -> str:
     ).strip()
 
 def clean_title_for_telegraph(title: str) -> str:
+    # Удаляем пояснения в скобках в конце
     title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
@@ -179,7 +181,6 @@ async def save_last_chapter(ch_id: str):
         logger.error(f"save_last_chapter error: {e}")
 
 async def get_first_chapter() -> Optional[int]:
-    """Возвращает номер самой новой главы из Redis, при необходимости обновляя."""
     try:
         cached = await redis_client.get("first_chapter")
         if cached:
@@ -187,16 +188,19 @@ async def get_first_chapter() -> Optional[int]:
     except Exception as e:
         logger.error(f"get_first_chapter cached error: {e}")
 
-    # Обновляем из первой страницы
+    logger.info(f"Обновляем first_chapter, загружаем страницу {get_page_url(1)}")
     html = await fetch_html(get_page_url(1))
     if not html:
+        logger.error("Не удалось загрузить страницу для обновления first_chapter")
         return None
     chapters = parse_chapters(html)
     if not chapters:
+        logger.error("На странице не найдено глав")
         return None
     first = int(chapters[0]['id'])
     try:
         await redis_client.set("first_chapter", str(first), ex=3600)
+        logger.info(f"first_chapter обновлён: {first}")
     except Exception as e:
         logger.error(f"save_first_chapter error: {e}")
     return first
@@ -255,6 +259,7 @@ async def fetch_html(url: str, retries: int = 2) -> str:
         for attempt in range(retries):
             page = await browser_context.new_page()
             try:
+                logger.debug(f"Загрузка {url} (попытка {attempt+1})")
                 await page.goto(url, timeout=60000)
                 await page.wait_for_selector('a:has-text("Chapter")', timeout=30000)
                 await page.wait_for_timeout(2000)
@@ -272,6 +277,7 @@ async def fetch_chapter_text(url: str) -> str:
     async with PLAYWRIGHT_SEMAPHORE:
         page = await browser_context.new_page()
         try:
+            logger.debug(f"Загрузка текста главы: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector('div.text#arrticle', timeout=30000)
             paragraphs = await page.evaluate('''() => {
@@ -314,6 +320,7 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
     first = await get_first_chapter()
     if not first:
+        logger.warning("Нет first_chapter, переходим к бинарному поиску")
         return await find_chapter_by_number_binary(chapter_number)
 
     page_estimate = 1 + (first - chapter_number) // CHAPTERS_PER_PAGE
@@ -322,21 +329,26 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
     if page_estimate > MAX_PAGES:
         page_estimate = MAX_PAGES
 
+    logger.info(f"Поиск главы {chapter_number}: предполагаемая страница {page_estimate}")
     url = get_page_url(page_estimate)
     html = await fetch_html(url)
     if html:
         chapters = parse_chapters(html)
         for ch in chapters:
             if int(ch['id']) == chapter_number:
+                logger.info(f"Глава {chapter_number} найдена на странице {page_estimate}")
                 return ch
-
+        logger.info(f"Глава {chapter_number} не найдена на странице {page_estimate}, переходим к бинарному поиску")
     return await find_chapter_by_number_binary(chapter_number)
 
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
     left, right = 1, MAX_PAGES
+    iteration = 0
     while left <= right:
+        iteration += 1
         mid = (left + right) // 2
         url = get_page_url(mid)
+        logger.info(f"Бинарный поиск: итерация {iteration}, страница {mid}")
         html = await fetch_html(url)
         if not html:
             right = mid - 1
@@ -354,9 +366,11 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
         else:
             for ch in chapters:
                 if int(ch['id']) == chapter_number:
+                    logger.info(f"Бинарный поиск: глава {chapter_number} найдена на странице {mid}")
                     return ch
             return None
         await asyncio.sleep(0.5)
+    logger.warning(f"Глава {chapter_number} не найдена ни на одной странице")
     return None
 
 # ======================== ПЕРЕВОД ========================
@@ -368,23 +382,11 @@ SYSTEM_PROMPT = (
     "1. Сохраняй структуру оригинала: абзацы, диалоги, внутренние мысли, описания. Не сливай абзацы и не меняй их порядок.\n"
     "2. Оформление:\n"
     "   — Прямую речь заключай в кавычки-ёлочки: «...»\n"
-    "   — Внутренние мысли персонажей (обычно выделены курсивом или одиночными кавычками в оригинале) передавай апострофами: '...' (без дополнительных кавычек).\n"
+    "   — Внутренние мысли персонажей передавай апострофами: '...' (без дополнительных кавычек).\n"
     "   — Диалоги начинай с новой строки, используя тире.\n"
-    "   — Сохраняй все знаки препинания согласно правилам русского языка.\n"
-    "3. Стиль:\n"
-    "   — Передавай точный смысл, но допускай литературную обработку, чтобы фразы звучали естественно по-русски.\n"
-    "   — Сохраняй эмоциональную окраску: иронию, сарказм, тревогу, торжественность и т.д.\n"
-    "   — Описания делай образными, но без излишней пафосности, следуя манере ручного перевода.\n"
-    "4. Имена, названия, термины переводи единообразно, ориентируясь на словарь ручного перевода:\n"
-    "   — Санни, Нефис, Герой, Горный Король, Лазурный Клинок, Саван Кукловода, Панцирный Падальщик, Царство Снов, Заклятие и т.д.\n"
-    "5. Запрещено:\n"
+    "3. Запрещено:\n"
     "   — Добавлять от себя пояснения, комментарии, примечания в скобках или сноски.\n"
     "   — Менять смысл или опускать значимые детали.\n"
-    "   — Использовать англицизмы, если есть устоявшийся русский аналог.\n\n"
-    "Обрати особое внимание на:\n"
-    "— Передачу внутренних монологов (они часто идут после описания и выделяются апострофами).\n"
-    "— Корректное оформление длинных диалогов с чередованием реплик и описаний действий.\n"
-    "— Единообразие терминологии на протяжении всего перевода.\n\n"
     "Переведи следующий текст, строго следуя этим правилам. Не добавляй ничего, кроме самого перевода."
 )
 
@@ -432,6 +434,43 @@ async def translate_text(text: str, retries: int = 3) -> str:
             await asyncio.sleep(2 ** attempt)
     return "[Не удалось перевести]"
 
+async def translate_title(title: str) -> str:
+    """Переводит только заголовок главы (короткий текст)."""
+    if len(title) > 200:
+        title = title[:200]
+    prompt = f"Переведи на русский язык название главы. Не добавляй никаких пояснений, только перевод. Название: {title}"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": SITE_URL,
+        "X-Title": SITE_NAME,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "stepfun/step-3.5-flash:free",
+        "messages": [
+            {"role": "system", "content": "Ты переводчик. Переводи только название главы, не добавляя ничего лишнего."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 100
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result = data["choices"][0]["message"]["content"].strip()
+                    # Дополнительная очистка: если результат слишком длинный (больше 150), обрезаем
+                    if len(result) > TELEGRAPH_TITLE_MAX_LENGTH:
+                        result = result[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
+                    return result
+                else:
+                    logger.error(f"Ошибка перевода заголовка: {resp.status}")
+                    return title
+    except Exception as e:
+        logger.exception(f"Ошибка перевода заголовка: {e}")
+        return title
+
 # ======================== TELEGRAPH ========================
 async def create_telegraph_page(title: str, content_text: str) -> Optional[str]:
     clean_title_text = clean_title_for_telegraph(title)
@@ -461,25 +500,41 @@ async def create_telegraph_page(title: str, content_text: str) -> Optional[str]:
 async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
     cid = ch['id']
     if url := await get_cached_telegraph(cid):
+        logger.info(f"Глава {cid}: уже есть в кэше")
         return url, True
 
+    logger.info(f"Глава {cid}: загрузка текста...")
     text = await fetch_chapter_text(ch['link'])
+    if not text or text.startswith("[Ошибка"):
+        logger.error(f"Глава {cid}: не удалось загрузить текст")
+        return None, False
+
+    logger.info(f"Глава {cid}: перевод текста (длина {len(text)} символов)...")
     translated = await translate_text(text)
-    translated_title = await translate_text(ch['title'])
+
+    logger.info(f"Глава {cid}: перевод заголовка...")
+    translated_title = await translate_title(ch['title'])
     translated_title_clean = clean_title_for_telegraph(translated_title)
 
     await save_cached_title(cid, translated_title_clean)
 
+    logger.info(f"Глава {cid}: создание страницы Telegraph...")
     new_url = await create_telegraph_page(translated_title_clean, translated)
 
     if new_url:
         await save_telegraph_url(cid, new_url)
+        logger.info(f"Глава {cid}: успешно переведена, ссылка: {new_url}")
         return new_url, True
-    return None, False
+    else:
+        logger.error(f"Глава {cid}: не удалось создать Telegraph")
+        return None, False
 
 # ======================== РАССЫЛКА ========================
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML"):
     subs = await load_subscribers()
+    if not subs:
+        logger.info("Нет подписчиков для рассылки")
+        return
     semaphore = asyncio.Semaphore(10)
 
     async def send(uid):
@@ -556,10 +611,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if uid not in subs:
         subs.add(uid)
         await save_subscribers(subs)
+        logger.info(f"Новый пользователь: {uid}")
     await message.answer("✅ Добро пожаловать!", reply_markup=await get_main_menu(uid))
 
 async def button_support(message: types.Message, state: FSMContext):
-    """Кнопка поддержки – отправляет ссылку на Boosty без упоминания админа."""
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -589,6 +644,7 @@ async def button_subscribe(message: types.Message, state: FSMContext):
     else:
         subs.add(uid)
         await save_subscribers(subs)
+        logger.info(f"Пользователь {uid} подписался")
         await message.answer(
             "✅ Вы подписались на уведомления о новых главах!",
             reply_markup=await get_main_menu(uid)
@@ -604,6 +660,7 @@ async def button_unsubscribe(message: types.Message, state: FSMContext):
     if uid in subs:
         subs.remove(uid)
         await save_subscribers(subs)
+        logger.info(f"Пользователь {uid} отписался")
         await message.answer(
             "❌ Вы отписались от уведомлений.",
             reply_markup=await get_main_menu(uid)
@@ -662,6 +719,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
 
     chapter_num = int(message.text)
     status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
+    logger.info(f"Пользователь {uid} запросил главу {chapter_num}")
 
     cached_url = await get_cached_telegraph(str(chapter_num))
     if cached_url:
@@ -672,6 +730,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             reply_markup=await get_main_menu(uid)
         )
         await save_user_bookmark(uid, str(chapter_num))
+        logger.info(f"Глава {chapter_num} выдана из кэша пользователю {uid}")
         await state.clear()
         return
 
@@ -682,6 +741,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             f"Глава с номером {chapter_num} не найдена.",
             reply_markup=await get_main_menu(uid)
         )
+        logger.warning(f"Глава {chapter_num} не найдена на сайте")
         await state.clear()
         return
 
@@ -696,6 +756,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
                 reply_markup=await get_main_menu(uid)
             )
             await save_user_bookmark(uid, chapter['id'])
+            logger.info(f"Глава {chapter_num} переведена и сохранена для пользователя {uid}")
         else:
             await message.answer(
                 "❌ Не удалось создать перевод. Попробуйте позже.",
@@ -724,6 +785,7 @@ async def button_bookmark(message: types.Message, state: FSMContext):
         )
         return
 
+    logger.info(f"Пользователь {uid} запросил закладку {bookmark}")
     cached_url = await get_cached_telegraph(bookmark)
     if cached_url:
         await message.answer(
@@ -790,6 +852,7 @@ async def button_prev(message: types.Message, state: FSMContext):
         )
         return
 
+    logger.info(f"Пользователь {uid} запросил предыдущую главу {prev_num} от закладки {current}")
     cached_url = await get_cached_telegraph(str(prev_num))
     if cached_url:
         await message.answer(
@@ -850,6 +913,7 @@ async def button_next(message: types.Message, state: FSMContext):
     current = int(bookmark)
     next_num = current + 1
 
+    logger.info(f"Пользователь {uid} запросил следующую главу {next_num} от закладки {current}")
     cached_url = await get_cached_telegraph(str(next_num))
     if cached_url:
         await message.answer(
@@ -939,6 +1003,7 @@ async def admin_clear_cache(callback: types.CallbackQuery):
             "✅ Кэш первой главы очищен.",
             reply_markup=admin_status_buttons
         )
+        logger.info("Админ очистил кэш first_chapter")
     except Exception as e:
         logger.exception("Ошибка очистки кэша")
         await callback.answer("Ошибка при очистке", show_alert=True)
@@ -950,15 +1015,16 @@ async def admin_force_check(callback: types.CallbackQuery):
     await callback.answer("Запускаю принудительную проверку...")
     msg = await callback.message.edit_text("🔄 Запущена принудительная проверка...", reply_markup=admin_status_buttons)
     asyncio.create_task(force_monitor_run(msg))
+    logger.info("Админ запустил принудительную проверку")
 
 async def admin_bulk_translate(callback: types.CallbackQuery):
-    """Переводит 10 последних глав без рассылки (для заполнения базы)."""
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     await callback.answer("Запускаю пакетный перевод...")
     msg = await callback.message.edit_text("📥 Начинаю пакетный перевод 10 последних глав...", reply_markup=admin_status_buttons)
     asyncio.create_task(bulk_translate(msg))
+    logger.info("Админ запустил пакетный перевод")
 
 async def admin_show_subscribers(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -1034,18 +1100,22 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
         if message.text.isdigit():
             await block_user(int(message.text))
             response = f"Пользователь {message.text} заблокирован"
+            logger.info(f"Админ заблокировал пользователя {message.text}")
         else:
             response = "Некорректный ID."
     elif action == "unblock":
         if message.text.isdigit():
             await unblock_user(int(message.text))
             response = f"Пользователь {message.text} разблокирован"
+            logger.info(f"Админ разблокировал пользователя {message.text}")
         else:
             response = "Некорректный ID."
     elif action == "remove":
         if message.text.isdigit():
             removed = await remove_subscriber(int(message.text))
             response = f"Пользователь {message.text} {'удалён' if removed else 'не найден'} из подписчиков"
+            if removed:
+                logger.info(f"Админ удалил подписку у пользователя {message.text}")
         else:
             response = "Некорректный ID."
     else:
@@ -1066,22 +1136,18 @@ async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
 
 # ======================== ПАКЕТНЫЙ ПЕРЕВОД ========================
 async def bulk_translate(msg: types.Message):
-    """Переводит последние 10 глав, которые ещё не переведены, и сохраняет ссылки."""
+    """Переводит последние 10 не переведённых глав без рассылки."""
     try:
-        # Получаем первую страницу
         html = await fetch_html(get_page_url(1))
         chapters = parse_chapters(html)
         if not chapters:
             await msg.edit_text("❌ Не удалось получить список глав.", reply_markup=admin_status_buttons)
             return
 
-        # Берём последние 10 глав (от новых к старым, но нам нужны не переведённые)
-        # Сортируем от старых к новым, чтобы переводить по порядку
         chapters_to_translate = []
         for ch in reversed(chapters):
             if len(chapters_to_translate) >= 10:
                 break
-            # Проверяем, есть ли уже перевод
             if not await get_cached_telegraph(ch['id']):
                 chapters_to_translate.append(ch)
 
@@ -1093,25 +1159,24 @@ async def bulk_translate(msg: types.Message):
         translated = 0
         for i, ch in enumerate(chapters_to_translate):
             try:
+                logger.info(f"Пакетный перевод: глава {ch['id']}")
                 url, success = await process_chapter_translation(ch)
                 if success and url:
                     translated += 1
                 else:
                     logger.warning(f"Не удалось перевести главу {ch['id']}")
-                # Небольшая пауза между главами
                 await asyncio.sleep(5)
-                # Обновляем сообщение каждые 2 главы
                 if (i + 1) % 2 == 0:
                     await msg.edit_text(f"📥 Переведено {translated}/{len(chapters_to_translate)} глав...")
             except Exception as e:
                 logger.exception(f"Ошибка при переводе главы {ch['id']}: {e}")
-                await msg.edit_text(f"⚠️ Ошибка при переводе главы {ch['id']}. Продолжаю...")
                 await asyncio.sleep(2)
 
         await msg.edit_text(
             f"✅ Пакетный перевод завершён.\nПереведено {translated} из {len(chapters_to_translate)} глав.",
             reply_markup=admin_status_buttons
         )
+        logger.info(f"Пакетный перевод завершён: {translated}/{len(chapters_to_translate)} глав")
     except Exception as e:
         logger.exception("Ошибка в bulk_translate")
         await msg.edit_text(f"❌ Ошибка при пакетном переводе: {e}", reply_markup=admin_status_buttons)
@@ -1130,6 +1195,7 @@ async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
         try:
+            logger.info("Проверка новых глав...")
             html = await fetch_html(get_page_url(1))
             chapters = parse_chapters(html)
             if not chapters:
@@ -1138,17 +1204,17 @@ async def monitor(check_once=False):
                 continue
 
             latest_id = chapters[0]['id']
-            # Обновляем first_chapter в Redis
             await redis_client.set("first_chapter", latest_id, ex=3600)
 
             last_str = await get_last_chapter()
             last_int = int(last_str) if last_str and last_str.isdigit() else 0
 
             new_chapters = [ch for ch in reversed(chapters) if int(ch['id']) > last_int]
-
             if new_chapters:
+                logger.info(f"Найдено {len(new_chapters)} новых глав: {[ch['id'] for ch in new_chapters]}")
                 translated_urls = []
                 for ch in new_chapters:
+                    logger.info(f"Начинаю обработку новой главы {ch['id']}")
                     url, success = await process_chapter_translation(ch)
                     if success and url:
                         translated_urls.append((ch['id'], url))
@@ -1156,12 +1222,16 @@ async def monitor(check_once=False):
 
                 if translated_urls:
                     for cid, url in translated_urls:
+                        logger.info(f"Рассылка новой главы {cid} подписчикам")
                         await notify_all_subscribers(
                             f"📢 <b>Новая глава!</b>\n\n📖 Глава {cid}\n🔗 {url}",
                             parse_mode="HTML"
                         )
                 max_id = max(int(ch['id']) for ch in new_chapters)
                 await save_last_chapter(str(max_id))
+                logger.info(f"last_chapter обновлён до {max_id}")
+            else:
+                logger.info("Новых глав нет")
 
         except Exception as e:
             logger.exception(f"Критическая ошибка мониторинга: {e}")
