@@ -28,7 +28,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
-ADMIN_ID = os.getenv("ADMIN_ID")
+ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID администратора
 
 if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
@@ -71,8 +71,6 @@ bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
 browser_context: Optional[BrowserContext] = None
 PLAYWRIGHT_SEMAPHORE: Optional[asyncio.Semaphore] = None
-
-PREMIUM_KEY = "premium_users"
 
 # ======================== FSM ========================
 class ChapterSelection(StatesGroup):
@@ -124,64 +122,6 @@ def get_page_url(page_num: int = 1) -> str:
         return TARGET_URL
     base = TARGET_URL.rstrip('/')
     return f"{base}/page/{page_num}/"
-
-# ======================== PREMIUM + RATE LIMIT ========================
-async def is_premium(user_id: int) -> bool:
-    try:
-        value = await redis_client.hget(PREMIUM_KEY, str(user_id))
-        if not value:
-            return False
-        return int(value.decode()) > time.time()
-    except Exception as e:
-        logger.error(f"is_premium error: {e}")
-        return False
-
-async def add_premium(user_id: int, days: int = 30):
-    try:
-        expire = time.time() + days * 86400
-        await redis_client.hset(PREMIUM_KEY, str(user_id), str(int(expire)))
-        logger.info(f"Премиум добавлен пользователю {user_id} на {days} дней")
-    except Exception as e:
-        logger.error(f"add_premium error: {e}")
-
-async def check_rate_limit(user_id: int) -> bool:
-    if await is_premium(user_id):
-        return True
-    key = f"rate_limit:{user_id}:hour"
-    count = await redis_client.incr(key)
-    if count == 1:
-        await redis_client.expire(key, 3600)
-    if count > 3:
-        return False
-    return True
-
-async def get_premium_remaining(user_id: int) -> str:
-    try:
-        value = await redis_client.hget(PREMIUM_KEY, str(user_id))
-        if not value:
-            return "У вас нет активной премиум-подписки.\n\n💎 Нажми «Стать премиум», чтобы оформить."
-
-        expire = float(value.decode())
-        now = time.time()
-
-        if expire <= now:
-            return "Премиум истёк.\n\n💎 Оформи новую подписку через кнопку «Стать премиум»."
-
-        remaining = expire - now
-        days = int(remaining // 86400)
-        hours = int((remaining % 86400) // 3600)
-        minutes = int((remaining % 3600) // 60)
-
-        if days >= 1:
-            return f"Твой премиум действителен еще: {days}д и {hours}ч"
-        elif hours >= 1:
-            return f"Твой премиум действителен еще: {hours}ч и {minutes}мин"
-        else:
-            return f"Твой премиум действителен еще: {minutes}мин"
-
-    except Exception as e:
-        logger.error(f"get_premium_remaining error: {e}")
-        return "Ошибка проверки статуса премиум."
 
 # ======================== REDIS ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
@@ -262,7 +202,6 @@ async def get_first_chapter() -> Optional[int]:
     return first
 
 async def get_latest_chapter_id() -> Optional[str]:
-    # Используем first_chapter как самый последний номер
     first = await get_first_chapter()
     if first:
         return str(first)
@@ -422,18 +361,34 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
 
 # ======================== ПЕРЕВОД ========================
 SYSTEM_PROMPT = (
-    "Ты профессиональный переводчик художественной литературы. "
-    "Переводи точно и сохраняй стиль. "
-    "НЕ ДОБАВЛЯЙ никаких пояснений, примечаний, комментариев в скобках. "
-    "Передавай ТОЛЬКО переведённый текст, без лишних слов."
+    "Ты — профессиональный переводчик художественной литературы.\n"
+    "Твоя задача — переводить текст новеллы «Shadow Slave» (Теневой раб) с английского на русский язык, "
+    "максимально приближаясь к стилю и качеству предоставленного ручного перевода.\n\n"
+    "Правила перевода:\n"
+    "1. Сохраняй структуру оригинала: абзацы, диалоги, внутренние мысли, описания. Не сливай абзацы и не меняй их порядок.\n"
+    "2. Оформление:\n"
+    "   — Прямую речь заключай в кавычки-ёлочки: «...»\n"
+    "   — Внутренние мысли персонажей (обычно выделены курсивом или одиночными кавычками в оригинале) передавай апострофами: '...' (без дополнительных кавычек).\n"
+    "   — Диалоги начинай с новой строки, используя тире.\n"
+    "   — Сохраняй все знаки препинания согласно правилам русского языка.\n"
+    "3. Стиль:\n"
+    "   — Передавай точный смысл, но допускай литературную обработку, чтобы фразы звучали естественно по-русски.\n"
+    "   — Сохраняй эмоциональную окраску: иронию, сарказм, тревогу, торжественность и т.д.\n"
+    "   — Описания делай образными, но без излишней пафосности, следуя манере ручного перевода.\n"
+    "4. Имена, названия, термины переводи единообразно, ориентируясь на словарь ручного перевода:\n"
+    "   — Санни, Нефис, Герой, Горный Король, Лазурный Клинок, Саван Кукловода, Панцирный Падальщик, Царство Снов, Заклятие и т.д.\n"
+    "5. Запрещено:\n"
+    "   — Добавлять от себя пояснения, комментарии, примечания в скобках или сноски.\n"
+    "   — Менять смысл или опускать значимые детали.\n"
+    "   — Использовать англицизмы, если есть устоявшийся русский аналог.\n\n"
+    "Обрати особое внимание на:\n"
+    "— Передачу внутренних монологов (они часто идут после описания и выделяются апострофами).\n"
+    "— Корректное оформление длинных диалогов с чередованием реплик и описаний действий.\n"
+    "— Единообразие терминологии на протяжении всего перевода.\n\n"
+    "Переведи следующий текст, строго следуя этим правилам. Не добавляй ничего, кроме самого перевода."
 )
 
-USER_PROMPT_TEMPLATE = (
-    "Переведи следующий текст на русский язык. "
-    "Сохрани абзацы и форматирование. "
-    "Не добавляй ничего от себя, только перевод. "
-    "Текст:\n\n{text}"
-)
+USER_PROMPT_TEMPLATE = "{text}"
 
 async def translate_text(text: str, retries: int = 3) -> str:
     if len(text) > 120000:
@@ -480,7 +435,7 @@ async def translate_text(text: str, retries: int = 3) -> str:
 # ======================== TELEGRAPH ========================
 async def create_telegraph_page(title: str, content_text: str) -> Optional[str]:
     clean_title_text = clean_title_for_telegraph(title)
-    nodes = text_to_telegraph_nodes(content_text)  # теперь без лишних тегов
+    nodes = text_to_telegraph_nodes(content_text)
     payload = {
         "access_token": TELEGRAPH_ACCESS_TOKEN,
         "title": clean_title_text,
@@ -549,7 +504,7 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
         [KeyboardButton(text="⬅️ Предыдущая"), KeyboardButton(text="➡️ Следующая")],
-        [KeyboardButton(text="💎 Премиум")],
+        [KeyboardButton(text="🤝 Поддержать")],
     ]
 
     if is_admin:
@@ -569,21 +524,11 @@ cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-premium_menu = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="💎 Стать премиум")],
-        [KeyboardButton(text="💎 Мой премиум")],
-        [KeyboardButton(text="← Назад в главное меню")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Премиум-раздел"
-)
-
 admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
         [InlineKeyboardButton(text="🚀 Принудительная проверка", callback_data="admin_force_check")],
-        [InlineKeyboardButton(text="💎 Добавить премиум", callback_data="admin_add_premium")],
+        [InlineKeyboardButton(text="📥 Пакетный перевод (10 глав)", callback_data="admin_bulk_translate")],
         [InlineKeyboardButton(text="📋 Список подписчиков", callback_data="admin_subscribers")],
         [InlineKeyboardButton(text="📜 Последние логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_user_manage")],
@@ -613,29 +558,20 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await save_subscribers(subs)
     await message.answer("✅ Добро пожаловать!", reply_markup=await get_main_menu(uid))
 
-async def button_premium_section(message: types.Message, state: FSMContext):
+async def button_support(message: types.Message, state: FSMContext):
+    """Кнопка поддержки – отправляет ссылку на Boosty без упоминания админа."""
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
         return
     await message.answer(
-        "💎 Премиум-раздел",
-        reply_markup=premium_menu
-    )
-
-async def button_my_premium(message: types.Message):
-    status_text = await get_premium_remaining(message.from_user.id)
-    await message.answer(
-        status_text,
-        reply_markup=premium_menu
-    )
-
-async def button_back_to_main(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        text="←",
-        reply_markup=await get_main_menu(message.from_user.id)
+        "❤️ Спасибо, что пользуетесь ботом!\n\n"
+        "Если вы хотите поддержать проект и помочь его развитию, "
+        "вы можете сделать это на Boosty:\n\n"
+        "👉 https://boosty.to/1h8u\n\n"
+        "Любая поддержка очень важна! 🙏",
+        reply_markup=await get_main_menu(uid)
     )
 
 async def button_subscribe(message: types.Message, state: FSMContext):
@@ -689,32 +625,14 @@ async def button_status(message: types.Message, state: FSMContext):
         reply_markup=admin_status_buttons
     )
 
-async def button_become_premium(message: types.Message):
-    await message.answer(
-        "💎 <b>Премиум-подписка</b>\n\n"
-        "💎 Безлимит глав\n"
-        "💎 Приоритетный перевод\n"
-        "💎 Доступ к будущим романам\n\n"
-        "👉 Оплатить: https://boosty.to/1h8u\n\n"
-        "После оплаты напишите администратору (@Ihateey0u) — активируем за 1–5 минут.",
-        parse_mode="HTML",
-        reply_markup=premium_menu
-    )
-
 async def button_choose_chapter(message: types.Message, state: FSMContext):
     if await is_user_blocked(message.from_user.id):
         await message.answer("Вы заблокированы.")
         return
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_chapter)
-
-    # Получаем последнюю доступную главу для отображения диапазона
     latest = await get_latest_chapter_id()
-    if latest:
-        range_text = f" (доступны главы 1–{latest})"
-    else:
-        range_text = ""
-
+    range_text = f" (доступны главы 1–{latest})" if latest else ""
     await message.answer(
         f"Введите номер главы для перевода{range_text}:",
         reply_markup=cancel_keyboard
@@ -740,14 +658,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
             "Пожалуйста, введите число.",
             reply_markup=cancel_keyboard
         )
-        return
-
-    if not await check_rate_limit(uid):
-        await message.answer(
-            "❌ Лимит 3 главы в час для бесплатных пользователей.\n💎 Купи премиум!",
-            reply_markup=await get_main_menu(uid)
-        )
-        await state.clear()
         return
 
     chapter_num = int(message.text)
@@ -805,10 +715,6 @@ async def button_bookmark(message: types.Message, state: FSMContext):
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
         return
-    if not await check_rate_limit(uid):
-        await message.answer("❌ Лимит 3 главы в час для бесплатных.\n💎 Купи премиум!", reply_markup=await get_main_menu(uid))
-        return
-
     await state.clear()
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
@@ -865,9 +771,6 @@ async def button_prev(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
-        return
-    if not await check_rate_limit(uid):
-        await message.answer("❌ Лимит 3 главы в час для бесплатных.\n💎 Купи премиум!", reply_markup=await get_main_menu(uid))
         return
     await state.clear()
     bookmark = await get_user_bookmark(uid)
@@ -934,9 +837,6 @@ async def button_next(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
-        return
-    if not await check_rate_limit(uid):
-        await message.answer("❌ Лимит 3 главы в час для бесплатных.\n💎 Купи премиум!", reply_markup=await get_main_menu(uid))
         return
     await state.clear()
     bookmark = await get_user_bookmark(uid)
@@ -1006,6 +906,7 @@ async def button_help(message: types.Message, state: FSMContext):
     )
     if is_admin:
         help_text += "📊 Статус – дополнительные административные функции\n"
+    help_text += "🤝 Поддержать – поддержать проект\n"
     help_text += "✅ Подписаться / ❌ Отписаться – управление уведомлениями\n"
     help_text += "❓ Помощь – это сообщение"
 
@@ -1049,6 +950,15 @@ async def admin_force_check(callback: types.CallbackQuery):
     await callback.answer("Запускаю принудительную проверку...")
     msg = await callback.message.edit_text("🔄 Запущена принудительная проверка...", reply_markup=admin_status_buttons)
     asyncio.create_task(force_monitor_run(msg))
+
+async def admin_bulk_translate(callback: types.CallbackQuery):
+    """Переводит 10 последних глав без рассылки (для заполнения базы)."""
+    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+    await callback.answer("Запускаю пакетный перевод...")
+    msg = await callback.message.edit_text("📥 Начинаю пакетный перевод 10 последних глав...", reply_markup=admin_status_buttons)
+    asyncio.create_task(bulk_translate(msg))
 
 async def admin_show_subscribers(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -1114,38 +1024,13 @@ async def admin_unblock(callback: types.CallbackQuery, state: FSMContext):
 async def admin_remove_sub(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "remove")
 
-async def admin_add_premium(callback: types.CallbackQuery, state: FSMContext):
-    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
-        await callback.answer("Доступ запрещён", show_alert=True)
-        return
-    await state.set_state(AdminActions.waiting_for_user_id)
-    await state.update_data(action_type="premium")
-    msg = await callback.message.edit_text(
-        "Введите ID пользователя и количество дней через пробел\nПример: 123456789 30",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
-    )
-    await state.update_data(request_msg_id=msg.message_id)
-    await callback.answer()
-
 async def process_admin_user_id(message: types.Message, state: FSMContext):
     data = await state.get_data()
     action = data.get("action_type")
     request_msg_id = data.get("request_msg_id")
     response = ""
 
-    if action == "premium":
-        try:
-            parts = message.text.split()
-            if len(parts) != 2:
-                response = "Неверный формат. Пример: 123456789 30"
-            else:
-                uid = int(parts[0])
-                days = int(parts[1])
-                await add_premium(uid, days)
-                response = f"✅ Премиум добавлен пользователю {uid} на {days} дней"
-        except Exception:
-            response = "Неверный формат. Пример: 123456789 30"
-    elif action == "block":
+    if action == "block":
         if message.text.isdigit():
             await block_user(int(message.text))
             response = f"Пользователь {message.text} заблокирован"
@@ -1178,6 +1063,58 @@ async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("Действие отменено.", reply_markup=admin_status_buttons)
     await callback.answer()
+
+# ======================== ПАКЕТНЫЙ ПЕРЕВОД ========================
+async def bulk_translate(msg: types.Message):
+    """Переводит последние 10 глав, которые ещё не переведены, и сохраняет ссылки."""
+    try:
+        # Получаем первую страницу
+        html = await fetch_html(get_page_url(1))
+        chapters = parse_chapters(html)
+        if not chapters:
+            await msg.edit_text("❌ Не удалось получить список глав.", reply_markup=admin_status_buttons)
+            return
+
+        # Берём последние 10 глав (от новых к старым, но нам нужны не переведённые)
+        # Сортируем от старых к новым, чтобы переводить по порядку
+        chapters_to_translate = []
+        for ch in reversed(chapters):
+            if len(chapters_to_translate) >= 10:
+                break
+            # Проверяем, есть ли уже перевод
+            if not await get_cached_telegraph(ch['id']):
+                chapters_to_translate.append(ch)
+
+        if not chapters_to_translate:
+            await msg.edit_text("ℹ️ Все последние 10 глав уже переведены.", reply_markup=admin_status_buttons)
+            return
+
+        await msg.edit_text(f"📥 Начинаю перевод {len(chapters_to_translate)} глав без рассылки...")
+        translated = 0
+        for i, ch in enumerate(chapters_to_translate):
+            try:
+                url, success = await process_chapter_translation(ch)
+                if success and url:
+                    translated += 1
+                else:
+                    logger.warning(f"Не удалось перевести главу {ch['id']}")
+                # Небольшая пауза между главами
+                await asyncio.sleep(5)
+                # Обновляем сообщение каждые 2 главы
+                if (i + 1) % 2 == 0:
+                    await msg.edit_text(f"📥 Переведено {translated}/{len(chapters_to_translate)} глав...")
+            except Exception as e:
+                logger.exception(f"Ошибка при переводе главы {ch['id']}: {e}")
+                await msg.edit_text(f"⚠️ Ошибка при переводе главы {ch['id']}. Продолжаю...")
+                await asyncio.sleep(2)
+
+        await msg.edit_text(
+            f"✅ Пакетный перевод завершён.\nПереведено {translated} из {len(chapters_to_translate)} глав.",
+            reply_markup=admin_status_buttons
+        )
+    except Exception as e:
+        logger.exception("Ошибка в bulk_translate")
+        await msg.edit_text(f"❌ Ошибка при пакетном переводе: {e}", reply_markup=admin_status_buttons)
 
 # ======================== ПРИНУДИТЕЛЬНЫЙ МОНИТОРИНГ ========================
 async def force_monitor_run(msg: types.Message):
@@ -1258,7 +1195,7 @@ async def on_shutdown():
 
 # ======================== ЗАПУСК ========================
 async def main():
-    global redis_client, bot, PLAYWRIGHT_SEMAPHORE
+    global redis_client, bot
     redis_client = await redis.from_url(REDIS_URL)
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
@@ -1275,22 +1212,18 @@ async def main():
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая")
     dp.message.register(button_next, lambda m: m.text == "➡️ Следующая")
+    dp.message.register(button_support, lambda m: m.text == "🤝 Поддержать")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
-
-    # Премиум меню
-    dp.message.register(button_premium_section, lambda m: m.text == "💎 Премиум")
-    dp.message.register(button_my_premium, lambda m: m.text == "💎 Мой премиум")
-    dp.message.register(button_become_premium, lambda m: m.text == "💎 Стать премиум")
-    dp.message.register(button_back_to_main, lambda m: m.text == "← Назад в главное меню")
 
     dp.message.register(handle_other_text)
 
     # Callback'ы
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
     dp.callback_query.register(admin_force_check, lambda c: c.data == "admin_force_check")
+    dp.callback_query.register(admin_bulk_translate, lambda c: c.data == "admin_bulk_translate")
     dp.callback_query.register(admin_show_subscribers, lambda c: c.data == "admin_subscribers")
     dp.callback_query.register(admin_show_logs, lambda c: c.data == "admin_logs")
     dp.callback_query.register(admin_user_manage, lambda c: c.data == "admin_user_manage")
@@ -1299,7 +1232,6 @@ async def main():
     dp.callback_query.register(admin_block, lambda c: c.data == "admin_block")
     dp.callback_query.register(admin_unblock, lambda c: c.data == "admin_unblock")
     dp.callback_query.register(admin_remove_sub, lambda c: c.data == "admin_remove_sub")
-    dp.callback_query.register(admin_add_premium, lambda c: c.data == "admin_add_premium")
     dp.callback_query.register(admin_cancel, lambda c: c.data == "admin_cancel")
 
     dp.startup.register(on_startup)
