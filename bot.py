@@ -517,19 +517,20 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 
     buttons = [
         [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
-        [KeyboardButton(text="💎 Мой премиум"), KeyboardButton(text="⬅️ Предыдущая глава")],
-        [KeyboardButton(text="➡️ Следующая глава"), KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="⬅️ Предыдущая"), KeyboardButton(text="➡️ Следующая")],
+        [KeyboardButton(text="💎 Премиум")],
     ]
+
     if is_admin:
-        buttons[2].insert(0, KeyboardButton(text="📊 Статус"))
+        buttons.append([KeyboardButton(text="📊 Статус")])
 
     buttons.append([KeyboardButton(text="❌ Отписаться" if is_subscribed else "✅ Подписаться")])
-    buttons.append([KeyboardButton(text="💎 Стать премиум")])
+    buttons.append([KeyboardButton(text="❓ Помощь")])
 
     return ReplyKeyboardMarkup(
         keyboard=buttons,
         resize_keyboard=True,
-        input_field_placeholder="Выберите действие..."
+        input_field_placeholder="Выберите действие…"
     )
 
 cancel_keyboard = ReplyKeyboardMarkup(
@@ -537,6 +538,16 @@ cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+premium_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💎 Стать премиум")],
+        [KeyboardButton(text="💎 Мой премиум")],
+        [KeyboardButton(text="← Назад в главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Премиум-раздел"
+
+    
 admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
@@ -571,10 +582,31 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await save_subscribers(subs)
     await message.answer("✅ Добро пожаловать!", reply_markup=await get_main_menu(uid))
 
+async def button_premium_section(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("Вы заблокированы.")
+        return
+
+    await message.answer(
+        "💎 Премиум-раздел",
+        reply_markup=premium_menu
+    )
+
 async def button_my_premium(message: types.Message):
-    """Новая кнопка для пользователей — показывает оставшееся время премиума"""
     status_text = await get_premium_remaining(message.from_user.id)
-    await message.answer(status_text, reply_markup=await get_main_menu(message.from_user.id))
+    await message.answer(
+        status_text,
+        reply_markup=premium_menu  # остаёмся в премиум-меню
+    )
+
+async def button_back_to_main(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Вернулись в главное меню",
+        reply_markup=await get_main_menu(message.from_user.id)
+    )
 
 async def button_subscribe(message: types.Message, state: FSMContext):
     await state.clear()
@@ -627,16 +659,16 @@ async def button_status(message: types.Message, state: FSMContext):
         reply_markup=admin_status_buttons
     )
 
-async def button_premium(message: types.Message):
+async def button_become_premium(message: types.Message):
     await message.answer(
         "💎 <b>Премиум-подписка</b>\n\n"
-        "✅ Безлимит глав\n"
-        "✅ Будущие романы\n"
-        "✅ Приоритетный перевод\n\n"
-        "👉 Оплата: <a href='https://boosty.to/your_boosty'>Boosty</a>\n"
-        "После оплаты напиши админу!",
+        "💎 Безлимит глав\n"
+        "💎 Приоритетный перевод\n"
+        "💎 Доступ к будущим романам\n\n"
+        "👉 Оплатить: https://boosty.to/1h8u\n\n"
+        "После оплаты напишите администратору (@admin_username) — активируем за 1–5 минут.",
         parse_mode="HTML",
-        reply_markup=await get_main_menu(message.from_user.id)
+        reply_markup=premium_menu  # остаёмся в премиум-меню
     )
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
@@ -1176,10 +1208,11 @@ async def main():
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     # Регистрация всех хендлеров
+    dp.message.register(button_premium_section, lambda m: m.text == "💎 Премиум")
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
     dp.message.register(button_my_premium, lambda m: m.text == "💎 Мой премиум")
-    dp.message.register(button_premium, lambda m: m.text == "💎 Стать премиум")
+    dp.message.register(button_become_premium, lambda m: m.text == "💎 Стать премиум")
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
@@ -1190,6 +1223,7 @@ async def main():
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
     dp.message.register(handle_other_text)
     dp.message.register(cmd_start, Command("start"))
+    dp.message.register(button_back_to_main, lambda m: m.text == "← Назад в главное меню")
 
     # Callback'ы
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
