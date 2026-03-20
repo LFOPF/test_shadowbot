@@ -56,7 +56,6 @@ TELEGRAPH_TITLE_MAX_LENGTH = 200
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Буфер логов для админа
 log_buffer = deque(maxlen=100)
 
 class LogHandler(logging.Handler):
@@ -102,14 +101,12 @@ def clean_title(raw_title: str) -> str:
     ).strip()
 
 def clean_title_for_telegraph(title: str) -> str:
-    # Удаляем пояснения в скобках в конце
     title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
     return title
 
 def text_to_telegraph_nodes(text: str) -> List[Dict]:
-    """Преобразует текст в узлы Telegraph: каждый абзац отдельный <p>."""
     paragraphs = text.split('\n\n')
     nodes = []
     for para in paragraphs:
@@ -209,7 +206,6 @@ async def get_latest_chapter_id() -> Optional[str]:
     first = await get_first_chapter()
     if first:
         return str(first)
-    # fallback
     html = await fetch_html(get_page_url(1))
     if not html:
         return None
@@ -459,11 +455,16 @@ async def translate_title(title: str) -> str:
             async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=30) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    result = data["choices"][0]["message"]["content"].strip()
-                    # Дополнительная очистка: если результат слишком длинный (больше 150), обрезаем
-                    if len(result) > TELEGRAPH_TITLE_MAX_LENGTH:
-                        result = result[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
-                    return result
+                    # Проверка на наличие поля content
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                    if content:
+                        result = content.strip()
+                        if len(result) > TELEGRAPH_TITLE_MAX_LENGTH:
+                            result = result[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
+                        return result
+                    else:
+                        logger.error(f"translate_title: пустой ответ от API")
+                        return title
                 else:
                     logger.error(f"Ошибка перевода заголовка: {resp.status}")
                     return title
@@ -1220,6 +1221,20 @@ async def monitor(check_once=False):
                         translated_urls.append((ch['id'], url))
                     await asyncio.sleep(8)
 
+                # Если есть админ, отправляем ему отчёт перед рассылкой
+                if ADMIN_ID and translated_urls:
+                    admin_id = int(ADMIN_ID)
+                    report_lines = ["✅ Переведены новые главы:"]
+                    for cid, url in translated_urls:
+                        report_lines.append(f"• Глава {cid}: {url}")
+                    await bot.send_message(
+                        admin_id,
+                        "\n".join(report_lines),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+
+                # Рассылка подписчикам
                 if translated_urls:
                     for cid, url in translated_urls:
                         logger.info(f"Рассылка новой главы {cid} подписчикам")
