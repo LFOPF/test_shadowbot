@@ -108,9 +108,16 @@ def clean_title_for_telegraph(title: str) -> str:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
     return title
 
-def text_to_html(text: str) -> str:
+def text_to_telegraph_nodes(text: str) -> List[Dict]:
+    """Преобразует текст в узлы Telegraph: каждый абзац отдельный <p>."""
     paragraphs = text.split('\n\n')
-    return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
+    nodes = []
+    for para in paragraphs:
+        if para.strip():
+            nodes.append({"tag": "p", "children": [para]})
+    if not nodes:
+        nodes = [{"tag": "p", "children": [text]}]
+    return nodes
 
 def get_page_url(page_num: int = 1) -> str:
     if page_num == 1:
@@ -148,7 +155,6 @@ async def check_rate_limit(user_id: int) -> bool:
         return False
     return True
 
-# ======================== НОВАЯ ФУНКЦИЯ: ОСТАВШЕЕСЯ ВРЕМЯ ПРЕМИУМА ========================
 async def get_premium_remaining(user_id: int) -> str:
     try:
         value = await redis_client.hget(PREMIUM_KEY, str(user_id))
@@ -159,7 +165,6 @@ async def get_premium_remaining(user_id: int) -> str:
         now = time.time()
 
         if expire <= now:
-            # await redis_client.hdel(PREMIUM_KEY, str(user_id))  # можно раскомментировать для автоочистки
             return "Премиум истёк.\n\n💎 Оформи новую подписку через кнопку «Стать премиум»."
 
         remaining = expire - now
@@ -233,19 +238,42 @@ async def save_last_chapter(ch_id: str):
     except Exception as e:
         logger.error(f"save_last_chapter error: {e}")
 
-async def get_latest_chapter_id() -> Optional[str]:
-    cached = await get_last_chapter()
-    if cached:
-        return cached
+async def get_first_chapter() -> Optional[int]:
+    """Возвращает номер самой новой главы из Redis, при необходимости обновляя."""
+    try:
+        cached = await redis_client.get("first_chapter")
+        if cached:
+            return int(cached.decode())
+    except Exception as e:
+        logger.error(f"get_first_chapter cached error: {e}")
+
+    # Обновляем из первой страницы
     html = await fetch_html(get_page_url(1))
     if not html:
         return None
     chapters = parse_chapters(html)
     if not chapters:
         return None
-    latest = chapters[0]['id']
-    await save_last_chapter(latest)
-    return latest
+    first = int(chapters[0]['id'])
+    try:
+        await redis_client.set("first_chapter", str(first), ex=3600)
+    except Exception as e:
+        logger.error(f"save_first_chapter error: {e}")
+    return first
+
+async def get_latest_chapter_id() -> Optional[str]:
+    # Используем first_chapter как самый последний номер
+    first = await get_first_chapter()
+    if first:
+        return str(first)
+    # fallback
+    html = await fetch_html(get_page_url(1))
+    if not html:
+        return None
+    chapters = parse_chapters(html)
+    if not chapters:
+        return None
+    return chapters[0]['id']
 
 # ======================== БЛОКИРОВКИ ========================
 blocked_users_key = "blocked_users"
@@ -345,11 +373,13 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     return chapters
 
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
-    latest = await get_latest_chapter_id()
-    if not latest:
+    first = await get_first_chapter()
+    if not first:
         return await find_chapter_by_number_binary(chapter_number)
 
-    page_estimate = max(1, 1 + (int(latest) - chapter_number) // CHAPTERS_PER_PAGE)
+    page_estimate = 1 + (first - chapter_number) // CHAPTERS_PER_PAGE
+    if page_estimate < 1:
+        page_estimate = 1
     if page_estimate > MAX_PAGES:
         page_estimate = MAX_PAGES
 
@@ -360,6 +390,7 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
         for ch in chapters:
             if int(ch['id']) == chapter_number:
                 return ch
+
     return await find_chapter_by_number_binary(chapter_number)
 
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
@@ -447,13 +478,14 @@ async def translate_text(text: str, retries: int = 3) -> str:
     return "[Не удалось перевести]"
 
 # ======================== TELEGRAPH ========================
-async def create_telegraph_page(title: str, content_html: str) -> Optional[str]:
+async def create_telegraph_page(title: str, content_text: str) -> Optional[str]:
     clean_title_text = clean_title_for_telegraph(title)
+    nodes = text_to_telegraph_nodes(content_text)  # теперь без лишних тегов
     payload = {
         "access_token": TELEGRAPH_ACCESS_TOKEN,
         "title": clean_title_text,
         "author_name": "Shadow Slave Bot",
-        "content": [{"tag": "p", "children": [content_html]}],
+        "content": nodes,
     }
 
     for attempt in range(2):
@@ -483,8 +515,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     await save_cached_title(cid, translated_title_clean)
 
-    html = text_to_html(translated)
-    new_url = await create_telegraph_page(translated_title_clean, html)
+    new_url = await create_telegraph_page(translated_title_clean, translated)
 
     if new_url:
         await save_telegraph_url(cid, new_url)
@@ -548,7 +579,6 @@ premium_menu = ReplyKeyboardMarkup(
     input_field_placeholder="Премиум-раздел"
 )
 
-    
 admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
@@ -589,7 +619,6 @@ async def button_premium_section(message: types.Message, state: FSMContext):
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
         return
-
     await message.answer(
         "💎 Премиум-раздел",
         reply_markup=premium_menu
@@ -599,7 +628,7 @@ async def button_my_premium(message: types.Message):
     status_text = await get_premium_remaining(message.from_user.id)
     await message.answer(
         status_text,
-        reply_markup=premium_menu  # остаёмся в премиум-меню
+        reply_markup=premium_menu
     )
 
 async def button_back_to_main(message: types.Message, state: FSMContext):
@@ -669,7 +698,7 @@ async def button_become_premium(message: types.Message):
         "👉 Оплатить: https://boosty.to/1h8u\n\n"
         "После оплаты напишите администратору (@Ihateey0u) — активируем за 1–5 минут.",
         parse_mode="HTML",
-        reply_markup=premium_menu  # остаёмся в премиум-меню
+        reply_markup=premium_menu
     )
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
@@ -678,8 +707,16 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
         return
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_chapter)
+
+    # Получаем последнюю доступную главу для отображения диапазона
+    latest = await get_latest_chapter_id()
+    if latest:
+        range_text = f" (доступны главы 1–{latest})"
+    else:
+        range_text = ""
+
     await message.answer(
-        "Введите номер главы для перевода:",
+        f"Введите номер главы для перевода{range_text}:",
         reply_markup=cancel_keyboard
     )
 
@@ -1091,9 +1128,6 @@ async def admin_add_premium(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def process_admin_user_id(message: types.Message, state: FSMContext):
-    if not message.text.strip().replace(' ', '').isdigit() and ' ' not in message.text:
-        await message.answer("Некорректный формат.")
-        return
     data = await state.get_data()
     action = data.get("action_type")
     request_msg_id = data.get("request_msg_id")
@@ -1101,22 +1135,34 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
 
     if action == "premium":
         try:
-            uid_str, days_str = message.text.split()
-            uid = int(uid_str)
-            days = int(days_str)
-            await add_premium(uid, days)
-            response = f"✅ Премиум добавлен пользователю {uid} на {days} дней"
+            parts = message.text.split()
+            if len(parts) != 2:
+                response = "Неверный формат. Пример: 123456789 30"
+            else:
+                uid = int(parts[0])
+                days = int(parts[1])
+                await add_premium(uid, days)
+                response = f"✅ Премиум добавлен пользователю {uid} на {days} дней"
         except Exception:
             response = "Неверный формат. Пример: 123456789 30"
     elif action == "block":
-        await block_user(int(message.text))
-        response = f"Пользователь {message.text} заблокирован"
+        if message.text.isdigit():
+            await block_user(int(message.text))
+            response = f"Пользователь {message.text} заблокирован"
+        else:
+            response = "Некорректный ID."
     elif action == "unblock":
-        await unblock_user(int(message.text))
-        response = f"Пользователь {message.text} разблокирован"
+        if message.text.isdigit():
+            await unblock_user(int(message.text))
+            response = f"Пользователь {message.text} разблокирован"
+        else:
+            response = "Некорректный ID."
     elif action == "remove":
-        removed = await remove_subscriber(int(message.text))
-        response = f"Пользователь {message.text} {'удалён' if removed else 'не найден'} из подписчиков"
+        if message.text.isdigit():
+            removed = await remove_subscriber(int(message.text))
+            response = f"Пользователь {message.text} {'удалён' if removed else 'не найден'} из подписчиков"
+        else:
+            response = "Некорректный ID."
     else:
         response = "Неизвестное действие."
 
@@ -1147,8 +1193,17 @@ async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
         try:
-            html = await fetch_html(TARGET_URL)
+            html = await fetch_html(get_page_url(1))
             chapters = parse_chapters(html)
+            if not chapters:
+                logger.error("Не найдено глав на первой странице")
+                await asyncio.sleep(60)
+                continue
+
+            latest_id = chapters[0]['id']
+            # Обновляем first_chapter в Redis
+            await redis_client.set("first_chapter", latest_id, ex=3600)
+
             last_str = await get_last_chapter()
             last_int = int(last_str) if last_str and last_str.isdigit() else 0
 
@@ -1208,24 +1263,23 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
-    # Регистрация всех хендлеров
     # Состояния
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
-    
+
     # Старт
     dp.message.register(cmd_start, Command("start"))
 
     # Основное меню
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
-    dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
-    dp.message.register(button_next, lambda m: m.text == "➡️ Следующая глава")
+    dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая")
+    dp.message.register(button_next, lambda m: m.text == "➡️ Следующая")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
-    
+
     # Премиум меню
     dp.message.register(button_premium_section, lambda m: m.text == "💎 Премиум")
     dp.message.register(button_my_premium, lambda m: m.text == "💎 Мой премиум")
