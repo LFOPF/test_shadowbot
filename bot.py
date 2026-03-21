@@ -1313,15 +1313,18 @@ async def on_startup():
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
+                '--disable-dev-shm-usage',         
                 '--disable-gpu',
                 '--disable-extensions',
-            ]
-        )    
-        browser_context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                '--single-process',                 
+            ],
         )
-        logger.info("Playwright готов")
+        browser_context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...',
+            viewport={'width': 1280, 'height': 800},
+            ignore_https_errors=True,
+        )
+        logger.info("Playwright и браузер успешно инициализированы")
     except Exception as e:
         logger.exception(f"Ошибка инициализации Playwright: {e}")
         raise
