@@ -10,9 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 
 # Переменные окружения
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PLAYWRIGHT_BROWSERS_PATH=0  # браузеры внутри контейнера, а не в /root/.cache
+ENV PYTHONUNBUFFERED=1
+    PYTHONDONTWRITEBYTECODE=1
+    PLAYWRIGHT_BROWSERS_PATH=0
 
 # Railway
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
