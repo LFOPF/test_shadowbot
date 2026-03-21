@@ -11,7 +11,6 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
-    retry_if_result,
     wait_fixed,
 )
 from tenacity import before_sleep_log, after_log
@@ -35,7 +34,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Telegram ID администратора
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
@@ -47,7 +46,7 @@ SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
 CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
-NOVEL_ID = "1205249"  # ID нашего романа
+NOVEL_ID = "1205249"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -83,6 +82,7 @@ class LogHandler(logging.Handler):
 logging.getLogger().addHandler(LogHandler())
 logging.getLogger().setLevel(logging.INFO)
 
+# ======================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ========================
 redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
@@ -94,7 +94,6 @@ class ChapterSelection(StatesGroup):
 
 class AdminActions(StatesGroup):
     waiting_for_user_id = State()
-    action_type = State()
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -108,6 +107,7 @@ def extract_chapter_id(text: str) -> Optional[str]:
             return m.group(1)
     return None
 
+
 def clean_title(raw_title: str) -> str:
     return re.sub(
         r'\s*\d+\s*(?:minute|hour|day|week|month|year)s?\s+ago$',
@@ -116,15 +116,18 @@ def clean_title(raw_title: str) -> str:
         flags=re.IGNORECASE
     ).strip()
 
+
 def clean_title_for_telegraph(title: str) -> str:
     title = re.sub(r'\s*\([^)]*\)$', '', title).strip()
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
-        title = title[:TELEGRAPH_TITLE_MAX_LENGTH-3] + "..."
+        title = title[:TELEGRAPH_TITLE_MAX_LENGTH - 3] + "..."
     return title
+
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
     return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
+
 
 def get_page_url(page_num: int) -> str:
     if page_num == 1:
@@ -132,8 +135,37 @@ def get_page_url(page_num: int) -> str:
     base = TARGET_URL.rstrip('/')
     return f"{base}/page/{page_num}/"
 
+
 def get_telegraph_path(url: str) -> str:
     return urlparse(url).path.split('/')[-1]
+
+
+# ======================== SAFE TELEGRAM HELPERS (ИСПРАВЛЕНИЕ ОШИБКИ) ========================
+async def safe_edit_text(
+    message: types.Message,
+    text: str,
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[InlineKeyboardMarkup | ReplyKeyboardMarkup] = None
+) -> None:
+    """Безопасное редактирование сообщения — игнорирует 'message is not modified'."""
+    try:
+        await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        logger.warning(f"TelegramBadRequest при edit: {e}")
+    except Exception as e:
+        logger.warning(f"Ошибка редактирования сообщения: {e}")
+
+
+async def safe_delete(message: Optional[types.Message]) -> None:
+    """Безопасное удаление сообщения."""
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 # ======================== REDIS ========================
@@ -145,12 +177,14 @@ async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
         logger.error(f"get_cached_telegraph error: {e}")
         return None
 
+
 async def save_telegraph_url(chapter_id: str, url: str):
     try:
         await redis_client.hset("telegraph_urls", chapter_id, url)
         logger.info(f"Сохранён URL для главы {chapter_id}: {url}")
     except Exception as e:
         logger.error(f"save_telegraph_url error: {e}")
+
 
 async def get_cached_title(chapter_id: str) -> Optional[str]:
     try:
@@ -160,11 +194,13 @@ async def get_cached_title(chapter_id: str) -> Optional[str]:
         logger.error(f"get_cached_title error: {e}")
         return None
 
+
 async def save_cached_title(chapter_id: str, title: str):
     try:
         await redis_client.hset("chapter_titles", chapter_id, title)
     except Exception as e:
         logger.error(f"save_cached_title error: {e}")
+
 
 async def load_subscribers() -> Set[int]:
     try:
@@ -176,11 +212,13 @@ async def load_subscribers() -> Set[int]:
         logger.error(f"load_subscribers error: {e}")
         return set()
 
+
 async def save_subscribers(subs: Set[int]):
     try:
         await redis_client.set("subscribers", json.dumps(list(subs)))
     except Exception as e:
         logger.error(f"save_subscribers error: {e}")
+
 
 async def get_last_chapter() -> Optional[str]:
     try:
@@ -190,12 +228,14 @@ async def get_last_chapter() -> Optional[str]:
         logger.error(f"get_last_chapter error: {e}")
         return None
 
+
 async def save_last_chapter(ch_id: str):
     try:
         await redis_client.set("last_chapter", ch_id)
     except Exception as e:
         logger.error(f"save_last_chapter error: {e}")
-        
+
+
 @retry(**RETRY_WEB)
 async def get_first_chapter() -> Optional[int]:
     try:
@@ -222,12 +262,14 @@ async def get_first_chapter() -> Optional[int]:
 # ======================== БЛОКИРОВКИ ========================
 blocked_users_key = "blocked_users"
 
+
 async def is_user_blocked(user_id: int) -> bool:
     try:
         return await redis_client.sismember(blocked_users_key, str(user_id))
     except Exception as e:
         logger.error(f"is_user_blocked error: {e}")
         return False
+
 
 async def block_user(user_id: int):
     try:
@@ -237,12 +279,14 @@ async def block_user(user_id: int):
     except Exception as e:
         logger.error(f"block_user error: {e}")
 
+
 async def unblock_user(user_id: int):
     try:
         await redis_client.srem(blocked_users_key, str(user_id))
         logger.info(f"Пользователь {user_id} разблокирован")
     except Exception as e:
         logger.error(f"unblock_user error: {e}")
+
 
 async def remove_subscriber(user_id: int) -> bool:
     subs = await load_subscribers()
@@ -263,6 +307,7 @@ async def get_user_bookmark(user_id: int) -> Optional[str]:
         logger.error(f"get_user_bookmark error: {e}")
         return None
 
+
 async def save_user_bookmark(user_id: int, chapter_id: str):
     try:
         await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
@@ -275,21 +320,19 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 async def fetch_html(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
-        
+
     page = await browser_context.new_page()
     try:
         await page.goto(url, wait_until="networkidle", timeout=90000)
-        
         try:
             await page.wait_for_selector('a:has-text("Chapter")', timeout=40000)
         except PlaywrightError:
             logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
-            
         await page.wait_for_timeout(2000)
         return await page.content()
-    
     finally:
         await page.close()
+
 
 @retry(**RETRY_WEB)
 async def fetch_chapter_text(url: str) -> str:
@@ -299,7 +342,6 @@ async def fetch_chapter_text(url: str) -> str:
     page = await browser_context.new_page()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-
         await page.wait_for_selector('div.text#arrticle', timeout=60000)
 
         paragraphs = await page.evaluate('''() => {
@@ -315,9 +357,9 @@ async def fetch_chapter_text(url: str) -> str:
 
         content = await page.text_content('div.text#arrticle')
         return content.strip() if content else "[Текст не найден]"
-
     finally:
         await page.close()
+
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, 'html.parser')
@@ -329,7 +371,6 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
         if cid and cid.isdigit():
             link = 'https://ranobes.net' + href if not href.startswith('http') else href
             if NOVEL_ID not in link:
-                logger.debug(f"Пропущена ссылка на чужое произведение: {link}")
                 continue
             chapters.append({
                 'id': cid,
@@ -344,15 +385,14 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     else:
         logger.error("Не найдено ни одной главы — структура сайта изменилась?")
     return chapters
-    
+
+
 @retry(**RETRY_WEB)
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
     first_chapter = await get_first_chapter()
     if not first_chapter:
-        logger.warning("Не удалось получить первую главу, переключаюсь на бинарный поиск")
         return await find_chapter_by_number_binary(chapter_number)
 
-    # Быстрый математический расчёт страницы
     page_estimate = 1 + (first_chapter - chapter_number) // CHAPTERS_PER_PAGE
     if page_estimate < 1:
         page_estimate = 1
@@ -368,9 +408,9 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
                 logger.info(f"Глава {chapter_number} найдена на странице {page_estimate}")
                 return ch
 
-    logger.info(f"Глава не на странице {page_estimate}, запускаю бинарный поиск")
     return await find_chapter_by_number_binary(chapter_number)
-    
+
+
 @retry(**RETRY_WEB)
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
     left, right = 1, MAX_PAGES
@@ -415,6 +455,7 @@ USER_PROMPT_TEMPLATE = (
     "Текст:\n\n{text}"
 )
 
+
 @retry(**RETRY_API)
 async def translate_text(text: str) -> str:
     if len(text) > 120000:
@@ -451,7 +492,7 @@ async def translate_text(text: str) -> str:
 
             elif resp.status == 429:
                 logger.warning("Rate limit от OpenRouter")
-                raise aiohttp.ClientError("Rate limit")  # tenacity сделает backoff
+                raise aiohttp.ClientError("Rate limit")
 
             else:
                 text_resp = await resp.text()
@@ -489,8 +530,6 @@ async def create_telegraph_page(
                     if text:
                         children.append(text)
             nodes.append({"tag": "p", "children": children})
-        else:
-            pass
 
     if not nodes:
         nodes = [{"tag": "p", "children": [content_html]}]
@@ -517,10 +556,8 @@ async def create_telegraph_page(
                         if error == 'TITLE_TOO_LONG' and attempt == 0:
                             clean_title_text = clean_title_text[:150] + "..."
                             payload["title"] = clean_title_text
-                            logger.info(f"Повторная попытка с укороченным заголовком: {clean_title_text}")
                             continue
-                        else:
-                            return None
+                        return None
         except Exception as e:
             logger.exception(f"Ошибка при создании страницы Telegraph: {e}")
             return None
@@ -532,7 +569,7 @@ async def create_telegraph_page(
     reraise=True,
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=2, min=5, max=120),
-    retry=retry_if_exception_type(Exception),   # почти всё
+    retry=retry_if_exception_type(Exception),
     before_sleep=before_sleep_log(logger, logging.ERROR),
 )
 async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
@@ -565,9 +602,8 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
     if new_url:
         await save_telegraph_url(cid, new_url)
         return new_url, True
-    else:
-        logger.error(f"Не удалось создать Telegraph для главы {cid}")
-        return None, False
+    logger.error(f"Не удалось создать Telegraph для главы {cid}")
+    return None, False
 
 
 # ======================== РАССЫЛКА ========================
@@ -581,7 +617,6 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
 
     async def send_with_limit(uid):
         if await is_user_blocked(uid):
-            logger.info(f"Пользователь {uid} заблокирован, пропускаем")
             return
         async with semaphore:
             try:
@@ -592,7 +627,7 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
                     reply_markup=reply_markup
                 )
             except (TelegramForbiddenError, TelegramBadRequest):
-                logger.info(f"Пользователь {uid} недоступен, будет удалён при следующей очистке")
+                logger.info(f"Пользователь {uid} недоступен")
             except Exception as e:
                 logger.error(f"Ошибка отправки {uid}: {e}")
 
@@ -627,6 +662,7 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         input_field_placeholder="Выберите действие..."
     )
 
+
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
     resize_keyboard=True,
@@ -655,7 +691,7 @@ admin_user_manage_buttons = InlineKeyboardMarkup(
 )
 
 
-# ======================== ХЕНДЛЕРЫ ОСНОВНЫХ ДЕЙСТВИЙ ========================
+# ======================== ХЕНДЛЕРЫ ========================
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
@@ -667,15 +703,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
         subs.add(uid)
         await save_subscribers(subs)
         await message.answer(
-            "✅ Подписка оформлена!\n\n"
-            "Используйте кнопки меню для навигации.",
+            "✅ Подписка оформлена!\n\nИспользуйте кнопки меню для навигации.",
             reply_markup=await get_main_menu(uid)
         )
     else:
-        await message.answer(
-            "Вы уже подписаны!",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("Вы уже подписаны!", reply_markup=await get_main_menu(uid))
+
 
 async def button_support(message: types.Message, state: FSMContext):
     await state.clear()
@@ -685,32 +718,26 @@ async def button_support(message: types.Message, state: FSMContext):
         return
     await message.answer(
         "❤️ Спасибо, что пользуетесь ботом!\n\n"
-        "Если вы хотите поддержать проект и помочь его развитию, "
-        "вы можете сделать это на Boosty:\n\n"
-        "👉 https://boosty.to/1h8u\n\n"
-        "Любая поддержка очень важна! 🙏",
+        "Если вы хотите поддержать проект — Boosty:\n"
+        "👉 https://boosty.to/1h8u",
         reply_markup=await get_main_menu(uid)
     )
+
 
 async def button_subscribe(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
-        await message.answer("Вы заблокированы и не можете подписаться.")
+        await message.answer("Вы заблокированы.")
         return
     subs = await load_subscribers()
     if uid in subs:
-        await message.answer(
-            "Вы уже подписаны на уведомления.",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("Вы уже подписаны.", reply_markup=await get_main_menu(uid))
     else:
         subs.add(uid)
         await save_subscribers(subs)
-        await message.answer(
-            "✅ Вы подписались на уведомления о новых главах!",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("✅ Вы подписались!", reply_markup=await get_main_menu(uid))
+
 
 async def button_unsubscribe(message: types.Message, state: FSMContext):
     await state.clear()
@@ -722,100 +749,81 @@ async def button_unsubscribe(message: types.Message, state: FSMContext):
     if uid in subs:
         subs.remove(uid)
         await save_subscribers(subs)
-        await message.answer(
-            "❌ Вы отписались от уведомлений.",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("❌ Вы отписались.", reply_markup=await get_main_menu(uid))
     else:
-        await message.answer(
-            "Вы не были подписаны.",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("Вы не были подписаны.", reply_markup=await get_main_menu(uid))
+
 
 async def button_status(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if ADMIN_ID is None or str(uid) != ADMIN_ID:
-        await message.answer("У вас нет доступа к этой функции.")
+        await message.answer("Доступ запрещён.")
         return
-    await message.answer(
-        "Выберите действие:",
-        reply_markup=admin_status_buttons
-    )
+    await message.answer("Выберите действие:", reply_markup=admin_status_buttons)
 
 
-# ======================== ХЕНДЛЕРЫ АДМИНИСТРАТОРА ========================
+# ======================== АДМИН ХЕНДЛЕРЫ ========================
 async def admin_clear_cache(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     try:
         await redis_client.delete("first_chapter")
-        await callback.answer("Кэш очищен", show_alert=False)
+        await callback.answer("Кэш очищен")
         await callback.message.edit_text(
-            "✅ Кэш первой главы очищен. При следующем поиске будет загружена актуальная информация.",
+            "✅ Кэш первой главы очищен.",
             reply_markup=admin_status_buttons
         )
     except Exception as e:
         logger.exception("Ошибка очистки кэша")
-        await callback.answer("Ошибка при очистке", show_alert=True)
+        await callback.answer("Ошибка", show_alert=True)
+
 
 async def admin_force_check(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
-    await callback.answer("Запускаю принудительную проверку...", show_alert=False)
-    msg = await callback.message.edit_text("🔄 Запущена принудительная проверка новых глав...", reply_markup=admin_status_buttons)
+    await callback.answer("Запуск проверки...")
+    msg = await callback.message.edit_text("🔄 Принудительная проверка запущена...", reply_markup=admin_status_buttons)
     asyncio.create_task(force_monitor_run(msg))
+
 
 async def admin_bulk_translate(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
-    await callback.answer("Запускаю пакетный перевод...", show_alert=False)
-    msg = await callback.message.edit_text("📥 Начинаю пакетный перевод 10 последних глав...", reply_markup=admin_status_buttons)
+    await callback.answer("Запуск пакетного перевода...")
+    msg = await callback.message.edit_text("📥 Пакетный перевод запущен...", reply_markup=admin_status_buttons)
     asyncio.create_task(bulk_translate(msg))
+
 
 async def admin_show_subscribers(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     subs = await load_subscribers()
-    if not subs:
-        text = "Нет подписчиков."
-    else:
-        subs_list = list(subs)
-        subs_preview = subs_list[:20]
-        text = f"Всего подписчиков: {len(subs)}\n"
-        text += "Первые 20:\n" + "\n".join(str(uid) for uid in subs_preview)
-        if len(subs_list) > 20:
-            text += "\n..."
+    text = f"Всего подписчиков: {len(subs)}" if subs else "Нет подписчиков."
     await callback.message.edit_text(text, reply_markup=admin_status_buttons)
     await callback.answer()
+
 
 async def admin_show_logs(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
-    if not log_buffer:
-        text = "Логи отсутствуют."
-    else:
-        logs = list(log_buffer)[-10:]
-        text = "Последние 10 записей лога:\n" + "\n".join(logs)
-        if len(text) > 4096:
-            text = text[:4093] + "..."
+    text = "Последние 10 логов:\n" + "\n".join(list(log_buffer)[-10:]) if log_buffer else "Логи отсутствуют."
     await callback.message.edit_text(text, reply_markup=admin_status_buttons)
     await callback.answer()
+
 
 async def admin_user_manage(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
-    await callback.message.edit_text(
-        "Выберите действие с пользователем:",
-        reply_markup=admin_user_manage_buttons
-    )
+    await callback.message.edit_text("Выберите действие:", reply_markup=admin_user_manage_buttons)
     await callback.answer()
+
 
 async def admin_back_to_main(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -823,6 +831,7 @@ async def admin_back_to_main(callback: types.CallbackQuery):
         return
     await callback.message.edit_text("Выберите действие:", reply_markup=admin_status_buttons)
     await callback.answer()
+
 
 async def admin_close(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
@@ -832,7 +841,7 @@ async def admin_close(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ======================== ХЕНДЛЕРЫ ДЛЯ ВВОДА ID ПОЛЬЗОВАТЕЛЯ ========================
+# ======================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ========================
 async def admin_action_start(callback: types.CallbackQuery, state: FSMContext, action: str):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -840,51 +849,54 @@ async def admin_action_start(callback: types.CallbackQuery, state: FSMContext, a
     await state.set_state(AdminActions.waiting_for_user_id)
     await state.update_data(action_type=action)
     msg = await callback.message.edit_text(
-        "Введите ID пользователя (число):",
+        "Введите ID пользователя:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]])
     )
     await state.update_data(request_msg_id=msg.message_id)
     await callback.answer()
 
+
 async def admin_block(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "block")
+
 
 async def admin_unblock(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "unblock")
 
+
 async def admin_remove_sub(callback: types.CallbackQuery, state: FSMContext):
     await admin_action_start(callback, state, "remove")
 
+
 async def process_admin_user_id(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Некорректный ID. Введите число или нажмите Отмена.")
+        await message.answer("Введите число или Отмена.")
         return
     user_id = int(message.text)
     data = await state.get_data()
     action = data.get("action_type")
     request_msg_id = data.get("request_msg_id")
-    response = ""
+
     if action == "block":
         await block_user(user_id)
-        response = f"Пользователь {user_id} заблокирован и удалён из подписчиков."
+        response = f"Пользователь {user_id} заблокирован."
     elif action == "unblock":
         await unblock_user(user_id)
         response = f"Пользователь {user_id} разблокирован."
     elif action == "remove":
         removed = await remove_subscriber(user_id)
-        if removed:
-            response = f"Пользователь {user_id} удалён из подписчиков."
-        else:
-            response = f"Пользователь {user_id} не найден в подписчиках."
+        response = f"Пользователь {user_id} удалён из подписчиков." if removed else f"Пользователь {user_id} не найден."
     else:
         response = "Неизвестное действие."
+
     await state.clear()
     if request_msg_id:
         try:
             await message.bot.delete_message(chat_id=message.chat.id, message_id=request_msg_id)
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение с запросом: {e}")
+        except Exception:
+            pass
     await message.answer(response, reply_markup=admin_status_buttons)
+
 
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -901,19 +913,17 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
     await state.set_state(ChapterSelection.waiting_for_chapter)
     last_chapter = await get_last_chapter() or "?"
     await message.answer(
-        f"Введите номер главы для перевода (от 1 до {last_chapter}):",
+        f"Введите номер главы (1 — {last_chapter}):",
         reply_markup=cancel_keyboard
     )
+
 
 async def button_bookmark(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer(
-            "У вас ещё нет закладки. Выберите главу через кнопку «📖 Выбор главы».",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("У вас ещё нет закладки.", reply_markup=await get_main_menu(uid))
         return
     await send_chapter_to_user(uid, int(bookmark), initial_message=message)
 
@@ -923,14 +933,12 @@ async def button_prev(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("У вас нет закладки.", reply_markup=await get_main_menu(uid))
+        await message.answer("Нет закладки.", reply_markup=await get_main_menu(uid))
         return
-
     prev_num = int(bookmark) - 1
     if prev_num < 1:
         await message.answer("Это первая глава.", reply_markup=await get_main_menu(uid))
         return
-
     await send_chapter_to_user(uid, prev_num, initial_message=message)
 
 
@@ -939,9 +947,8 @@ async def button_next(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("У вас нет закладки.", reply_markup=await get_main_menu(uid))
+        await message.answer("Нет закладки.", reply_markup=await get_main_menu(uid))
         return
-
     next_num = int(bookmark) + 1
     await send_chapter_to_user(uid, next_num, initial_message=message)
 
@@ -959,83 +966,79 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("Введите число или нажмите «❌ Отмена».", reply_markup=cancel_keyboard)
+        await message.answer("Введите число или нажмите Отмена.", reply_markup=cancel_keyboard)
         return
 
     chapter_num = int(message.text)
-    status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
+    # ИСПРАВЛЕНИЕ: начальное сообщение с уникальным текстом
+    status_msg = await message.answer(f"🔍 Обработка главы {chapter_num}...")
     await send_chapter_to_user(uid, chapter_num, status_msg=status_msg)
     await state.clear()
+
 
 async def button_help(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     is_admin = ADMIN_ID is not None and str(uid) == ADMIN_ID
     help_text = (
-        "🤖 Доступные действия через кнопки:\n"
-        "📌 Моя закладка – показать перевод текущей сохранённой главы\n"
-        "📖 Выбор главы – ввести номер главы и получить перевод\n"
-        "⬅️ Предыдущая глава – перевод предыдущей главы (относительно закладки)\n"
-        "➡️ Следующая глава – перевод следующей главы (относительно закладки)\n"
+        "🤖 Доступные команды:\n"
+        "📌 Моя закладка — текущая глава\n"
+        "📖 Выбор главы — ввести номер\n"
+        "⬅️ / ➡️ — предыдущая / следующая\n"
+        "✅ / ❌ — подписка / отписка\n"
+        "🤝 Поддержать — Boosty\n"
+        "❓ Помощь — это сообщение"
     )
     if is_admin:
-        help_text += "📊 Статус – дополнительные административные функции\n"
-    help_text += "🤝 Поддержать – поддержать проект\n"
-    help_text += "✅ Подписаться / ❌ Отписаться – управление уведомлениями\n"
-    help_text += "❓ Помощь – это сообщение"
-
+        help_text += "\n📊 Статус — админ-панель"
     await message.answer(help_text, reply_markup=await get_main_menu(uid))
 
-# ======================== УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ГЛАВ ========================
+
+# ======================== УНИВЕРСАЛЬНЫЙ ОТПРАВЩИК ГЛАВЫ ========================
 async def send_chapter_to_user(
     user_id: int,
     chapter_num: int,
     status_msg: Optional[types.Message] = None,
     initial_message: Optional[types.Message] = None,
 ) -> bool:
-    """
-    Универсальная функция для отправки любой главы.
-    Возвращает True, если успешно.
-    """
     uid = user_id
     if await is_user_blocked(uid):
-        await (initial_message or status_msg).answer("Вы заблокированы.")
+        await safe_delete(status_msg)
+        if initial_message:
+            await initial_message.answer("Вы заблокированы.")
         return False
 
-    # 1. Проверяем кэш
+    # 1. Кэш
     cached_url = await get_cached_telegraph(str(chapter_num))
     if cached_url:
         text = f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}"
-        if status_msg:
-            await status_msg.delete()
+        await safe_delete(status_msg)
         await (initial_message or status_msg).answer(
             text, parse_mode="HTML", reply_markup=await get_main_menu(uid)
         )
         await save_user_bookmark(uid, str(chapter_num))
         return True
 
-    # 2. Ищем главу
+    # 2. Поиск (уникальный текст!)
     if status_msg:
-        await status_msg.edit_text(f"🔍 Ищу перевод главы {chapter_num}...")
-    chapter = await find_chapter_by_number(chapter_num)
+        await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
 
+    chapter = await find_chapter_by_number(chapter_num)
     if not chapter:
-        if status_msg:
-            await status_msg.delete()
+        await safe_delete(status_msg)
         await (initial_message or status_msg).answer(
             f"❌ Глава {chapter_num} не найдена.",
             reply_markup=await get_main_menu(uid)
         )
         return False
 
-    # 3. Переводим
+    # 3. Перевод (новый текст!)
     if status_msg:
-        await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
+        await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
 
     try:
         url, success = await process_chapter_translation(chapter)
-        if status_msg:
-            await status_msg.delete()
+        await safe_delete(status_msg)
 
         if success and url:
             text = f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}"
@@ -1044,41 +1047,37 @@ async def send_chapter_to_user(
             )
             await save_user_bookmark(uid, chapter['id'])
             return True
-        else:
-            await (initial_message or status_msg).answer(
-                "❌ Не удалось создать перевод. Попробуйте позже.",
-                reply_markup=await get_main_menu(uid)
-            )
-            return False
+
+        await (initial_message or status_msg).answer(
+            "❌ Не удалось создать перевод. Попробуйте позже.",
+            reply_markup=await get_main_menu(uid)
+        )
+        return False
 
     except Exception as e:
         logger.exception(f"send_chapter_to_user error: {e}")
-        if status_msg:
-            await status_msg.delete()
+        await safe_delete(status_msg)
         await (initial_message or status_msg).answer(
             "❌ Ошибка при обработке главы.",
             reply_markup=await get_main_menu(uid)
         )
         return False
 
+
 async def handle_other_text(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is not None:
         await state.clear()
+        await message.answer("Ввод отменён.", reply_markup=await get_main_menu(message.from_user.id))
+    else:
         await message.answer(
-            "Ввод отменён. Используйте кнопки меню.",
+            "Пожалуйста, используйте кнопки меню.",
             reply_markup=await get_main_menu(message.from_user.id)
         )
-    else:
-        uid = message.from_user.id
-        await message.answer(
-            "Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
-            reply_markup=await get_main_menu(uid)
-        )
+
 
 # ======================== ПАКЕТНЫЙ ПЕРЕВОД ========================
 async def bulk_translate(msg: types.Message):
-    """Переводит последние 10 не переведённых глав без рассылки."""
     try:
         html = await fetch_html(TARGET_URL)
         chapters = parse_chapters(html)
@@ -1086,57 +1085,48 @@ async def bulk_translate(msg: types.Message):
             await msg.edit_text("❌ Не удалось получить список глав.", reply_markup=admin_status_buttons)
             return
 
-        chapters_to_translate = []
-        for ch in reversed(chapters):
-            if len(chapters_to_translate) >= 10:
-                break
-            if not await get_cached_telegraph(ch['id']):
-                chapters_to_translate.append(ch)
+        chapters_to_translate = [ch for ch in reversed(chapters) if not await get_cached_telegraph(ch['id'])][:10]
 
         if not chapters_to_translate:
-            await msg.edit_text("ℹ️ Все последние 10 глав уже переведены.", reply_markup=admin_status_buttons)
+            await msg.edit_text("ℹ️ Все последние главы уже переведены.", reply_markup=admin_status_buttons)
             return
 
-        await msg.edit_text(f"📥 Начинаю перевод {len(chapters_to_translate)} глав без рассылки...")
+        await msg.edit_text(f"📥 Перевод {len(chapters_to_translate)} глав...")
         translated = 0
         for i, ch in enumerate(chapters_to_translate):
             try:
-                logger.info(f"Пакетный перевод: глава {ch['id']}")
                 url, success = await process_chapter_translation(ch)
                 if success and url:
                     translated += 1
-                else:
-                    logger.warning(f"Не удалось перевести главу {ch['id']}")
                 await asyncio.sleep(5)
                 if (i + 1) % 2 == 0:
-                    await msg.edit_text(f"📥 Переведено {translated}/{len(chapters_to_translate)} глав...")
+                    await msg.edit_text(f"📥 Переведено {translated}/{len(chapters_to_translate)}...")
             except Exception as e:
-                logger.exception(f"Ошибка при переводе главы {ch['id']}: {e}")
-                await asyncio.sleep(2)
+                logger.exception(f"Ошибка главы {ch['id']}: {e}")
 
         await msg.edit_text(
-            f"✅ Пакетный перевод завершён.\nПереведено {translated} из {len(chapters_to_translate)} глав.",
+            f"✅ Пакетный перевод завершён: {translated}/{len(chapters_to_translate)}",
             reply_markup=admin_status_buttons
         )
-        logger.info(f"Пакетный перевод завершён: {translated}/{len(chapters_to_translate)} глав")
     except Exception as e:
-        logger.exception("Ошибка в bulk_translate")
-        await msg.edit_text(f"❌ Ошибка при пакетном переводе: {e}", reply_markup=admin_status_buttons)
+        logger.exception("Ошибка bulk_translate")
+        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
 
-# ======================== ПРИНУДИТЕЛЬНЫЙ ЗАПУСК МОНИТОРИНГА ========================
+
+# ======================== ПРИНУДИТЕЛЬНЫЙ МОНИТОРИНГ ========================
 async def force_monitor_run(msg: types.Message):
-    logger.info("Принудительный запуск мониторинга")
+    logger.info("Принудительная проверка")
     try:
         await monitor(check_once=True)
-        await msg.edit_text("✅ Принудительная проверка завершена.", reply_markup=admin_status_buttons)
+        await msg.edit_text("✅ Проверка завершена.", reply_markup=admin_status_buttons)
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка при проверке: {e}", reply_markup=admin_status_buttons)
+        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
+
 
 # ======================== МОНИТОРИНГ ========================
 async def monitor(check_once=False):
-    logger.info("Мониторинг запущен — автоматический перевод и рассылка включены")
+    logger.info("Мониторинг запущен")
     while True:
-        logger.info("Начало проверки")
         try:
             html = await fetch_html(TARGET_URL)
             chapters = parse_chapters(html)
@@ -1148,59 +1138,43 @@ async def monitor(check_once=False):
             if new_chapters:
                 logger.info(f"Новых глав: {len(new_chapters)}")
                 translated_urls = []
-                failed_chapters = []
+                failed = []
 
                 for i, ch in enumerate(new_chapters):
-                    cid = ch['id']
-                    logger.info(f"Автоматическая обработка главы {cid}")
                     try:
                         url, success = await process_chapter_translation(ch)
                         if success and url:
-                            translated_urls.append((cid, url))
+                            translated_urls.append((ch['id'], url))
                         else:
-                            failed_chapters.append(cid)
+                            failed.append(ch['id'])
                     except Exception as e:
-                        logger.exception(f"Ошибка обработки новой главы {cid}")
-                        failed_chapters.append(cid)
-
+                        logger.exception(f"Ошибка главы {ch['id']}")
+                        failed.append(ch['id'])
                     if i < len(new_chapters) - 1:
                         await asyncio.sleep(10)
 
                 if ADMIN_ID:
                     admin_id = int(ADMIN_ID)
                     if translated_urls:
-                        msg_lines = ["✅ Переведены новые главы:"]
-                        for cid, url in translated_urls:
-                            msg_lines.append(f"• Глава {cid}: {url}")
                         await bot.send_message(
                             admin_id,
-                            "\n".join(msg_lines),
+                            "✅ Переведены новые главы:\n" + "\n".join(f"• {cid}: {url}" for cid, url in translated_urls),
                             parse_mode="HTML",
                             disable_web_page_preview=True
                         )
-                    if failed_chapters:
-                        await bot.send_message(
-                            admin_id,
-                            f"❌ Не удалось перевести главы: {', '.join(map(str, failed_chapters))}",
-                            parse_mode="HTML"
-                        )
+                    if failed:
+                        await bot.send_message(admin_id, f"❌ Не удалось: {', '.join(map(str, failed))}")
 
                 max_id = max(int(ch['id']) for ch in new_chapters)
                 await save_last_chapter(str(max_id))
-                logger.info(f"last_chapter обновлён до {max_id}")
 
                 for cid, url in translated_urls:
                     chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
-                    if chapter_info:
-                        await notify_all_subscribers(
-                            f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}",
-                            parse_mode="HTML"
-                        )
-                    else:
-                        await notify_all_subscribers(
-                            f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}",
-                            parse_mode="HTML"
-                        )
+                    notify_text = (
+                        f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}"
+                        if chapter_info else f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}"
+                    )
+                    await notify_all_subscribers(notify_text, parse_mode="HTML")
 
             else:
                 logger.info("Новых глав нет")
@@ -1211,7 +1185,6 @@ async def monitor(check_once=False):
 
         if check_once:
             break
-        logger.info(f"Проверка завершена. Ожидание {CHECK_INTERVAL} сек")
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -1219,42 +1192,33 @@ async def monitor(check_once=False):
 async def on_startup():
     logger.info("Бот запущен. Инициализация Playwright...")
     global playwright_instance, browser_context
-    try:
-        playwright_instance = await async_playwright().start()
+    playwright_instance = await async_playwright().start()
 
-        from playwright._impl._driver import compute_driver_executable
-        logger.info(f"Playwright driver: {compute_driver_executable()}")
+    browser = await playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--single-process',
+            '--disable-extensions',
+        ]
+    )
 
-        browser = await playwright_instance.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',     
-                '--disable-gpu',
-                '--single-process',             
-                '--disable-extensions',
-            ],
-            timeout=90000,                      
-        )
-
-        browser_context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-            viewport={'width': 1280, 'height': 800},
-            ignore_https_errors=True,
-        )
-        logger.info("Браузер успешно запущен!")
-    except Exception as e:
-        logger.exception(f"Ошибка инициализации Playwright: {e}")
-        import os
-        logger.info(f"PLAYWRIGHT_BROWSERS_PATH={os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
-        raise
+    browser_context = await browser.new_context(
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        viewport={'width': 1280, 'height': 800},
+        ignore_https_errors=True,
+    )
+    logger.info("Playwright готов")
 
     asyncio.create_task(monitor())
     logger.info("Мониторинг запущен")
 
+
 async def on_shutdown():
-    logger.info("Бот остановлен. Закрытие ресурсов...")
+    logger.info("Выключение...")
     global playwright_instance, browser_context
     if browser_context:
         await browser_context.close()
@@ -1271,6 +1235,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
+    # Регистрация хендлеров
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
 
@@ -1283,11 +1248,10 @@ async def main():
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
-
     dp.message.register(cmd_start, Command("start"))
-    
     dp.message.register(handle_other_text)
 
+    # Callback-хендлеры
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
     dp.callback_query.register(admin_force_check, lambda c: c.data == "admin_force_check")
     dp.callback_query.register(admin_bulk_translate, lambda c: c.data == "admin_bulk_translate")
@@ -1305,6 +1269,7 @@ async def main():
     dp.shutdown.register(on_shutdown)
 
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
