@@ -1,40 +1,22 @@
-FROM python:3.13-slim
-
-# Устанавливаем все необходимые зависимости для Chromium
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    libglib2.0-0 \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    libxfixes3 \
-    libxcb-shm0 \
-    libxcb1 \
-    libx11-6 \
-    libxext6 \
-    libxrender1 \
-    libxcb-shape0 \
-    libxcb-xfixes0 \
-    && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/playwright/python:v1.50.0-noble  # или новее, например v1.51.0-noble / v1.52.0-noble
 
 WORKDIR /app
 
+# Кэширование слоёв
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем браузеры Playwright через python -m
-RUN python -m playwright install chromium
-
+# Код
 COPY bot.py .
 
+# Переменные окружения
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PLAYWRIGHT_BROWSERS_PATH=0  # браузеры внутри контейнера, а не в /root/.cache
+
+# Railway
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Запуск бота
 CMD ["python", "bot.py"]
