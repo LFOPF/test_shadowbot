@@ -1332,7 +1332,7 @@ async def on_startup():
         )
         logger.info("Браузер успешно запущен!")
     except Exception as e:
-        logger.exception(f"Ошибка инициализации Playwright: {e}")ю
+        logger.exception(f"Ошибка инициализации Playwright: {e}")
         import os
         logger.info(f"PLAYWRIGHT_BROWSERS_PATH={os.getenv('PLAYWRIGHT_BROWSERS_PATH')}")
         raise
