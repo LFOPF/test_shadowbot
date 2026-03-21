@@ -1308,25 +1308,31 @@ async def on_startup():
     global playwright_instance, browser_context
     try:
         playwright_instance = await async_playwright().start()
+        
+        from playwright._impl._driver import compute_driver_executable
+        logger.info(f"Playwright driver path: {compute_driver_executable()}")
+        
         browser = await playwright_instance.chromium.launch(
             headless=True,
+            channel=None,
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',         
+                '--disable-dev-shm-usage',
                 '--disable-gpu',
+                '--single-process',
                 '--disable-extensions',
-                '--single-process',                 
             ],
+            timeout=60000,
         )
         browser_context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...',
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
             viewport={'width': 1280, 'height': 800},
             ignore_https_errors=True,
         )
-        logger.info("Playwright и браузер успешно инициализированы")
+        logger.info("Playwright + Chromium headless успешно запущен")
     except Exception as e:
-        logger.exception(f"Ошибка инициализации Playwright: {e}")
+        logger.exception(f"Критическая ошибка Playwright init: {e}")
         raise
 
     asyncio.create_task(monitor())
