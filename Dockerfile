@@ -11,8 +11,9 @@ COPY bot.py .
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PLAYWRIGHT_BROWSERS_PATH=0
-
+    PLAYWRIGHT_BROWSERS_PATH=0 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
+    
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1 || true
 
