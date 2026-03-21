@@ -6,7 +6,14 @@ import json
 from typing import Optional, Set, List, Dict, Any
 from urllib.parse import urlparse
 from collections import deque
-
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+from tenacity.before import before_sleep_log
+from tenacity.after import after_log
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -242,6 +249,7 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 
 # ======================== PLAYWRIGHT ========================
+
 async def fetch_html(url: str, retries: int = 2) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
