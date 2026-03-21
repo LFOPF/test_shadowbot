@@ -49,6 +49,23 @@ CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
 NOVEL_ID = "1205249"  # ID нашего романа
 
+RETRY_WEB = dict(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    retry=retry_if_exception_type((asyncio.TimeoutError, ConnectionError, OSError, aiohttp.ClientError, PlaywrightError)),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    after=after_log(logger, logging.INFO),
+)
+
+RETRY_API = dict(
+    reraise=True,
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1.5, min=4, max=90),
+    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, TimeoutError, Exception)),  # можно уточнить
+    retry_error_callback= lambda retry_state: logger.error(f"Исчерпаны попытки API: {retry_state.outcome.exception()}")
+)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -250,20 +267,7 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 
 # ======================== PLAYWRIGHT ========================
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(5),      
-    wait=wait_exponential(multiplier=1.5, min=3, max=60), 
-    retry=retry_if_exception_type((
-        asyncio.TimeoutError,
-        PlaywrightError,
-        aiohttp.ClientError, 
-        ConnectionError,
-        OSError,                               
-    )),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    after=after_log(logger, logging.INFO),
-)
+@retry(**RETRY_WEB)
 async def fetch_html(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
@@ -283,20 +287,7 @@ async def fetch_html(url: str) -> str:
     finally:
         await page.close()
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(4),           
-    wait=wait_exponential(multiplier=1.5, min=3, max=60),
-    retry=retry_if_exception_type((
-        asyncio.TimeoutError,
-        PlaywrightError,                        
-        aiohttp.ClientError,                    
-        ConnectionError,
-        OSError,                                
-    )),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    after=after_log(logger, logging.INFO),
-)
+@retry(**RETRY_WEB)
 async def fetch_chapter_text(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
@@ -305,7 +296,7 @@ async def fetch_chapter_text(url: str) -> str:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        await page.wait_for_selector('div.text#arrticle', timeout=45000)
+        await page.wait_for_selector('div.text#arrticle', timeout=60000)
 
         paragraphs = await page.evaluate('''() => {
             const c = document.querySelector('div.text#arrticle');
@@ -477,6 +468,11 @@ async def translate_text(text: str, retries: int = 3) -> str:
 
 
 # ======================== TELEGRAPH ========================
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_fixed(5) + wait_exponential(min=2, max=60),
+    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, Exception)),
+)
 async def create_telegraph_page(
     title: str,
     content_html: str,
@@ -540,6 +536,13 @@ async def create_telegraph_page(
 
 
 # ======================== ОБРАБОТКА ПЕРЕВОДА ГЛАВЫ ========================
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=5, max=120),
+    retry=retry_if_exception_type(Exception),   # почти всё
+    before_sleep=before_sleep_log(logger, logging.ERROR),
+)
 async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
     cid = ch['id']
     title = ch['title']
