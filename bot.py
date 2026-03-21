@@ -516,7 +516,7 @@ async def translate_text(text: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "google/gemini-2.5-flash-lite",
+        "model": "qwen/qwen3.5-flash-02-23",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
