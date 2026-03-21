@@ -469,7 +469,7 @@ async def translate_text(text: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "stepfun/step-3.5-flash:free",
+        "model": "google/gemini-2.5-flash-lite",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
