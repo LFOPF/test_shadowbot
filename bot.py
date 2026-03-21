@@ -49,6 +49,9 @@ CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
 NOVEL_ID = "1205249"  # ID нашего романа
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 RETRY_WEB = dict(
     reraise=True,
     stop=stop_after_attempt(5),
@@ -70,10 +73,6 @@ RETRY_API = dict(
     after=after_log(logger, logging.INFO),
 )
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Простой буфер для логов (последние 100 строк)
 log_buffer = deque(maxlen=100)
 
 class LogHandler(logging.Handler):
