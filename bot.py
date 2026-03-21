@@ -873,6 +873,47 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
         reply_markup=cancel_keyboard
     )
 
+async def button_bookmark(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    bookmark = await get_user_bookmark(uid)
+    if not bookmark:
+        await message.answer(
+            "У вас ещё нет закладки. Выберите главу через кнопку «📖 Выбор главы».",
+            reply_markup=await get_main_menu(uid)
+        )
+        return
+    await send_chapter_to_user(uid, int(bookmark), initial_message=message)
+
+
+async def button_prev(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    bookmark = await get_user_bookmark(uid)
+    if not bookmark:
+        await message.answer("У вас нет закладки.", reply_markup=await get_main_menu(uid))
+        return
+
+    prev_num = int(bookmark) - 1
+    if prev_num < 1:
+        await message.answer("Это первая глава.", reply_markup=await get_main_menu(uid))
+        return
+
+    await send_chapter_to_user(uid, prev_num, initial_message=message)
+
+
+async def button_next(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    bookmark = await get_user_bookmark(uid)
+    if not bookmark:
+        await message.answer("У вас нет закладки.", reply_markup=await get_main_menu(uid))
+        return
+
+    next_num = int(bookmark) + 1
+    await send_chapter_to_user(uid, next_num, initial_message=message)
+
+
 async def process_chapter_number(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if await is_user_blocked(uid):
@@ -882,252 +923,17 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
 
     if message.text == "❌ Отмена":
         await state.clear()
-        await message.answer(
-            "Ввод отменён.",
-            reply_markup=await get_main_menu(uid)
-        )
+        await message.answer("Ввод отменён.", reply_markup=await get_main_menu(uid))
         return
 
     if not message.text.isdigit():
-        await message.answer(
-            "Пожалуйста, введите число. Если хотите отменить ввод, нажмите кнопку «❌ Отмена».",
-            reply_markup=cancel_keyboard
-        )
+        await message.answer("Введите число или нажмите «❌ Отмена».", reply_markup=cancel_keyboard)
         return
 
     chapter_num = int(message.text)
-
     status_msg = await message.answer(f"🔍 Ищу перевод главы {chapter_num}...")
-
-    cached_url = await get_cached_telegraph(str(chapter_num))
-    if cached_url:
-        await status_msg.delete()
-        await message.answer(
-            f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML",
-            reply_markup=await get_main_menu(uid)
-        )
-        await save_user_bookmark(uid, str(chapter_num))
-        await state.clear()
-        return
-
-    chapter = await find_chapter_by_number(chapter_num)
-    if not chapter:
-        await status_msg.delete()
-        await message.answer(
-            f"Глава с номером {chapter_num} не найдена. Проверьте номер.",
-            reply_markup=await get_main_menu(uid)
-        )
-        await state.clear()
-        return
-
-    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
-    try:
-        url, success = await process_chapter_translation(chapter)
-        await status_msg.delete()
-        if success and url:
-            await message.answer(
-                f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}",
-                parse_mode="HTML",
-                reply_markup=await get_main_menu(uid)
-            )
-            await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(
-                "❌ Не удалось создать перевод. Попробуйте позже.",
-                reply_markup=await get_main_menu(uid)
-            )
-    except Exception as e:
-        logger.exception(f"process_chapter_number translation error: {e}")
-        await message.answer(
-            "❌ Ошибка при обработке главы.",
-            reply_markup=await get_main_menu(uid)
-        )
-    finally:
-        await state.clear()
-
-async def button_bookmark(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    if await is_user_blocked(uid):
-        await message.answer("Вы заблокированы.")
-        return
+    await send_chapter_to_user(uid, chapter_num, status_msg=status_msg)
     await state.clear()
-    bookmark = await get_user_bookmark(uid)
-    if not bookmark:
-        await message.answer(
-            "У вас ещё нет закладки. Выберите главу через кнопку «📖 Выбор главы».",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    cached_url = await get_cached_telegraph(bookmark)
-    if cached_url:
-        await message.answer(
-            f"📖 <b>Глава {bookmark}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML",
-            reply_markup=await get_main_menu(uid)
-        )
-        await save_user_bookmark(uid, bookmark)
-        return
-
-    status_msg = await message.answer(f"🔍 Ищу перевод главы {bookmark}...")
-    chapter = await find_chapter_by_number(int(bookmark))
-    if not chapter:
-        await status_msg.delete()
-        await message.answer(
-            "Закладка указывает на несуществующую главу. Установите новую закладку.",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {bookmark}...")
-    try:
-        url, success = await process_chapter_translation(chapter)
-        await status_msg.delete()
-        if success and url:
-            await message.answer(
-                f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}",
-                parse_mode="HTML",
-                reply_markup=await get_main_menu(uid)
-            )
-            await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(
-                "❌ Не удалось создать перевод.",
-                reply_markup=await get_main_menu(uid)
-            )
-    except Exception as e:
-        logger.exception(f"button_bookmark error: {e}")
-        await message.answer(
-            "❌ Ошибка при загрузке главы.",
-            reply_markup=await get_main_menu(uid)
-        )
-
-async def button_prev(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    if await is_user_blocked(uid):
-        await message.answer("Вы заблокированы.")
-        return
-    await state.clear()
-    bookmark = await get_user_bookmark(uid)
-    if not bookmark:
-        await message.answer(
-            "У вас нет закладки. Сначала выберите главу через кнопку «📖 Выбор главы».",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    current = int(bookmark)
-    prev_num = current - 1
-    if prev_num < 1:
-        await message.answer(
-            "Это первая глава. Предыдущей не существует.",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    cached_url = await get_cached_telegraph(str(prev_num))
-    if cached_url:
-        await message.answer(
-            f"📖 <b>Глава {prev_num}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML",
-            reply_markup=await get_main_menu(uid)
-        )
-        await save_user_bookmark(uid, str(prev_num))
-        return
-
-    status_msg = await message.answer(f"🔍 Ищу перевод главы {prev_num}...")
-    chapter = await find_chapter_by_number(prev_num)
-    if not chapter:
-        await status_msg.delete()
-        await message.answer(
-            f"Глава {prev_num} не найдена.",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {prev_num}...")
-    try:
-        url, success = await process_chapter_translation(chapter)
-        await status_msg.delete()
-        if success and url:
-            await message.answer(
-                f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}",
-                parse_mode="HTML",
-                reply_markup=await get_main_menu(uid)
-            )
-            await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(
-                "❌ Не удалось создать перевод.",
-                reply_markup=await get_main_menu(uid)
-            )
-    except Exception as e:
-        logger.exception(f"button_prev error: {e}")
-        await message.answer(
-            "❌ Ошибка при загрузке главы.",
-            reply_markup=await get_main_menu(uid)
-        )
-
-async def button_next(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    if await is_user_blocked(uid):
-        await message.answer("Вы заблокированы.")
-        return
-    await state.clear()
-    bookmark = await get_user_bookmark(uid)
-    if not bookmark:
-        await message.answer(
-            "У вас нет закладки. Сначала выберите главу через кнопку «📖 Выбор главы».",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    current = int(bookmark)
-    next_num = current + 1
-
-    cached_url = await get_cached_telegraph(str(next_num))
-    if cached_url:
-        await message.answer(
-            f"📖 <b>Глава {next_num}</b>\n\n🔗 {cached_url}",
-            parse_mode="HTML",
-            reply_markup=await get_main_menu(uid)
-        )
-        await save_user_bookmark(uid, str(next_num))
-        return
-
-    status_msg = await message.answer(f"🔍 Ищу перевод главы {next_num}...")
-    chapter = await find_chapter_by_number(next_num)
-    if not chapter:
-        await status_msg.delete()
-        await message.answer(
-            f"Глава {next_num} не найдена.",
-            reply_markup=await get_main_menu(uid)
-        )
-        return
-
-    await status_msg.edit_text(f"📥 Загружаю и перевожу главу {next_num}...")
-    try:
-        url, success = await process_chapter_translation(chapter)
-        await status_msg.delete()
-        if success and url:
-            await message.answer(
-                f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}",
-                parse_mode="HTML",
-                reply_markup=await get_main_menu(uid)
-            )
-            await save_user_bookmark(uid, chapter['id'])
-        else:
-            await message.answer(
-                "❌ Не удалось создать перевод.",
-                reply_markup=await get_main_menu(uid)
-            )
-    except Exception as e:
-        logger.exception(f"button_next error: {e}")
-        await message.answer(
-            "❌ Ошибка при загрузке главы.",
-            reply_markup=await get_main_menu(uid)
-        )
 
 async def button_help(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1147,6 +953,81 @@ async def button_help(message: types.Message, state: FSMContext):
     help_text += "❓ Помощь – это сообщение"
 
     await message.answer(help_text, reply_markup=await get_main_menu(uid))
+
+# ======================== УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ГЛАВ ========================
+async def send_chapter_to_user(
+    user_id: int,
+    chapter_num: int,
+    status_msg: Optional[types.Message] = None,
+    initial_message: Optional[types.Message] = None,
+) -> bool:
+    """
+    Универсальная функция для отправки любой главы.
+    Возвращает True, если успешно.
+    """
+    uid = user_id
+    if await is_user_blocked(uid):
+        await (initial_message or status_msg).answer("Вы заблокированы.")
+        return False
+
+    # 1. Проверяем кэш
+    cached_url = await get_cached_telegraph(str(chapter_num))
+    if cached_url:
+        text = f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}"
+        if status_msg:
+            await status_msg.delete()
+        await (initial_message or status_msg).answer(
+            text, parse_mode="HTML", reply_markup=await get_main_menu(uid)
+        )
+        await save_user_bookmark(uid, str(chapter_num))
+        return True
+
+    # 2. Ищем главу
+    if status_msg:
+        await status_msg.edit_text(f"🔍 Ищу перевод главы {chapter_num}...")
+    chapter = await find_chapter_by_number(chapter_num)
+
+    if not chapter:
+        if status_msg:
+            await status_msg.delete()
+        await (initial_message or status_msg).answer(
+            f"❌ Глава {chapter_num} не найдена.",
+            reply_markup=await get_main_menu(uid)
+        )
+        return False
+
+    # 3. Переводим
+    if status_msg:
+        await status_msg.edit_text(f"📥 Загружаю и перевожу главу {chapter_num}...")
+
+    try:
+        url, success = await process_chapter_translation(chapter)
+        if status_msg:
+            await status_msg.delete()
+
+        if success and url:
+            text = f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}"
+            await (initial_message or status_msg).answer(
+                text, parse_mode="HTML", reply_markup=await get_main_menu(uid)
+            )
+            await save_user_bookmark(uid, chapter['id'])
+            return True
+        else:
+            await (initial_message or status_msg).answer(
+                "❌ Не удалось создать перевод. Попробуйте позже.",
+                reply_markup=await get_main_menu(uid)
+            )
+            return False
+
+    except Exception as e:
+        logger.exception(f"send_chapter_to_user error: {e}")
+        if status_msg:
+            await status_msg.delete()
+        await (initial_message or status_msg).answer(
+            "❌ Ошибка при обработке главы.",
+            reply_markup=await get_main_menu(uid)
+        )
+        return False
 
 async def handle_other_text(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
@@ -1370,6 +1251,9 @@ async def main():
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
+
+    dp.message.register(cmd_start, Command("start"))
+    
     dp.message.register(handle_other_text)
 
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
@@ -1385,13 +1269,10 @@ async def main():
     dp.callback_query.register(admin_remove_sub, lambda c: c.data == "admin_remove_sub")
     dp.callback_query.register(admin_cancel, lambda c: c.data == "admin_cancel")
 
-    dp.message.register(cmd_start, Command("start"))
-
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
