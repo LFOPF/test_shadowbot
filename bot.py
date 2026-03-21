@@ -40,7 +40,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
-CHECK_INTERVAL = 3600
+CHECK_INTERVAL = 7200
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
