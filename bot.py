@@ -11,9 +11,10 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
+    retry_if_result,
+    wait_fixed,
 )
-from tenacity.before import before_sleep_log
-from tenacity.after import after_log
+from tenacity import before_sleep_log, after_log
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -249,35 +250,63 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 
 # ======================== PLAYWRIGHT ========================
-
-async def fetch_html(url: str, retries: int = 2) -> str:
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),      
+    wait=wait_exponential(multiplier=1.5, min=3, max=60), 
+    retry=retry_if_exception_type((
+        asyncio.TimeoutError,
+        PlaywrightError,
+        aiohttp.ClientError, 
+        ConnectionError,
+        OSError,                               
+    )),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    after=after_log(logger, logging.INFO),
+)
+async def fetch_html(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
-
-    for attempt in range(retries):
-        page = await browser_context.new_page()
+        
+    page = await browser_context.new_page()
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=90000)
+        
         try:
-            await page.goto(url, timeout=60000)
-            await page.wait_for_selector('a:has-text("Chapter")', timeout=30000)
-            await page.wait_for_timeout(2000)
-            return await page.content()
-        except Exception as e:
-            logger.warning(f"fetch_html error on {url} (попытка {attempt+1}): {e}")
-            if attempt == retries - 1:
-                return ""
-            await asyncio.sleep(2 ** attempt)
-        finally:
-            await page.close()
-    return ""
+            await page.wait_for_selector('a:has-text("Chapter")', timeout=40000)
+        except PlaywrightError:
+            logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
+            
+        await page.wait_for_timeout(2000)
+        return await page.content()
+    
+    finally:
+        await page.close()
 
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(4),           
+    wait=wait_exponential(multiplier=1.5, min=3, max=60),
+    retry=retry_if_exception_type((
+        asyncio.TimeoutError,
+        PlaywrightError,                        
+        aiohttp.ClientError,                    
+        ConnectionError,
+        OSError,                                
+    )),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    after=after_log(logger, logging.INFO),
+)
 async def fetch_chapter_text(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
 
     page = await browser_context.new_page()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_selector('div.text#arrticle', timeout=30000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+        await page.wait_for_selector('div.text#arrticle', timeout=45000)
+
         paragraphs = await page.evaluate('''() => {
             const c = document.querySelector('div.text#arrticle');
             if (!c) return [];
@@ -285,13 +314,13 @@ async def fetch_chapter_text(url: str) -> str:
                 .map(p => p.innerText.trim())
                 .filter(t => t.length > 0);
         }''')
+
         if paragraphs:
             return '\n\n'.join(paragraphs)
+
         content = await page.text_content('div.text#arrticle')
         return content.strip() if content else "[Текст не найден]"
-    except Exception as e:
-        logger.warning(f"fetch_chapter_text {url}: {e}")
-        return f"[Ошибка загрузки: {e}]"
+
     finally:
         await page.close()
 
