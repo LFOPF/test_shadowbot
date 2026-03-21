@@ -10,8 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 
 # Переменные окружения
-ENV PYTHONUNBUFFERED=1
-    PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=0
 
 # Railway
