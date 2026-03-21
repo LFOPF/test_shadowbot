@@ -47,7 +47,6 @@ MAX_PAGES = 120
 CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
 NOVEL_ID = "1205249"
-TOTAL_CHAPTERS_FALLBACK = 2893
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -141,54 +140,14 @@ def get_telegraph_path(url: str) -> str:
     return urlparse(url).path.split('/')[-1]
 
 
-# ======================== ПРОГРЕСС ЧТЕНИЯ (ДИНАМИЧЕСКИЙ) ========================
-def progress_bar(current: int, total: int, width: int = 15) -> str:
-    if total <= 0:
-        return ""
-    filled = int(width * current / total)
-    bar = "█" * filled + "░" * (width - filled)
-    percent = round((current / total) * 100)
-    return f"[{bar}] {percent}%"
-
-
-async def get_total_chapters() -> int:
-    """Динамическое общее количество глав — обновляется в monitor()"""
-    try:
-        value = await redis_client.get("total_chapters_known")
-        if value:
-            return int(value.decode())
-    except Exception as e:
-        logger.error(f"get_total_chapters error: {e}")
-    return TOTAL_CHAPTERS_FALLBACK
-
-
-async def get_progress_text(user_id: int) -> str:
-    """Текст прогресса для кнопки «Мой прогресс»"""
-    bookmark = await get_user_bookmark(user_id)
-    if not bookmark or not bookmark.isdigit():
-        return "📊 У вас ещё нет закладки. Начните читать с любой главы!"
-
-    current = int(bookmark)
-    total = await get_total_chapters()
-
-    if total <= 0:
-        return "📊 Общее количество глав ещё определяется..."
-
-    percent = round((current / total) * 100, 1)
-    if percent > 100:
-        percent = 100.0
-
-    bar = progress_bar(current, total)
-    return f"📊 Вы прочитали {percent}% романа\n({current} / {total} глав)\n\n{bar}"
-
-
-# ======================== SAFE TELEGRAM HELPERS ========================
+# ======================== SAFE TELEGRAM HELPERS (ИСПРАВЛЕНИЕ ОШИБКИ) ========================
 async def safe_edit_text(
     message: types.Message,
     text: str,
     parse_mode: Optional[str] = None,
     reply_markup: Optional[InlineKeyboardMarkup | ReplyKeyboardMarkup] = None
 ) -> None:
+    """Безопасное редактирование сообщения — игнорирует 'message is not modified'."""
     try:
         await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except TelegramBadRequest as e:
@@ -200,6 +159,7 @@ async def safe_edit_text(
 
 
 async def safe_delete(message: Optional[types.Message]) -> None:
+    """Безопасное удаление сообщения."""
     if not message:
         return
     try:
@@ -516,12 +476,12 @@ async def translate_text(text: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "qwen/qwen3.5-flash-02-23",
+        "model": "google/gemini-2.5-flash-lite",
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
-        "temperature": 0.72,
+        "temperature": 0.90,
         "top_p": 0.93,
         "max_tokens": 8192,
         "presence_penalty": 0.15,
@@ -692,8 +652,8 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     is_admin = ADMIN_ID is not None and str(user_id) == ADMIN_ID
 
     buttons = [
-        [KeyboardButton(text="📊 Мой прогресс"), KeyboardButton(text="📖 Выбор главы")],
-        [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
+        [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
+        [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
         [KeyboardButton(text="🤝 Поддержать")],
     ]
     row3 = [KeyboardButton(text="❓ Помощь")]
@@ -811,17 +771,6 @@ async def button_status(message: types.Message, state: FSMContext):
         await message.answer("Доступ запрещён.")
         return
     await message.answer("Выберите действие:", reply_markup=admin_status_buttons)
-
-
-# ======================== КНОПКА ПРОГРЕССА ========================
-async def button_progress(message: types.Message, state: FSMContext):
-    await state.clear()
-    uid = message.from_user.id
-    if await is_user_blocked(uid):
-        await message.answer("Вы заблокированы.")
-        return
-    progress_text = await get_progress_text(uid)
-    await message.answer(progress_text, reply_markup=await get_main_menu(uid))
 
 
 # ======================== АДМИН ХЕНДЛЕРЫ ========================
@@ -1031,6 +980,7 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     chapter_num = int(message.text)
+    # ИСПРАВЛЕНИЕ: начальное сообщение с уникальным текстом
     status_msg = await message.answer(f"🔍 Обработка главы {chapter_num}...")
     await send_chapter_to_user(uid, chapter_num, status_msg=status_msg)
     await state.clear()
@@ -1042,7 +992,6 @@ async def button_help(message: types.Message, state: FSMContext):
     is_admin = ADMIN_ID is not None and str(uid) == ADMIN_ID
     help_text = (
         "🤖 Доступные команды:\n"
-        "📊 Мой прогресс — статистика чтения\n"
         "📌 Моя закладка — текущая глава\n"
         "📖 Выбор главы — ввести номер\n"
         "⬅️ / ➡️ — предыдущая / следующая\n"
@@ -1069,6 +1018,7 @@ async def send_chapter_to_user(
             await initial_message.answer("Вы заблокированы.")
         return False
 
+    # 1. Кэш
     cached_url = await get_cached_telegraph(str(chapter_num))
     if cached_url:
         text = f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}"
@@ -1079,6 +1029,7 @@ async def send_chapter_to_user(
         await save_user_bookmark(uid, str(chapter_num))
         return True
 
+    # 2. Поиск (уникальный текст!)
     if status_msg:
         await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
 
@@ -1091,6 +1042,7 @@ async def send_chapter_to_user(
         )
         return False
 
+    # 3. Перевод (новый текст!)
     if status_msg:
         await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
 
@@ -1188,16 +1140,6 @@ async def monitor(check_once=False):
         try:
             html = await fetch_html(TARGET_URL)
             chapters = parse_chapters(html)
-
-            # === ДИНАМИЧЕСКОЕ ОБНОВЛЕНИЕ ОБЩЕГО КОЛИЧЕСТВА ГЛАВ ===
-            if chapters:
-                current_max = max(int(ch['id']) for ch in chapters)
-                try:
-                    await redis_client.set("total_chapters_known", current_max, ex=86400 * 7)
-                    logger.info(f"Обновлено максимальное количество глав: {current_max}")
-                except Exception as e:
-                    logger.error(f"Ошибка сохранения total_chapters_known: {e}")
-
             last_str = await get_last_chapter()
             last_int = int(last_str) if last_str and last_str.isdigit() else 0
 
@@ -1316,7 +1258,6 @@ async def main():
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
     dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
     dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
-    dp.message.register(button_progress, lambda m: m.text == "📊 Мой прогресс")   # ← новая кнопка
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(handle_other_text)
 
@@ -1342,3 +1283,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
