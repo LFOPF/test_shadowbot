@@ -25,7 +25,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import redis.asyncio as redis
-from playwright.async_api import async_playwright, Playwright, BrowserContext, Error as PlaywrightError
+from playwright.async_api import async_playwright, Playwright, BrowserContext, Page, Error as PlaywrightError
 from bs4 import BeautifulSoup
 import aiohttp
 
@@ -87,7 +87,7 @@ redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
 browser_context: Optional[BrowserContext] = None
-
+shared_page: Optional[Page] = None
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
     waiting_for_chapter = State()
@@ -96,6 +96,40 @@ class AdminActions(StatesGroup):
     waiting_for_user_id = State()
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
+async def get_shared_page() -> Page:
+    global shared_page
+    if shared_page is not None and not shared_page.is_closed():
+        return shared_page
+    
+    # Если страницы нет или она закрыта — создаём новую
+    logger.info("Создаём/восстанавливаем общую страницу Playwright")
+    shared_page = await browser_context.new_page()
+    
+    # Настройки
+    await shared_page.set_viewport_size({"width": 1280, "height": 720})
+    await shared_page.set_extra_http_headers({
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    })
+    await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
+    return shared_page
+
+def _should_block(route) -> bool:
+    req = route.request
+    res_type = req.resource_type
+    url = req.url.lower()
+
+    if res_type in ("image", "stylesheet", "font", "media", "other"):
+        return True
+    
+    ad_patterns = [
+        "googleads", "doubleclick", "adservice", "adserver", "banner", 
+        "yandex.ru/ads", "rambler", "mgid", "cointraffic", "propellerads"
+    ]
+    if any(p in url for p in ad_patterns):
+        return True
+        
+    return False
+    
 def extract_chapter_id(text: str) -> Optional[str]:
     text = text.strip()
     patterns = [
@@ -321,7 +355,7 @@ async def fetch_html(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
 
-    page = await browser_context.new_page()
+    page = await get_shared_page()
     try:
         await page.goto(url, wait_until="networkidle", timeout=90000)
         try:
@@ -330,8 +364,11 @@ async def fetch_html(url: str) -> str:
             logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
         await page.wait_for_timeout(2000)
         return await page.content()
-    finally:
-        await page.close()
+    except Exception as e:
+        logger.error(f"Ошибка в fetch_html на {url}: {e}")
+        if not page.is_closed():
+            await page.close()
+        raise
 
 
 @retry(**RETRY_WEB)
@@ -339,7 +376,7 @@ async def fetch_chapter_text(url: str) -> str:
     if not playwright_instance or not browser_context:
         raise RuntimeError("Playwright не инициализирован")
 
-    page = await browser_context.new_page()
+    page = await get_shared_page()          # ← изменили
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_selector('div.text#arrticle', timeout=60000)
@@ -357,8 +394,11 @@ async def fetch_chapter_text(url: str) -> str:
 
         content = await page.text_content('div.text#arrticle')
         return content.strip() if content else "[Текст не найден]"
-    finally:
-        await page.close()
+    except Exception as e:
+        logger.error(f"Ошибка в fetch_chapter_text на {url}: {e}")
+        if not page.is_closed():
+            await page.close()
+        raise
 
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
@@ -1218,7 +1258,7 @@ async def on_startup():
 
     browser_context = await browser.new_context(
         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        viewport={'width': 1280, 'height': 800},
+        viewport={'width': 1280, 'height': 720},
         ignore_https_errors=True,
     )
     logger.info("Playwright готов")
@@ -1229,7 +1269,9 @@ async def on_startup():
 
 async def on_shutdown():
     logger.info("Выключение...")
-    global playwright_instance, browser_context
+    global shared_page, browser_context, playwright_instance
+    if shared_page and not shared_page.is_closed():
+        await shared_page.close()
     if browser_context:
         await browser_context.close()
     if playwright_instance:
