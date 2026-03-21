@@ -26,7 +26,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import redis.asyncio as redis
-from playwright.async_api import async_playwright, Playwright, BrowserContext
+from playwright.async_api import async_playwright, Playwright, BrowserContext, Error as PlaywrightError
 from bs4 import BeautifulSoup
 import aiohttp
 
@@ -52,8 +52,11 @@ NOVEL_ID = "1205249"  # ID нашего романа
 RETRY_WEB = dict(
     reraise=True,
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=60),
-    retry=retry_if_exception_type((asyncio.TimeoutError, ConnectionError, OSError, aiohttp.ClientError, PlaywrightError)),
+    wait=wait_exponential(multiplier=1.2, min=3, max=75),
+    retry=retry_if_exception_type((
+        asyncio.TimeoutError, ConnectionError, OSError,
+        aiohttp.ClientError, aiohttp.ClientResponseError, PlaywrightError
+    )),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     after=after_log(logger, logging.INFO),
 )
@@ -62,8 +65,9 @@ RETRY_API = dict(
     reraise=True,
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=1.5, min=4, max=90),
-    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, TimeoutError, Exception)),  # можно уточнить
-    retry_error_callback= lambda retry_state: logger.error(f"Исчерпаны попытки API: {retry_state.outcome.exception()}")
+    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, asyncio.TimeoutError, Exception)),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    after=after_log(logger, logging.INFO),
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -192,7 +196,8 @@ async def save_last_chapter(ch_id: str):
         await redis_client.set("last_chapter", ch_id)
     except Exception as e:
         logger.error(f"save_last_chapter error: {e}")
-
+        
+@retry(**RETRY_WEB)
 async def get_first_chapter() -> Optional[int]:
     try:
         cached = await redis_client.get("first_chapter")
@@ -340,7 +345,8 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     else:
         logger.error("Не найдено ни одной главы — структура сайта изменилась?")
     return chapters
-
+    
+@retry(**RETRY_WEB)
 async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]]:
     first_chapter = await get_first_chapter()
     if not first_chapter:
@@ -365,7 +371,8 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
 
     logger.info(f"Глава не на странице {page_estimate}, запускаю бинарный поиск")
     return await find_chapter_by_number_binary(chapter_number)
-
+    
+@retry(**RETRY_WEB)
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
     left, right = 1, MAX_PAGES
     while left <= right:
@@ -409,7 +416,8 @@ USER_PROMPT_TEMPLATE = (
     "Текст:\n\n{text}"
 )
 
-async def translate_text(text: str, retries: int = 3) -> str:
+@retry(**RETRY_API)
+async def translate_text(text: str) -> str:
     if len(text) > 120000:
         logger.warning("Текст слишком длинный, обрезаем")
         text = text[:120000] + "\n... [обрезано]"
@@ -426,45 +434,30 @@ async def translate_text(text: str, retries: int = 3) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
-        "temperature": 0.5,  # оптимальная температура – не слишком сухо, не слишком хаотично
+        "temperature": 0.5,
         "max_tokens": 8000
     }
 
-    for attempt in range(retries):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=120
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        try:
-                            content = data["choices"][0]["message"]["content"]
-                            if content is not None:
-                                return content.strip()
-                            else:
-                                logger.error("Перевод вернул пустой контент")
-                                return "[Ошибка: пустой ответ]"
-                        except (KeyError, IndexError, AttributeError) as e:
-                            logger.error(f"Ошибка парсинга ответа: {e}")
-                            return "[Ошибка формата ответа]"
-                    elif resp.status == 429:
-                        logger.warning(f"Rate limit (попытка {attempt+1})")
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        logger.error(f"Перевод {resp.status}: {await resp.text()}")
-                        return f"[Ошибка перевода {resp.status}]"
-        except asyncio.TimeoutError:
-            logger.warning(f"Таймаут перевода (попытка {attempt+1})")
-            if attempt == retries - 1:
-                return "[Таймаут]"
-            await asyncio.sleep(2 ** attempt)
-        except Exception as e:
-            logger.exception(f"Исключение перевода: {e}")
-    return "[Не удалось перевести]"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=130
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                return content.strip() if content else "[Ошибка: пустой ответ]"
+
+            elif resp.status == 429:
+                logger.warning("Rate limit от OpenRouter")
+                raise aiohttp.ClientError("Rate limit")  # tenacity сделает backoff
+
+            else:
+                text_resp = await resp.text()
+                logger.error(f"OpenRouter {resp.status}: {text_resp[:500]}")
+                raise aiohttp.ClientError(f"HTTP {resp.status}")
 
 
 # ======================== TELEGRAPH ========================
