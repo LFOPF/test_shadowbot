@@ -1314,7 +1314,6 @@ async def on_startup():
         
         browser = await playwright_instance.chromium.launch(
             headless=True,
-            channel="chrome",
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
