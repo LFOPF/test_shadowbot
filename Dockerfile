@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 RUN ls -la /root/.cache/ms-playwright/ || true
 
+COPY glossary.txt .
 COPY bot.py .
 
 ENV PYTHONUNBUFFERED=1 \
