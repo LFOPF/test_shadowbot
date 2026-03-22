@@ -105,38 +105,42 @@ class AdminActions(StatesGroup):
 async def launch_browser():
     global playwright_instance, browser, browser_context, shared_page
 
-    if browser is not None and not browser.is_closed():
+    if browser is not None:
         return
 
     logger.info("Запуск браузера Playwright...")
-    playwright_instance = await async_playwright().start()
+    try:
+        playwright_instance = await async_playwright().start()
 
-    browser = await playwright_instance.chromium.launch(
-        headless=True,
-        args=[
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--single-process',
-            '--disable-extensions',
-        ]
-    )
+        browser = await playwright_instance.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--single-process',
+                '--disable-extensions',
+            ]
+        )
 
-    browser_context = await browser.new_context(
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        viewport={'width': 1280, 'height': 720},
-        ignore_https_errors=True,
-    )
+        browser_context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            viewport={'width': 1280, 'height': 720},
+            ignore_https_errors=True,
+        )
 
-    shared_page = await browser_context.new_page()
-    await shared_page.set_viewport_size({"width": 1280, "height": 720})
-    await shared_page.set_extra_http_headers({
-        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-    })
-    await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
+        shared_page = await browser_context.new_page()
+        await shared_page.set_viewport_size({"width": 1280, "height": 720})
+        await shared_page.set_extra_http_headers({
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        })
+        await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
 
-    logger.info("Браузер запущен и страница создана")
+        logger.info("Браузер запущен и страница создана")
+    except Exception as e:
+        logger.exception("Критическая ошибка при запуске браузера")
+        raise
 
 
 async def close_browser():
@@ -214,7 +218,7 @@ async def get_shared_page() -> Page:
 
     touch_browser_activity()
 
-    if browser is None or browser.is_closed():
+    if browser is None:
         await launch_browser()
 
     if shared_page is not None and not shared_page.is_closed():
@@ -230,7 +234,6 @@ async def get_shared_page() -> Page:
     return shared_page
 
 
-# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def extract_chapter_id(text: str) -> Optional[str]:
     text = text.strip()
     patterns = [
@@ -271,7 +274,6 @@ def get_page_url(page_num: int) -> str:
     return f"{base}/page/{page_num}/"
 
 
-# ======================== SAFE TELEGRAM ========================
 async def safe_edit_text(
     message: types.Message,
     text: str,
@@ -297,7 +299,6 @@ async def safe_delete(message: Optional[types.Message]) -> None:
         pass
 
 
-# ======================== REDIS ========================
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
         value = await redis_client.hget("telegraph_urls", chapter_id)
@@ -388,7 +389,6 @@ async def get_first_chapter() -> Optional[int]:
     return first
 
 
-# ======================== БЛОКИРОВКИ ========================
 blocked_users_key = "blocked_users"
 
 
@@ -427,7 +427,6 @@ async def remove_subscriber(user_id: int) -> bool:
     return False
 
 
-# ======================== ЗАКЛАДКИ ========================
 async def get_user_bookmark(user_id: int) -> Optional[str]:
     try:
         value = await redis_client.hget("user_bookmarks", str(user_id))
@@ -444,7 +443,6 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
         logger.error(f"save_user_bookmark error: {e}")
 
 
-# ======================== PLAYWRIGHT ========================
 @retry(**RETRY_WEB)
 async def fetch_html(url: str) -> str:
     page = await get_shared_page()
@@ -569,7 +567,6 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
     return None
 
 
-# ======================== ПЕРЕВОД ========================
 SYSTEM_PROMPT = (
     "Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave. "
     "Ты переводишь на уровне лучших русскоязычных команд (RanobeLib, Rulate, BookWire). "
@@ -639,7 +636,6 @@ async def translate_text(text: str) -> str:
                 raise aiohttp.ClientError(f"HTTP {resp.status}")
 
 
-# ======================== TELEGRAPH ========================
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_fixed(5) + wait_exponential(min=2, max=60),
@@ -703,7 +699,6 @@ async def create_telegraph_page(
     return None
 
 
-# ======================== ОБРАБОТКА ПЕРЕВОДА ГЛАВЫ ========================
 @retry(
     reraise=True,
     stop=stop_after_attempt(4),
@@ -745,7 +740,6 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
     return None, False
 
 
-# ======================== РАССЫЛКА ========================
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
     subs = await load_subscribers()
     if not subs:
@@ -774,7 +768,6 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ======================== КЛАВИАТУРЫ ========================
 async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     subs = await load_subscribers()
     is_subscribed = user_id in subs
@@ -829,7 +822,6 @@ admin_user_manage_buttons = InlineKeyboardMarkup(
 )
 
 
-# ======================== ХЕНДЛЕРЫ ========================
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
@@ -901,7 +893,6 @@ async def button_status(message: types.Message, state: FSMContext):
     await message.answer("Выберите действие:", reply_markup=admin_status_buttons)
 
 
-# ======================== АДМИН ХЕНДЛЕРЫ ========================
 async def admin_clear_cache(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -970,7 +961,6 @@ async def admin_close(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ======================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ========================
 async def admin_action_start(callback: types.CallbackQuery, state: FSMContext, action: str):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
@@ -1033,7 +1023,6 @@ async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ======================== ХЕНДЛЕРЫ ВЫБОРА ГЛАВЫ ========================
 async def button_choose_chapter(message: types.Message, state: FSMContext):
     if await is_user_blocked(message.from_user.id):
         await message.answer("Вы заблокированы.")
@@ -1122,7 +1111,6 @@ async def button_help(message: types.Message, state: FSMContext):
     await message.answer(help_text, reply_markup=await get_main_menu(uid))
 
 
-# ======================== ОТПРАВКА ГЛАВЫ ========================
 async def send_chapter_to_user(
     user_id: int,
     chapter_num: int,
@@ -1204,7 +1192,6 @@ async def handle_other_text(message: types.Message, state: FSMContext):
         )
 
 
-# ======================== ПРИНУДИТЕЛЬНЫЙ МОНИТОРИНГ ========================
 async def force_monitor_run(msg: types.Message):
     logger.info("Принудительная проверка")
     try:
@@ -1214,7 +1201,6 @@ async def force_monitor_run(msg: types.Message):
         await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
 
 
-# ======================== МОНИТОРИНГ ========================
 async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
@@ -1280,11 +1266,13 @@ async def monitor(check_once=False):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-# ======================== LIFECYCLE ========================
 async def on_startup():
     global _last_activity_time
     logger.info("Бот запущен. Запускаем браузер и мониторинг...")
-    await launch_browser()
+    try:
+        await launch_browser()
+    except Exception as e:
+        logger.exception("Ошибка запуска браузера при старте")
     _last_activity_time = asyncio.get_event_loop().time()
     asyncio.create_task(monitor())
     asyncio.create_task(keep_browser_alive())
@@ -1298,7 +1286,6 @@ async def on_shutdown():
         await redis_client.aclose()
 
 
-# ======================== ЗАПУСК ========================
 async def main():
     global redis_client, bot
     redis_client = await redis.from_url(REDIS_URL)
