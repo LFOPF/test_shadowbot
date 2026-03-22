@@ -1,1 +1,12 @@
-
+Sunny = Санни
+Nephis = Нефис
+Azarax = Азаракс
+Killer = Убийца
+Shadow Legion = Теневой Легион
+Nightmare Desert = Пустыня Кошмаров
+Divine Aspect = Божественный Аспект
+Saint = Святой
+the currents of Will were twisting = течения Воли искажались
+Supreme Titan = Верховный Титан
+God of Sun = Бог Солнца
+Soulflame = душевное пламя
