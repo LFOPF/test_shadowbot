@@ -5,7 +5,6 @@ import re
 import json
 import html
 import time
-from contextlib import suppress
 from typing import Optional, Set, List, Dict, Any
 from urllib.parse import urlparse
 from collections import deque
@@ -55,6 +54,8 @@ TRANSLATION_LOCK_TTL = 15 * 60
 TRANSLATION_WAIT_TIMEOUT = 90
 TRANSLATION_WAIT_STEP = 2
 ERROR_TTL = 5 * 60
+PLAYWRIGHT_CONCURRENCY = int(os.getenv("PLAYWRIGHT_CONCURRENCY", "2"))
+GLOSSARY_CACHE_TTL = int(os.getenv("GLOSSARY_CACHE_TTL", "300"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -103,6 +104,10 @@ _browser_is_closing = False
 monitor_lock = asyncio.Lock()
 http_session: Optional[aiohttp.ClientSession] = None
 subscribers_key_ready = False
+playwright_semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
+_glossary_cache: Optional[Dict[str, str]] = None
+_glossary_cache_expires_at = 0.0
+_glossary_cache_lock = asyncio.Lock()
 # glossary_dict: Dict[str, str] = {}  трайнем через хэш
 SYSTEM_PROMPT = (
     "Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave. "
@@ -381,38 +386,55 @@ async def load_glossary_to_redis(force: bool = False):
         logger.exception("Ошибка при загрузке глоссария в Redis")
 
 
+async def get_glossary_terms(force_refresh: bool = False) -> Dict[str, str]:
+    global _glossary_cache, _glossary_cache_expires_at
+
+    now = time.time()
+    if not force_refresh and _glossary_cache is not None and now < _glossary_cache_expires_at:
+        return _glossary_cache
+
+    async with _glossary_cache_lock:
+        now = time.time()
+        if not force_refresh and _glossary_cache is not None and now < _glossary_cache_expires_at:
+            return _glossary_cache
+
+        all_terms = await redis_client.hgetall("glossary:terms")
+        if not all_terms:
+            logger.warning("Глоссарий в Redis пустой")
+            _glossary_cache = {}
+            _glossary_cache_expires_at = now + GLOSSARY_CACHE_TTL
+            return _glossary_cache
+
+        _glossary_cache = {
+            eng.decode('utf-8'): rus.decode('utf-8')
+            for eng, rus in all_terms.items()
+        }
+        _glossary_cache_expires_at = now + GLOSSARY_CACHE_TTL
+        return _glossary_cache
+
+
 async def get_relevant_glossary(text: str) -> str:
-    """Возвращает строку с релевантными терминами из Redis"""
-    redis_key = "glossary:terms"
-    
-    all_terms = await redis_client.hgetall(redis_key)
-    
+    all_terms = await get_glossary_terms()
     if not all_terms:
-        logger.warning("Глоссарий в Redis пустой")
         return ""
-    
+
     relevant = []
     text_lower = text.lower()
-    
-    for eng_bytes, rus_bytes in all_terms.items():
-        eng = eng_bytes.decode('utf-8')
-        rus = rus_bytes.decode('utf-8')
-        
-        # Точный поиск с границами слова
-        pattern = re.compile(r'(?i)\b' + re.escape(eng) + r'\b')
+
+    for eng, rus in all_terms.items():
+        pattern = re.compile(r"(?i)\b" + re.escape(eng) + r"\b")
         if pattern.search(text) or eng.lower() in text_lower:
             relevant.append(f"{eng} → {rus}")
-    
+
     if not relevant:
         return ""
-    
+
     return (
         "=== ГЛОССАРИЙ ===\n"
-        "Используй ТОЛЬКО следующие переводы имён, терминов и названий (строго!):\n\n" +
-        "\n".join(relevant) +
-        "\n\nНе придумывай другие варианты перевода для этих слов."
+        "Используй ТОЛЬКО следующие переводы имён, терминов и названий (строго!):\n\n"
+        + "\n".join(relevant)
+        + "\n\nНе придумывай другие варианты перевода для этих слов."
     )
-
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
@@ -453,134 +475,7 @@ async def safe_delete(message: Optional[types.Message]) -> None:
     except Exception:
         pass
 
-async def get_chapter_cache(chapter_id: str) -> dict[str, str]:
-    try:
-        data = await redis_client.hgetall(f"chapter:{chapter_id}")
-        if not data:
-            return {}
-        return {k.decode(): v.decode() for k, v in data.items()}
-    except Exception as e:
-        logger.error(f"get_chapter_cache error for {chapter_id}: {e}")
-        return {}
 
-
-async def save_chapter_cache(chapter_id: str, mapping: dict[str, str]) -> None:
-    try:
-        payload = {k: str(v) for k, v in mapping.items() if v is not None}
-        if not payload:
-            return
-        await redis_client.hset(f"chapter:{chapter_id}", mapping=payload)
-    except Exception as e:
-        logger.error(f"save_chapter_cache error for {chapter_id}: {e}")
-
-
-async def set_chapter_status(chapter_id: str, status: str, error: str = "") -> None:
-    await save_chapter_cache(chapter_id, {
-        "status": status,
-        "error": error,
-        "updated_at": str(int(time.time())),
-    })
-
-
-async def acquire_translation_lock(chapter_id: str) -> bool:
-    try:
-        result = await redis_client.set(
-            f"translation:lock:{chapter_id}",
-            str(int(time.time())),
-            ex=TRANSLATION_LOCK_TTL,
-            nx=True,
-        )
-        return bool(result)
-    except Exception as e:
-        logger.error(f"acquire_translation_lock error for {chapter_id}: {e}")
-        return False
-
-
-async def release_translation_lock(chapter_id: str) -> None:
-    with suppress(Exception):
-        await redis_client.delete(f"translation:lock:{chapter_id}")
-
-
-async def is_translation_in_progress(chapter_id: str) -> bool:
-    try:
-        return bool(await redis_client.exists(f"translation:lock:{chapter_id}"))
-    except Exception as e:
-        logger.error(f"is_translation_in_progress error for {chapter_id}: {e}")
-        return False
-
-
-async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION_WAIT_TIMEOUT) -> Optional[str]:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        url = await get_cached_telegraph(chapter_id)
-        if url:
-            return url
-
-        cache = await get_chapter_cache(chapter_id)
-
-        if cache.get("telegraph_url"):
-            return cache["telegraph_url"]
-
-        if cache.get("status") == "failed":
-            return None
-
-        await asyncio.sleep(TRANSLATION_WAIT_STEP)
-
-    url = await get_cached_telegraph(chapter_id)
-    if url:
-        return url
-
-    cache = await get_chapter_cache(chapter_id)
-    return cache.get("telegraph_url")
-
-
-async def save_translation_error(chapter_id: str, error: str) -> None:
-    try:
-        await redis_client.set(f"translation:error:{chapter_id}", error, ex=ERROR_TTL)
-    except Exception as e:
-        logger.error(f"save_translation_error error for {chapter_id}: {e}")
-
-
-async def get_translation_error(chapter_id: str) -> Optional[str]:
-    try:
-        value = await redis_client.get(f"translation:error:{chapter_id}")
-        return value.decode() if value else None
-    except Exception as e:
-        logger.error(f"get_translation_error error for {chapter_id}: {e}")
-        return None
-
-
-async def get_chapter_meta(chapter_id: str) -> Optional[Dict[str, str]]:
-    try:
-        data = await redis_client.hgetall(f"chapter_meta:{chapter_id}")
-        if not data:
-            return None
-
-        decoded = {k.decode(): v.decode() for k, v in data.items()}
-
-        if not decoded.get("id") or not decoded.get("title") or not decoded.get("link"):
-            return None
-
-        return {
-            "id": decoded["id"],
-            "title": decoded["title"],
-            "link": decoded["link"],
-        }
-    except Exception as e:
-        logger.error(f"get_chapter_meta error for {chapter_id}: {e}")
-        return None
-
-
-async def save_chapter_meta(ch: Dict[str, str]) -> None:
-    try:
-        await redis_client.hset(f"chapter_meta:{ch['id']}", mapping={
-            "id": ch["id"],
-            "title": ch["title"],
-            "link": ch["link"],
-        })
-    except Exception as e:
-        logger.error(f"save_chapter_meta error for {ch['id']}: {e}")
-        
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
         value = await redis_client.hget("telegraph_urls", chapter_id)
@@ -612,6 +507,131 @@ async def save_cached_title(chapter_id: str, title: str):
         await redis_client.hset("chapter_titles", chapter_id, title)
     except Exception as e:
         logger.error(f"save_cached_title error: {e}")
+
+
+async def get_chapter_cache(chapter_id: str) -> dict[str, str]:
+    try:
+        data = await redis_client.hgetall(f"chapter:{chapter_id}")
+        if not data:
+            return {}
+        return {k.decode(): v.decode() for k, v in data.items()}
+    except Exception as e:
+        logger.error(f"get_chapter_cache error for {chapter_id}: {e}")
+        return {}
+
+
+async def save_chapter_cache(chapter_id: str, mapping: dict[str, str]) -> None:
+    try:
+        payload = {k: str(v) for k, v in mapping.items() if v is not None}
+        if payload:
+            await redis_client.hset(f"chapter:{chapter_id}", mapping=payload)
+    except Exception as e:
+        logger.error(f"save_chapter_cache error for {chapter_id}: {e}")
+
+
+async def set_chapter_status(chapter_id: str, status: str, error: str = "") -> None:
+    await save_chapter_cache(chapter_id, {
+        "status": status,
+        "error": error,
+        "updated_at": str(int(time.time())),
+    })
+
+
+async def acquire_translation_lock(chapter_id: str) -> bool:
+    try:
+        result = await redis_client.set(
+            f"translation:lock:{chapter_id}",
+            str(int(time.time())),
+            ex=TRANSLATION_LOCK_TTL,
+            nx=True,
+        )
+        return bool(result)
+    except Exception as e:
+        logger.error(f"acquire_translation_lock error for {chapter_id}: {e}")
+        return False
+
+
+async def release_translation_lock(chapter_id: str) -> None:
+    try:
+        await redis_client.delete(f"translation:lock:{chapter_id}")
+    except Exception as e:
+        logger.error(f"release_translation_lock error for {chapter_id}: {e}")
+
+
+async def is_translation_in_progress(chapter_id: str) -> bool:
+    try:
+        return bool(await redis_client.exists(f"translation:lock:{chapter_id}"))
+    except Exception as e:
+        logger.error(f"is_translation_in_progress error for {chapter_id}: {e}")
+        return False
+
+
+async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION_WAIT_TIMEOUT) -> Optional[str]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        url = await get_cached_telegraph(chapter_id)
+        if url:
+            return url
+
+        cache = await get_chapter_cache(chapter_id)
+        if cache.get("telegraph_url"):
+            return cache["telegraph_url"]
+        if cache.get("status") == "failed":
+            return None
+
+        await asyncio.sleep(TRANSLATION_WAIT_STEP)
+
+    url = await get_cached_telegraph(chapter_id)
+    if url:
+        return url
+
+    cache = await get_chapter_cache(chapter_id)
+    return cache.get("telegraph_url")
+
+
+async def save_translation_error(chapter_id: str, error: str) -> None:
+    try:
+        await redis_client.set(f"translation:error:{chapter_id}", error, ex=ERROR_TTL)
+    except Exception as e:
+        logger.error(f"save_translation_error error for {chapter_id}: {e}")
+
+
+async def get_translation_error(chapter_id: str) -> Optional[str]:
+    try:
+        value = await redis_client.get(f"translation:error:{chapter_id}")
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_translation_error error for {chapter_id}: {e}")
+        return None
+
+
+async def save_chapter_meta(ch: Dict[str, str]) -> None:
+    try:
+        await redis_client.hset(f"chapter_meta:{ch['id']}", mapping={
+            "id": ch["id"],
+            "title": ch["title"],
+            "link": ch["link"],
+        })
+    except Exception as e:
+        logger.error(f"save_chapter_meta error for {ch['id']}: {e}")
+
+
+async def get_chapter_meta(chapter_id: str) -> Optional[Dict[str, str]]:
+    try:
+        data = await redis_client.hgetall(f"chapter_meta:{chapter_id}")
+        if not data:
+            return None
+        decoded = {k.decode(): v.decode() for k, v in data.items()}
+        if not decoded.get("id") or not decoded.get("title") or not decoded.get("link"):
+            return None
+        return {
+            "id": decoded["id"],
+            "title": decoded["title"],
+            "link": decoded["link"],
+        }
+    except Exception as e:
+        logger.error(f"get_chapter_meta error for {chapter_id}: {e}")
+        return None
 
 
 async def ensure_subscribers_key() -> None:
@@ -802,49 +822,51 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 @retry(**RETRY_WEB)
 async def fetch_html(url: str) -> str:
-    page = await create_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    async with playwright_semaphore:
+        page = await create_page()
         try:
-            await page.wait_for_selector('a:has-text("Chapter")', timeout=40000)
-        except PlaywrightError:
-            logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
-        await page.wait_for_timeout(1500)
-        return await page.content()
-    except Exception as e:
-        logger.error(f"Ошибка в fetch_html на {url}: {e}")
-        raise
-    finally:
-        if not page.is_closed():
-            await page.close()
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            try:
+                await page.wait_for_selector('a:has-text("Chapter")', timeout=40000)
+            except PlaywrightError:
+                logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
+            await page.wait_for_timeout(1500)
+            return await page.content()
+        except Exception as e:
+            logger.error(f"Ошибка в fetch_html на {url}: {e}")
+            raise
+        finally:
+            if not page.is_closed():
+                await page.close()
 
 
 @retry(**RETRY_WEB)
 async def fetch_chapter_text(url: str) -> str:
-    page = await create_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        await page.wait_for_selector('div.text#arrticle', timeout=60000)
+    async with playwright_semaphore:
+        page = await create_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_selector('div.text#arrticle', timeout=60000)
 
-        paragraphs = await page.evaluate('''() => {
-            const c = document.querySelector('div.text#arrticle');
-            if (!c) return [];
-            return Array.from(c.querySelectorAll('p'))
-                .map(p => p.innerText.trim())
-                .filter(t => t.length > 0);
-        }''')
+            paragraphs = await page.evaluate("""() => {
+                const c = document.querySelector('div.text#arrticle');
+                if (!c) return [];
+                return Array.from(c.querySelectorAll('p'))
+                    .map(p => p.innerText.trim())
+                    .filter(t => t.length > 0);
+            }""")
 
-        if paragraphs:
-            return '\n\n'.join(paragraphs)
+            if paragraphs:
+                return "\n\n".join(paragraphs)
 
-        content = await page.text_content('div.text#arrticle')
-        return content.strip() if content else "[Текст не найден]"
-    except Exception as e:
-        logger.error(f"Ошибка в fetch_chapter_text на {url}: {e}")
-        raise
-    finally:
-        if not page.is_closed():
-            await page.close()
+            content = await page.text_content('div.text#arrticle')
+            return content.strip() if content else "[Текст не найден]"
+        except Exception as e:
+            logger.error(f"Ошибка в fetch_chapter_text на {url}: {e}")
+            raise
+        finally:
+            if not page.is_closed():
+                await page.close()
 
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
@@ -1113,13 +1135,18 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     await save_chapter_meta(ch)
 
-    # 1. Быстрый путь: готовый Telegraph
     url = await get_cached_telegraph(cid)
     if url:
         logger.info(f"Глава {cid} найдена в telegraph-кэше")
         return url, True
 
-    # 2. Если кто-то уже переводит эту главу — ждём
+    cache = await get_chapter_cache(cid)
+    cached_url = cache.get("telegraph_url")
+    if cached_url:
+        await save_telegraph_url(cid, cached_url)
+        logger.info(f"Глава {cid} найдена в chapter-кэше")
+        return cached_url, True
+
     if await is_translation_in_progress(cid):
         logger.info(f"Глава {cid} уже переводится другим процессом, ждём результат")
         ready_url = await wait_for_ready_translation(cid)
@@ -1128,7 +1155,6 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         logger.warning(f"Ожидание перевода главы {cid} завершилось без результата")
         return None, False
 
-    # 3. Пытаемся взять lock
     lock_acquired = await acquire_translation_lock(cid)
     if not lock_acquired:
         logger.info(f"Не удалось взять lock для главы {cid}, ждём готовый результат")
@@ -1139,10 +1165,9 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     try:
         await set_chapter_status(cid, "processing")
+        await save_chapter_cache(cid, {"source_url": source_url, "source_title": title})
 
         cache = await get_chapter_cache(cid)
-
-        # 4. Оригинальный текст: либо из Redis, либо парсим сайт один раз
         original_text = cache.get("original_text")
         if not original_text:
             try:
@@ -1152,22 +1177,13 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 await set_chapter_status(cid, "failed", "fetch_failed")
                 await save_translation_error(cid, "fetch_failed")
                 return None, False
+            await save_chapter_cache(cid, {"original_text": original_text})
 
-            await save_chapter_cache(cid, {
-                "source_url": source_url,
-                "source_title": title,
-                "original_text": original_text,
-            })
-
-        # 5. Перевод текста: либо из Redis, либо переводим
         translated_text = cache.get("translated_text")
         if not translated_text:
             translated_text = await translate_text(original_text)
-            await save_chapter_cache(cid, {
-                "translated_text": translated_text,
-            })
+            await save_chapter_cache(cid, {"translated_text": translated_text})
 
-        # 6. Заголовок: либо из Redis, либо переводим
         translated_title = cache.get("translated_title") or await get_cached_title(cid)
         if translated_title and re.search(r"[А-Яа-яЁё]", translated_title):
             translated_title_clean = clean_title_for_telegraph(translated_title)
@@ -1177,22 +1193,13 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 translated_title_clean = clean_title_for_telegraph(title)
 
         await save_cached_title(cid, translated_title_clean)
-        await save_chapter_cache(cid, {
-            "translated_title": translated_title_clean,
-        })
+        await save_chapter_cache(cid, {"translated_title": translated_title_clean})
 
-        # 7. Telegraph: создаём только если ещё нет готовой ссылки
         html = text_to_html(translated_text)
-        new_url = await create_telegraph_page(
-            title=translated_title_clean,
-            content_html=html
-        )
-
+        new_url = await create_telegraph_page(title=translated_title_clean, content_html=html)
         if new_url:
             await save_telegraph_url(cid, new_url)
-            await save_chapter_cache(cid, {
-                "telegraph_url": new_url,
-            })
+            await save_chapter_cache(cid, {"telegraph_url": new_url})
             await set_chapter_status(cid, "ready")
             return new_url, True
 
@@ -1200,15 +1207,14 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         await set_chapter_status(cid, "failed", "telegraph_failed")
         await save_translation_error(cid, "telegraph_failed")
         return None, False
-
     except Exception as e:
         logger.exception(f"process_chapter_translation error for {cid}: {e}")
         await set_chapter_status(cid, "failed", "unexpected_error")
         await save_translation_error(cid, "unexpected_error")
         raise
-
     finally:
         await release_translation_lock(cid)
+
 
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
     subs = await load_subscribers()
@@ -1595,6 +1601,12 @@ async def send_chapter_to_user(
 
     try:
         cached_url = await get_cached_telegraph(str(chapter_num))
+        if not cached_url:
+            chapter_cache = await get_chapter_cache(str(chapter_num))
+            cached_url = chapter_cache.get("telegraph_url")
+            if cached_url:
+                await save_telegraph_url(str(chapter_num), cached_url)
+
         if cached_url:
             text = f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}"
             await safe_delete(status_msg)
@@ -1605,7 +1617,6 @@ async def send_chapter_to_user(
             return True
 
         chapter = await get_chapter_meta(str(chapter_num))
-
         if chapter:
             logger.info(f"Глава {chapter_num} найдена в chapter_meta кэше")
             if status_msg:
@@ -1613,7 +1624,6 @@ async def send_chapter_to_user(
         else:
             if status_msg:
                 await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
-
             chapter = await find_chapter_by_number(chapter_num)
             if not chapter:
                 await safe_delete(status_msg)
@@ -1622,22 +1632,14 @@ async def send_chapter_to_user(
                     reply_markup=await get_main_menu(uid)
                 )
                 return False
-
             await save_chapter_meta(chapter)
 
         in_progress = await is_translation_in_progress(chapter["id"])
-
         if status_msg:
             if in_progress:
-                await safe_edit_text(
-                    status_msg,
-                    f"⏳ Глава {chapter_num} уже переводится, ожидаю готовый результат..."
-                )
+                await safe_edit_text(status_msg, f"⏳ Глава {chapter_num} уже переводится, ожидаю готовый результат...")
             else:
-                await safe_edit_text(
-                    status_msg,
-                    f"📥 Загружаю и перевожу главу {chapter_num}..."
-                )
+                await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
 
         url, success = await process_chapter_translation(chapter)
         await safe_delete(status_msg)
@@ -1650,12 +1652,24 @@ async def send_chapter_to_user(
             await save_user_bookmark(uid, chapter['id'])
             return True
 
+        recent_error = await get_translation_error(chapter["id"])
+        if recent_error:
+            error_map = {
+                "fetch_failed": "❌ Не удалось загрузить текст главы. Попробуйте позже.",
+                "telegraph_failed": "❌ Перевод получен, но не удалось создать страницу Telegraph. Попробуйте позже.",
+                "unexpected_error": "❌ Во время обработки главы произошла ошибка. Попробуйте позже.",
+            }
+            await (initial_message or status_msg).answer(
+                error_map.get(recent_error, "❌ Не удалось создать перевод. Попробуйте позже."),
+                reply_markup=await get_main_menu(uid)
+            )
+            return False
+
         await (initial_message or status_msg).answer(
             "❌ Не удалось создать перевод. Попробуйте позже.",
             reply_markup=await get_main_menu(uid)
         )
         return False
-
     except Exception as e:
         logger.exception(f"send_chapter_to_user error: {e}")
         await safe_delete(status_msg)
@@ -1769,8 +1783,8 @@ async def on_startup():
    
     try:
         await load_glossary_to_redis(force=False)
-        count = await redis_client.hlen("glossary:terms")
-        logger.info(f"Глоссарий в Redis: {count} терминов")
+        terms = await get_glossary_terms(force_refresh=True)
+        logger.info(f"Глоссарий в Redis: {len(terms)} терминов")
     except Exception as e:
         logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
     
