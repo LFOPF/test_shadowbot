@@ -151,17 +151,27 @@ async def close_browser():
 
     logger.info("Закрываем браузер по таймеру бездействия")
     try:
-        if shared_page and not shared_page.is_closed():
-            await shared_page.close()
+        # Сначала закрываем контекст — он сам закроет страницы
         if browser_context:
             await browser_context.close()
         if browser:
             await browser.close()
-        if playwright_instance:
-            await playwright_instance.stop()
+        # Небольшая задержка, чтобы избежать race conditions
+        await asyncio.sleep(0.3)
+    except PlaywrightError as e:
+        err_str = str(e)
+        if "Target page, context or browser has been closed" in err_str:
+            logger.debug("Ожидаемое предупреждение Playwright при закрытии (target уже закрыт)")
+        else:
+            logger.warning(f"Ошибка Playwright при закрытии: {e}")
     except Exception as e:
-        logger.warning(f"Ошибка при закрытии браузера: {e}")
+        logger.warning(f"Неожиданная ошибка при закрытии браузера: {e}")
     finally:
+        if playwright_instance:
+            try:
+                await playwright_instance.stop()
+            except Exception:
+                pass
         playwright_instance = None
         browser = None
         browser_context = None
