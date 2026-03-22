@@ -656,13 +656,12 @@ async def remove_subscriber(user_id: int) -> bool:
 
 
 async def get_user_bookmark(user_id: int) -> Optional[str]:
-    value = await redis_client.hget("user:bookmarks", str(user_id))
+    value = await redis_client.hget("user_bookmarks", str(user_id))
     return value.decode() if value else None
 
 
 async def save_user_bookmark(user_id: int, chapter_id: str):
-    await redis_client.hset("user:bookmarks", str(user_id), chapter_id)
-    await redis_client.expire("user:bookmarks", 2592000 * 3)
+    await redis_client.hset("user_bookmarks", str(user_id), chapter_id)
 
 
 async def notify_all_subscribers(text: str, parse_mode: str = None):
