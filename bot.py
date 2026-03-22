@@ -25,7 +25,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import redis.asyncio as redis
-from playwright.async_api import async_playwright, Playwright, BrowserContext, Page, Error as PlaywrightError
+from playwright.async_api import async_playwright, Playwright, BrowserContext, Page, Browser, Error as PlaywrightError
 from bs4 import BeautifulSoup
 import aiohttp
 
@@ -40,7 +40,8 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
     raise ValueError("Не заданы все обязательные переменные окружения")
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
-CHECK_INTERVAL = 7200
+CHECK_INTERVAL = 10800          # 3 часа
+IDLE_TIMEOUT = 1200             # 20 минут бездействия → закрываем браузер
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
@@ -86,8 +87,13 @@ logging.getLogger().setLevel(logging.INFO)
 redis_client: Optional[redis.Redis] = None
 bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
+browser: Optional[Browser] = None
 browser_context: Optional[BrowserContext] = None
 shared_page: Optional[Page] = None
+
+_last_activity_time = 0.0
+_browser_keepalive_task: Optional[asyncio.Task] = None
+
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
     waiting_for_chapter = State()
@@ -95,23 +101,95 @@ class ChapterSelection(StatesGroup):
 class AdminActions(StatesGroup):
     waiting_for_user_id = State()
 
-# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
-async def get_shared_page() -> Page:
-    global shared_page
-    if shared_page is not None and not shared_page.is_closed():
-        return shared_page
-    
-    # Если страницы нет или она закрыта — создаём новую
-    logger.info("Создаём/восстанавливаем общую страницу Playwright")
+# ======================== БРАУЗЕР + IDLE-ТАЙМЕР ========================
+async def launch_browser():
+    global playwright_instance, browser, browser_context, shared_page
+
+    if browser is not None and not browser.is_closed():
+        return
+
+    logger.info("Запуск браузера Playwright...")
+    playwright_instance = await async_playwright().start()
+
+    browser = await playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--single-process',
+            '--disable-extensions',
+        ]
+    )
+
+    browser_context = await browser.new_context(
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        viewport={'width': 1280, 'height': 720},
+        ignore_https_errors=True,
+    )
+
     shared_page = await browser_context.new_page()
-    
-    # Настройки
     await shared_page.set_viewport_size({"width": 1280, "height": 720})
     await shared_page.set_extra_http_headers({
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
     })
     await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
-    return shared_page
+
+    logger.info("Браузер запущен и страница создана")
+
+
+async def close_browser():
+    global playwright_instance, browser, browser_context, shared_page, _browser_keepalive_task
+
+    if browser is None:
+        return
+
+    logger.info("Закрываем браузер по таймеру бездействия")
+    try:
+        if shared_page and not shared_page.is_closed():
+            await shared_page.close()
+        if browser_context:
+            await browser_context.close()
+        if browser:
+            await browser.close()
+        if playwright_instance:
+            await playwright_instance.stop()
+    except Exception as e:
+        logger.warning(f"Ошибка при закрытии браузера: {e}")
+    finally:
+        playwright_instance = None
+        browser = None
+        browser_context = None
+        shared_page = None
+        if _browser_keepalive_task:
+            _browser_keepalive_task.cancel()
+            _browser_keepalive_task = None
+
+
+async def keep_browser_alive():
+    global _last_activity_time, _browser_keepalive_task
+
+    while True:
+        await asyncio.sleep(60)
+        if browser is None:
+            continue
+
+        idle_time = asyncio.get_event_loop().time() - _last_activity_time
+        if idle_time > IDLE_TIMEOUT:
+            logger.info(f"Браузер бездействовал {idle_time:.0f} сек → закрываем")
+            await close_browser()
+            break
+
+
+def touch_browser_activity():
+    global _last_activity_time, _browser_keepalive_task
+
+    _last_activity_time = asyncio.get_event_loop().time()
+
+    if _browser_keepalive_task is None or _browser_keepalive_task.done():
+        _browser_keepalive_task = asyncio.create_task(keep_browser_alive())
+
 
 def _should_block(route) -> bool:
     req = route.request
@@ -120,16 +198,39 @@ def _should_block(route) -> bool:
 
     if res_type in ("image", "stylesheet", "font", "media", "other"):
         return True
-    
+
     ad_patterns = [
-        "googleads", "doubleclick", "adservice", "adserver", "banner", 
+        "googleads", "doubleclick", "adservice", "adserver", "banner",
         "yandex.ru/ads", "rambler", "mgid", "cointraffic", "propellerads"
     ]
     if any(p in url for p in ad_patterns):
         return True
-        
+
     return False
-    
+
+
+async def get_shared_page() -> Page:
+    global shared_page
+
+    touch_browser_activity()
+
+    if browser is None or browser.is_closed():
+        await launch_browser()
+
+    if shared_page is not None and not shared_page.is_closed():
+        return shared_page
+
+    logger.info("Создаём новую общую страницу")
+    shared_page = await browser_context.new_page()
+    await shared_page.set_viewport_size({"width": 1280, "height": 720})
+    await shared_page.set_extra_http_headers({
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    })
+    await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
+    return shared_page
+
+
+# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def extract_chapter_id(text: str) -> Optional[str]:
     text = text.strip()
     patterns = [
@@ -170,18 +271,13 @@ def get_page_url(page_num: int) -> str:
     return f"{base}/page/{page_num}/"
 
 
-def get_telegraph_path(url: str) -> str:
-    return urlparse(url).path.split('/')[-1]
-
-
-# ======================== SAFE TELEGRAM HELPERS (ИСПРАВЛЕНИЕ ОШИБКИ) ========================
+# ======================== SAFE TELEGRAM ========================
 async def safe_edit_text(
     message: types.Message,
     text: str,
     parse_mode: Optional[str] = None,
     reply_markup: Optional[InlineKeyboardMarkup | ReplyKeyboardMarkup] = None
 ) -> None:
-    """Безопасное редактирование сообщения — игнорирует 'message is not modified'."""
     try:
         await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except TelegramBadRequest as e:
@@ -193,7 +289,6 @@ async def safe_edit_text(
 
 
 async def safe_delete(message: Optional[types.Message]) -> None:
-    """Безопасное удаление сообщения."""
     if not message:
         return
     try:
@@ -352,9 +447,6 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 # ======================== PLAYWRIGHT ========================
 @retry(**RETRY_WEB)
 async def fetch_html(url: str) -> str:
-    if not playwright_instance or not browser_context:
-        raise RuntimeError("Playwright не инициализирован")
-
     page = await get_shared_page()
     try:
         await page.goto(url, wait_until="networkidle", timeout=90000)
@@ -373,10 +465,7 @@ async def fetch_html(url: str) -> str:
 
 @retry(**RETRY_WEB)
 async def fetch_chapter_text(url: str) -> str:
-    if not playwright_instance or not browser_context:
-        raise RuntimeError("Playwright не инициализирован")
-
-    page = await get_shared_page()          # ← изменили
+    page = await get_shared_page()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_selector('div.text#arrticle', timeout=60000)
@@ -723,7 +812,6 @@ admin_status_buttons = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Очистить кэш", callback_data="admin_clear_cache")],
         [InlineKeyboardButton(text="🚀 Принудительная проверка", callback_data="admin_force_check")],
-        [InlineKeyboardButton(text="📥 Пакетный перевод (10 глав)", callback_data="admin_bulk_translate")],
         [InlineKeyboardButton(text="📋 Список подписчиков", callback_data="admin_subscribers")],
         [InlineKeyboardButton(text="📜 Последние логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_user_manage")],
@@ -837,15 +925,6 @@ async def admin_force_check(callback: types.CallbackQuery):
     await callback.answer("Запуск проверки...")
     msg = await callback.message.edit_text("🔄 Принудительная проверка запущена...", reply_markup=admin_status_buttons)
     asyncio.create_task(force_monitor_run(msg))
-
-
-async def admin_bulk_translate(callback: types.CallbackQuery):
-    if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
-        await callback.answer("Доступ запрещён", show_alert=True)
-        return
-    await callback.answer("Запуск пакетного перевода...")
-    msg = await callback.message.edit_text("📥 Пакетный перевод запущен...", reply_markup=admin_status_buttons)
-    asyncio.create_task(bulk_translate(msg))
 
 
 async def admin_show_subscribers(callback: types.CallbackQuery):
@@ -1020,7 +1099,6 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     chapter_num = int(message.text)
-    # ИСПРАВЛЕНИЕ: начальное сообщение с уникальным текстом
     status_msg = await message.answer(f"🔍 Обработка главы {chapter_num}...")
     await send_chapter_to_user(uid, chapter_num, status_msg=status_msg)
     await state.clear()
@@ -1044,13 +1122,14 @@ async def button_help(message: types.Message, state: FSMContext):
     await message.answer(help_text, reply_markup=await get_main_menu(uid))
 
 
-# ======================== УНИВЕРСАЛЬНЫЙ ОТПРАВЩИК ГЛАВЫ ========================
+# ======================== ОТПРАВКА ГЛАВЫ ========================
 async def send_chapter_to_user(
     user_id: int,
     chapter_num: int,
     status_msg: Optional[types.Message] = None,
     initial_message: Optional[types.Message] = None,
 ) -> bool:
+    touch_browser_activity()
     uid = user_id
     if await is_user_blocked(uid):
         await safe_delete(status_msg)
@@ -1058,35 +1137,32 @@ async def send_chapter_to_user(
             await initial_message.answer("Вы заблокированы.")
         return False
 
-    # 1. Кэш
-    cached_url = await get_cached_telegraph(str(chapter_num))
-    if cached_url:
-        text = f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}"
-        await safe_delete(status_msg)
-        await (initial_message or status_msg).answer(
-            text, parse_mode="HTML", reply_markup=await get_main_menu(uid)
-        )
-        await save_user_bookmark(uid, str(chapter_num))
-        return True
-
-    # 2. Поиск (уникальный текст!)
-    if status_msg:
-        await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
-
-    chapter = await find_chapter_by_number(chapter_num)
-    if not chapter:
-        await safe_delete(status_msg)
-        await (initial_message or status_msg).answer(
-            f"❌ Глава {chapter_num} не найдена.",
-            reply_markup=await get_main_menu(uid)
-        )
-        return False
-
-    # 3. Перевод (новый текст!)
-    if status_msg:
-        await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
-
     try:
+        cached_url = await get_cached_telegraph(str(chapter_num))
+        if cached_url:
+            text = f"📖 <b>Глава {chapter_num}</b>\n\n🔗 {cached_url}"
+            await safe_delete(status_msg)
+            await (initial_message or status_msg).answer(
+                text, parse_mode="HTML", reply_markup=await get_main_menu(uid)
+            )
+            await save_user_bookmark(uid, str(chapter_num))
+            return True
+
+        if status_msg:
+            await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
+
+        chapter = await find_chapter_by_number(chapter_num)
+        if not chapter:
+            await safe_delete(status_msg)
+            await (initial_message or status_msg).answer(
+                f"❌ Глава {chapter_num} не найдена.",
+                reply_markup=await get_main_menu(uid)
+            )
+            return False
+
+        if status_msg:
+            await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
+
         url, success = await process_chapter_translation(chapter)
         await safe_delete(status_msg)
 
@@ -1112,6 +1188,8 @@ async def send_chapter_to_user(
             reply_markup=await get_main_menu(uid)
         )
         return False
+    finally:
+        touch_browser_activity()
 
 
 async def handle_other_text(message: types.Message, state: FSMContext):
@@ -1124,43 +1202,6 @@ async def handle_other_text(message: types.Message, state: FSMContext):
             "Пожалуйста, используйте кнопки меню.",
             reply_markup=await get_main_menu(message.from_user.id)
         )
-
-
-# ======================== ПАКЕТНЫЙ ПЕРЕВОД ========================
-async def bulk_translate(msg: types.Message):
-    try:
-        html = await fetch_html(TARGET_URL)
-        chapters = parse_chapters(html)
-        if not chapters:
-            await msg.edit_text("❌ Не удалось получить список глав.", reply_markup=admin_status_buttons)
-            return
-
-        chapters_to_translate = [ch for ch in reversed(chapters) if not await get_cached_telegraph(ch['id'])][:10]
-
-        if not chapters_to_translate:
-            await msg.edit_text("ℹ️ Все последние главы уже переведены.", reply_markup=admin_status_buttons)
-            return
-
-        await msg.edit_text(f"📥 Перевод {len(chapters_to_translate)} глав...")
-        translated = 0
-        for i, ch in enumerate(chapters_to_translate):
-            try:
-                url, success = await process_chapter_translation(ch)
-                if success and url:
-                    translated += 1
-                await asyncio.sleep(5)
-                if (i + 1) % 2 == 0:
-                    await msg.edit_text(f"📥 Переведено {translated}/{len(chapters_to_translate)}...")
-            except Exception as e:
-                logger.exception(f"Ошибка главы {ch['id']}: {e}")
-
-        await msg.edit_text(
-            f"✅ Пакетный перевод завершён: {translated}/{len(chapters_to_translate)}",
-            reply_markup=admin_status_buttons
-        )
-    except Exception as e:
-        logger.exception("Ошибка bulk_translate")
-        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
 
 
 # ======================== ПРИНУДИТЕЛЬНЫЙ МОНИТОРИНГ ========================
@@ -1177,6 +1218,7 @@ async def force_monitor_run(msg: types.Message):
 async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
+        touch_browser_activity()
         try:
             html = await fetch_html(TARGET_URL)
             chapters = parse_chapters(html)
@@ -1240,42 +1282,18 @@ async def monitor(check_once=False):
 
 # ======================== LIFECYCLE ========================
 async def on_startup():
-    logger.info("Бот запущен. Инициализация Playwright...")
-    global playwright_instance, browser_context
-    playwright_instance = await async_playwright().start()
-
-    browser = await playwright_instance.chromium.launch(
-        headless=True,
-        args=[
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--single-process',
-            '--disable-extensions',
-        ]
-    )
-
-    browser_context = await browser.new_context(
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        viewport={'width': 1280, 'height': 720},
-        ignore_https_errors=True,
-    )
-    logger.info("Playwright готов")
-
+    global _last_activity_time
+    logger.info("Бот запущен. Запускаем браузер и мониторинг...")
+    await launch_browser()
+    _last_activity_time = asyncio.get_event_loop().time()
     asyncio.create_task(monitor())
-    logger.info("Мониторинг запущен")
+    asyncio.create_task(keep_browser_alive())
+    logger.info("Мониторинг и idle-таймер запущены")
 
 
 async def on_shutdown():
     logger.info("Выключение...")
-    global shared_page, browser_context, playwright_instance
-    if shared_page and not shared_page.is_closed():
-        await shared_page.close()
-    if browser_context:
-        await browser_context.close()
-    if playwright_instance:
-        await playwright_instance.stop()
+    await close_browser()
     if redis_client:
         await redis_client.aclose()
 
@@ -1287,7 +1305,6 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
-    # Регистрация хендлеров
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
 
@@ -1303,10 +1320,8 @@ async def main():
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(handle_other_text)
 
-    # Callback-хендлеры
     dp.callback_query.register(admin_clear_cache, lambda c: c.data == "admin_clear_cache")
     dp.callback_query.register(admin_force_check, lambda c: c.data == "admin_force_check")
-    dp.callback_query.register(admin_bulk_translate, lambda c: c.data == "admin_bulk_translate")
     dp.callback_query.register(admin_show_subscribers, lambda c: c.data == "admin_subscribers")
     dp.callback_query.register(admin_show_logs, lambda c: c.data == "admin_logs")
     dp.callback_query.register(admin_user_manage, lambda c: c.data == "admin_user_manage")
@@ -1325,4 +1340,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
