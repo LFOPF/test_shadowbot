@@ -910,6 +910,62 @@ async def create_telegraph_page(
     return None
 
 
+@retry(**RETRY_API)
+async def translate_title(title: str) -> str:
+    """Переводит только заголовок главы коротким и дешёвым запросом."""
+    source_title = (title or "").strip()
+    if not source_title:
+        return "Без названия"
+
+    # Если заголовок уже содержит кириллицу, считаем его переведённым.
+    if re.search(r"[А-Яа-яЁё]", source_title):
+        return clean_title_for_telegraph(source_title)
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": SITE_URL,
+        "X-Title": SITE_NAME,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "google/gemini-2.5-flash-lite",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Переведи ТОЛЬКО название главы новеллы на русский язык. "
+                    "Сохрани номер главы, стиль и смысл. "
+                    "Верни только итоговое название без пояснений, кавычек и префиксов."
+                ),
+            },
+            {"role": "user", "content": source_title}
+        ],
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "max_tokens": 120,
+    }
+
+    session = await get_http_session()
+    async with session.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+    ) as resp:
+        if resp.status == 200:
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            translated = content.strip() if content else source_title
+            return clean_title_for_telegraph(translated)
+        elif resp.status == 429:
+            logger.warning("Rate limit от OpenRouter при переводе заголовка")
+            raise aiohttp.ClientError("Rate limit")
+        else:
+            text_resp = await resp.text()
+            logger.error(f"OpenRouter title {resp.status}: {text_resp[:500]}")
+            return clean_title_for_telegraph(source_title)
+
+
 @retry(
     reraise=True,
     stop=stop_after_attempt(4),
@@ -933,7 +989,14 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         return None, False
 
     translated = await translate_text(text)
-    translated_title_clean = clean_title_for_telegraph(title)
+
+    cached_title = await get_cached_title(cid)
+    if cached_title and re.search(r"[А-Яа-яЁё]", cached_title):
+        translated_title_clean = clean_title_for_telegraph(cached_title)
+    else:
+        translated_title_clean = await translate_title(title)
+        if not translated_title_clean:
+            translated_title_clean = clean_title_for_telegraph(title)
 
     await save_cached_title(cid, translated_title_clean)
 
