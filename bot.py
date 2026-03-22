@@ -323,6 +323,87 @@ def clean_title_for_telegraph(title: str) -> str:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH - 3] + "..."
     return title
 
+async def load_glossary_to_redis(force: bool = False):
+    """
+    Загружает glossary.txt → Redis хэш glossary:terms
+    Если force=False — загружает только если хэш пустой
+    """
+    redis_key = "glossary:terms"
+    
+    # Проверяем, есть ли уже данные
+    existing_count = await redis_client.hlen(redis_key)
+    
+    if existing_count > 0 and not force:
+        logger.info(f"Глоссарий в Redis уже существует ({existing_count} терминов), пропускаем загрузку")
+        return
+    
+    try:
+        terms = {}
+        with open('glossary.txt', 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' not in line:
+                    logger.warning(f"glossary.txt:{line_num} — строка без '='")
+                    continue
+                
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if key and value:
+                    terms[key] = value
+        
+        if not terms:
+            logger.warning("Глоссарий пустой или невалидный")
+            return
+        
+        # Сортируем
+        sorted_terms = dict(sorted(terms.items(), key=lambda x: len(x[0]), reverse=True))
+        
+        await redis_client.hmset(redis_key, sorted_terms)
+        
+        logger.info(f"Глоссарий успешно загружен в Redis → {len(sorted_terms)} терминов")
+        
+    except FileNotFoundError:
+        logger.error("Файл glossary.txt не найден")
+    except Exception as e:
+        logger.exception("Ошибка при загрузке глоссария в Redis")
+
+
+async def get_relevant_glossary(text: str) -> str:
+    """Возвращает строку с релевантными терминами из Redis"""
+    redis_key = "glossary:terms"
+    
+    all_terms = await redis_client.hgetall(redis_key)
+    
+    if not all_terms:
+        logger.warning("Глоссарий в Redis пустой")
+        return ""
+    
+    relevant = []
+    text_lower = text.lower()
+    
+    for eng_bytes, rus_bytes in all_terms.items():
+        eng = eng_bytes.decode('utf-8')
+        rus = rus_bytes.decode('utf-8')
+        
+        # Точный поиск с границами слова
+        pattern = re.compile(r'(?i)\b' + re.escape(eng) + r'\b')
+        if pattern.search(text) or eng.lower() in text_lower:
+            relevant.append(f"{eng} → {rus}")
+    
+    if not relevant:
+        return ""
+    
+    return (
+        "=== ГЛОССАРИЙ ===\n"
+        "Используй ТОЛЬКО следующие переводы имён, терминов и названий (строго!):\n\n" +
+        "\n".join(relevant) +
+        "\n\nНе придумывай другие варианты перевода для этих слов."
+    )
+
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
@@ -659,20 +740,27 @@ async def translate_text(text: str) -> str:
         logger.warning("Текст слишком длинный, обрезаем")
         text = text[:120000] + "\n... [обрезано]"
 
+    glossary_section = get_relevant_glossary(text)
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": SITE_URL,
         "X-Title": SITE_NAME,
         "Content-Type": "application/json"
     }
+    
+    system_prompt = SYSTEM_PROMPT
+    if glossary_section:
+        system_prompt = glossary_section + "\n\n" + SYSTEM_PROMPT
+
     payload = {
         "model": "google/gemini-2.5-flash-lite",
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
         ],
         "temperature": 0.90,
-        "top_p": 0.93,
+        "top_p": 0.92,
         "max_tokens": 8192,
         "presence_penalty": 0.15,
         "frequency_penalty": 0.08
@@ -693,7 +781,6 @@ async def translate_text(text: str) -> str:
             elif resp.status == 429:
                 logger.warning("Rate limit от OpenRouter")
                 raise aiohttp.ClientError("Rate limit")
-
             else:
                 text_resp = await resp.text()
                 logger.error(f"OpenRouter {resp.status}: {text_resp[:500]}")
@@ -1332,14 +1419,24 @@ async def monitor(check_once=False):
 
 async def on_startup():
     global _last_activity_time
-    logger.info("Бот запущен. Запускаем браузер и мониторинг...")
+    logger.info("Бот запущен. Запускаем браузер, глоссарий и мониторинг...")
+   
+    try:
+        await load_glossary_to_redis(force=False)
+        count = await redis_client.hlen("glossary:terms")
+        logger.info(f"Глоссарий в Redis: {count} терминов")
+    except Exception as e:
+    logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
+    
     try:
         await launch_browser()
     except Exception as e:
         logger.exception("Ошибка запуска браузера при старте")
+        
     _last_activity_time = asyncio.get_event_loop().time()
     asyncio.create_task(monitor())
     asyncio.create_task(keep_browser_alive())
+    
     logger.info("Мониторинг и idle-таймер запущены")
 
 
