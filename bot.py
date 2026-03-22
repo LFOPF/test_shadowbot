@@ -42,7 +42,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
-IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "360"))  # 6 min
+IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "180"))  # 3 минуты по умолчанию для экономии RAM
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
@@ -96,6 +96,7 @@ _browser_lock = asyncio.Lock()
 _browser_is_closing = False
 monitor_lock = asyncio.Lock()
 http_session: Optional[aiohttp.ClientSession] = None
+subscribers_key_ready = False
 # glossary_dict: Dict[str, str] = {}  трайнем через хэш
 SYSTEM_PROMPT = (
     "Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave. "
@@ -480,8 +481,69 @@ async def save_cached_title(chapter_id: str, title: str):
         logger.error(f"save_cached_title error: {e}")
 
 
+async def ensure_subscribers_key() -> None:
+    global subscribers_key_ready
+    if subscribers_key_ready:
+        return
+    try:
+        key_type = await redis_client.type("subscribers")
+        if isinstance(key_type, bytes):
+            key_type = key_type.decode()
+
+        if key_type in ("none", "set"):
+            subscribers_key_ready = True
+            return
+
+        migrated_ids: Set[int] = set()
+
+        if key_type == "string":
+            raw = await redis_client.get("subscribers")
+            if raw:
+                raw_str = raw.decode() if isinstance(raw, bytes) else str(raw)
+                try:
+                    parsed = json.loads(raw_str)
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            try:
+                                migrated_ids.add(int(item))
+                            except (TypeError, ValueError):
+                                continue
+                    elif isinstance(parsed, dict):
+                        for item in parsed.keys():
+                            try:
+                                migrated_ids.add(int(item))
+                            except (TypeError, ValueError):
+                                continue
+                except json.JSONDecodeError:
+                    for part in re.split(r"[,\s]+", raw_str.strip()):
+                        if not part:
+                            continue
+                        try:
+                            migrated_ids.add(int(part))
+                        except ValueError:
+                            continue
+        elif key_type == "list":
+            values = await redis_client.lrange("subscribers", 0, -1)
+            for value in values:
+                try:
+                    migrated_ids.add(int(value.decode() if isinstance(value, bytes) else value))
+                except (TypeError, ValueError):
+                    continue
+
+        pipe = redis_client.pipeline()
+        pipe.delete("subscribers")
+        if migrated_ids:
+            pipe.sadd("subscribers", *[str(uid) for uid in migrated_ids])
+        await pipe.execute()
+        subscribers_key_ready = True
+        logger.info(f"Миграция ключа subscribers завершена, перенесено {len(migrated_ids)} подписчиков")
+    except Exception as e:
+        logger.error(f"ensure_subscribers_key error: {e}")
+
+
 async def load_subscribers() -> Set[int]:
     try:
+        await ensure_subscribers_key()
         values = await redis_client.smembers("subscribers")
         return {int(v.decode() if isinstance(v, bytes) else v) for v in values}
     except Exception as e:
@@ -491,6 +553,7 @@ async def load_subscribers() -> Set[int]:
 
 async def save_subscribers(subs: Set[int]):
     try:
+        await ensure_subscribers_key()
         pipe = redis_client.pipeline()
         pipe.delete("subscribers")
         if subs:
@@ -502,6 +565,7 @@ async def save_subscribers(subs: Set[int]):
 
 async def add_subscriber(user_id: int) -> None:
     try:
+        await ensure_subscribers_key()
         await redis_client.sadd("subscribers", str(user_id))
     except Exception as e:
         logger.error(f"add_subscriber error: {e}")
@@ -576,6 +640,7 @@ async def unblock_user(user_id: int):
 
 async def remove_subscriber(user_id: int) -> bool:
     try:
+        await ensure_subscribers_key()
         removed = await redis_client.srem("subscribers", str(user_id))
         if removed:
             logger.info(f"Пользователь {user_id} удалён из подписчиков")
@@ -1444,6 +1509,7 @@ async def on_shutdown():
 async def main():
     global redis_client, bot
     redis_client = await redis.from_url(REDIS_URL)
+    await ensure_subscribers_key()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
