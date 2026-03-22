@@ -4,6 +4,8 @@ import logging
 import re
 import json
 import html
+import time
+from contextlib import suppress
 from typing import Optional, Set, List, Dict, Any
 from urllib.parse import urlparse
 from collections import deque
@@ -49,6 +51,10 @@ MAX_PAGES = 120
 CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
 NOVEL_ID = "1205249"
+TRANSLATION_LOCK_TTL = 15 * 60
+TRANSLATION_WAIT_TIMEOUT = 90
+TRANSLATION_WAIT_STEP = 2
+ERROR_TTL = 5 * 60
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -447,7 +453,104 @@ async def safe_delete(message: Optional[types.Message]) -> None:
     except Exception:
         pass
 
+async def get_chapter_cache(chapter_id: str) -> dict[str, str]:
+    try:
+        data = await redis_client.hgetall(f"chapter:{chapter_id}")
+        if not data:
+            return {}
+        return {k.decode(): v.decode() for k, v in data.items()}
+    except Exception as e:
+        logger.error(f"get_chapter_cache error for {chapter_id}: {e}")
+        return {}
 
+
+async def save_chapter_cache(chapter_id: str, mapping: dict[str, str]) -> None:
+    try:
+        payload = {k: str(v) for k, v in mapping.items() if v is not None}
+        if not payload:
+            return
+        await redis_client.hset(f"chapter:{chapter_id}", mapping=payload)
+    except Exception as e:
+        logger.error(f"save_chapter_cache error for {chapter_id}: {e}")
+
+
+async def set_chapter_status(chapter_id: str, status: str, error: str = "") -> None:
+    await save_chapter_cache(chapter_id, {
+        "status": status,
+        "error": error,
+        "updated_at": str(int(time.time())),
+    })
+
+
+async def acquire_translation_lock(chapter_id: str) -> bool:
+    try:
+        result = await redis_client.set(
+            f"translation:lock:{chapter_id}",
+            str(int(time.time())),
+            ex=TRANSLATION_LOCK_TTL,
+            nx=True,
+        )
+        return bool(result)
+    except Exception as e:
+        logger.error(f"acquire_translation_lock error for {chapter_id}: {e}")
+        return False
+
+
+async def release_translation_lock(chapter_id: str) -> None:
+    with suppress(Exception):
+        await redis_client.delete(f"translation:lock:{chapter_id}")
+
+
+async def is_translation_in_progress(chapter_id: str) -> bool:
+    try:
+        return bool(await redis_client.exists(f"translation:lock:{chapter_id}"))
+    except Exception as e:
+        logger.error(f"is_translation_in_progress error for {chapter_id}: {e}")
+        return False
+
+
+async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION_WAIT_TIMEOUT) -> Optional[str]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        url = await get_cached_telegraph(chapter_id)
+        if url:
+            return url
+
+        cache = await get_chapter_cache(chapter_id)
+        if cache.get("status") == "failed":
+            return None
+
+        await asyncio.sleep(TRANSLATION_WAIT_STEP)
+
+    return await get_cached_telegraph(chapter_id)
+
+
+async def save_translation_error(chapter_id: str, error: str) -> None:
+    try:
+        await redis_client.set(f"translation:error:{chapter_id}", error, ex=ERROR_TTL)
+    except Exception as e:
+        logger.error(f"save_translation_error error for {chapter_id}: {e}")
+
+
+async def get_translation_error(chapter_id: str) -> Optional[str]:
+    try:
+        value = await redis_client.get(f"translation:error:{chapter_id}")
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_translation_error error for {chapter_id}: {e}")
+        return None
+
+
+async def save_chapter_meta(ch: Dict[str, str]) -> None:
+    try:
+        await redis_client.hset(f"chapter_meta:{ch['id']}", mapping={
+            "id": ch["id"],
+            "title": ch["title"],
+            "link": ch["link"],
+        })
+    except Exception as e:
+        logger.error(f"save_chapter_meta error for {ch['id']}: {e}")
+        
 async def get_cached_telegraph(chapter_id: str) -> Optional[str]:
     try:
         value = await redis_client.hget("telegraph_urls", chapter_id)
@@ -974,44 +1077,108 @@ async def translate_title(title: str) -> str:
     before_sleep=before_sleep_log(logger, logging.ERROR),
 )
 async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
-    cid = ch['id']
-    title = ch['title']
+    cid = ch["id"]
+    title = ch["title"]
+    source_url = ch["link"]
 
+    await save_chapter_meta(ch)
+
+    # 1. Быстрый путь: готовый Telegraph
     url = await get_cached_telegraph(cid)
     if url:
-        logger.info(f"Глава {cid} найдена в кэше")
+        logger.info(f"Глава {cid} найдена в telegraph-кэше")
         return url, True
 
-    try:
-        text = await fetch_chapter_text(ch['link'])
-    except Exception as e:
-        logger.exception(f"Ошибка загрузки главы {cid}")
+    # 2. Если кто-то уже переводит эту главу — ждём
+    if await is_translation_in_progress(cid):
+        logger.info(f"Глава {cid} уже переводится другим процессом, ждём результат")
+        ready_url = await wait_for_ready_translation(cid)
+        if ready_url:
+            return ready_url, True
+        logger.warning(f"Ожидание перевода главы {cid} завершилось без результата")
         return None, False
 
-    translated = await translate_text(text)
+    # 3. Пытаемся взять lock
+    lock_acquired = await acquire_translation_lock(cid)
+    if not lock_acquired:
+        logger.info(f"Не удалось взять lock для главы {cid}, ждём готовый результат")
+        ready_url = await wait_for_ready_translation(cid)
+        if ready_url:
+            return ready_url, True
+        return None, False
 
-    cached_title = await get_cached_title(cid)
-    if cached_title and re.search(r"[А-Яа-яЁё]", cached_title):
-        translated_title_clean = clean_title_for_telegraph(cached_title)
-    else:
-        translated_title_clean = await translate_title(title)
-        if not translated_title_clean:
-            translated_title_clean = clean_title_for_telegraph(title)
+    try:
+        await set_chapter_status(cid, "processing")
 
-    await save_cached_title(cid, translated_title_clean)
+        cache = await get_chapter_cache(cid)
 
-    html = text_to_html(translated)
-    new_url = await create_telegraph_page(
-        title=translated_title_clean,
-        content_html=html
-    )
+        # 4. Оригинальный текст: либо из Redis, либо парсим сайт один раз
+        original_text = cache.get("original_text")
+        if not original_text:
+            try:
+                original_text = await fetch_chapter_text(source_url)
+            except Exception:
+                logger.exception(f"Ошибка загрузки главы {cid}")
+                await set_chapter_status(cid, "failed", "fetch_failed")
+                await save_translation_error(cid, "fetch_failed")
+                return None, False
 
-    if new_url:
-        await save_telegraph_url(cid, new_url)
-        return new_url, True
-    logger.error(f"Не удалось создать Telegraph для главы {cid}")
-    return None, False
+            await save_chapter_cache(cid, {
+                "source_url": source_url,
+                "source_title": title,
+                "original_text": original_text,
+            })
 
+        # 5. Перевод текста: либо из Redis, либо переводим
+        translated_text = cache.get("translated_text")
+        if not translated_text:
+            translated_text = await translate_text(original_text)
+            await save_chapter_cache(cid, {
+                "translated_text": translated_text,
+            })
+
+        # 6. Заголовок: либо из Redis, либо переводим
+        translated_title = cache.get("translated_title") or await get_cached_title(cid)
+        if translated_title and re.search(r"[А-Яа-яЁё]", translated_title):
+            translated_title_clean = clean_title_for_telegraph(translated_title)
+        else:
+            translated_title_clean = await translate_title(title)
+            if not translated_title_clean:
+                translated_title_clean = clean_title_for_telegraph(title)
+
+        await save_cached_title(cid, translated_title_clean)
+        await save_chapter_cache(cid, {
+            "translated_title": translated_title_clean,
+        })
+
+        # 7. Telegraph: создаём только если ещё нет готовой ссылки
+        html = text_to_html(translated_text)
+        new_url = await create_telegraph_page(
+            title=translated_title_clean,
+            content_html=html
+        )
+
+        if new_url:
+            await save_telegraph_url(cid, new_url)
+            await save_chapter_cache(cid, {
+                "telegraph_url": new_url,
+            })
+            await set_chapter_status(cid, "ready")
+            return new_url, True
+
+        logger.error(f"Не удалось создать Telegraph для главы {cid}")
+        await set_chapter_status(cid, "failed", "telegraph_failed")
+        await save_translation_error(cid, "telegraph_failed")
+        return None, False
+
+    except Exception as e:
+        logger.exception(f"process_chapter_translation error for {cid}: {e}")
+        await set_chapter_status(cid, "failed", "unexpected_error")
+        await save_translation_error(cid, "unexpected_error")
+        raise
+
+    finally:
+        await release_translation_lock(cid)
 
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
     subs = await load_subscribers()
@@ -1419,8 +1586,21 @@ async def send_chapter_to_user(
             )
             return False
 
+        await save_chapter_meta(chapter)
+
+        in_progress = await is_translation_in_progress(chapter["id"])
+
         if status_msg:
-            await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
+            if in_progress:
+                await safe_edit_text(
+                    status_msg,
+                    f"⏳ Глава {chapter_num} уже переводится, ожидаю готовый результат..."
+                )
+            else:
+                await safe_edit_text(
+                    status_msg,
+                    f"📥 Загружаю и перевожу главу {chapter_num}..."
+                )
 
         url, success = await process_chapter_translation(chapter)
         await safe_delete(status_msg)
