@@ -41,7 +41,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
-IDLE_TIMEOUT = 1200             # 20 минут бездействия → закрываем браузер
+IDLE_TIMEOUT = 45             # 20 минут бездействия → закрываем браузер
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
@@ -90,9 +90,10 @@ playwright_instance: Optional[Playwright] = None
 browser: Optional[Browser] = None
 browser_context: Optional[BrowserContext] = None
 shared_page: Optional[Page] = None
-
 _last_activity_time = 0.0
 _browser_keepalive_task: Optional[asyncio.Task] = None
+_browser_lock = asyncio.Lock()
+_browser_is_closing = False
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -144,56 +145,80 @@ async def launch_browser():
 
 
 async def close_browser():
-    global playwright_instance, browser, browser_context, shared_page, _browser_keepalive_task
+    global browser, browser_context, shared_page, playwright_instance
+    global _browser_keepalive_task, _browser_is_closing
 
-    if browser is None:
-        return
+    async with _browser_lock:
+        if browser is None or _browser_is_closing:
+            return
 
-    logger.info("Закрываем браузер по таймеру бездействия")
-    try:
-        # Сначала закрываем контекст — он сам закроет страницы
-        if browser_context:
-            await browser_context.close()
-        if browser:
-            await browser.close()
-        # Небольшая задержка, чтобы избежать race conditions
-        await asyncio.sleep(0.3)
-    except PlaywrightError as e:
-        err_str = str(e)
-        if "Target page, context or browser has been closed" in err_str:
-            logger.debug("Ожидаемое предупреждение Playwright при закрытии (target уже закрыт)")
-        else:
-            logger.warning(f"Ошибка Playwright при закрытии: {e}")
-    except Exception as e:
-        logger.warning(f"Неожиданная ошибка при закрытии браузера: {e}")
-    finally:
-        if playwright_instance:
-            try:
-                await playwright_instance.stop()
-            except Exception:
-                pass
-        playwright_instance = None
-        browser = None
-        browser_context = None
-        shared_page = None
-        if _browser_keepalive_task:
-            _browser_keepalive_task.cancel()
-            _browser_keepalive_task = None
+        _browser_is_closing = True
+        logger.info("Закрываем браузер...")
+
+        try:
+            if _browser_keepalive_task:
+                _browser_keepalive_task.cancel()
+                try:
+                    await _browser_keepalive_task
+                except asyncio.CancelledError:
+                    pass
+                _browser_keepalive_task = None
+
+            if browser_context:
+                try:
+                    await browser_context.close()
+                except PlaywrightError as e:
+                    if "Target" in str(e) and ("closed" in str(e) or "disposed" in str(e)):
+                        logger.debug("Контекст уже закрыт/удалён")
+                    else:
+                        logger.warning(f"Ошибка закрытия context: {e}")
+
+            if browser:
+                try:
+                    await browser.close()
+                except PlaywrightError as e:
+                    logger.debug(f"Browser.close: {e}")
+
+            if playwright_instance:
+                try:
+                    await playwright_instance.stop()
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0.2)
+
+        except Exception as e:
+            logger.warning(f"Неожиданная ошибка при закрытии браузера: {e}")
+
+        finally:
+            browser = None
+            browser_context = None
+            shared_page = None
+            playwright_instance = None
+            _browser_is_closing = False
 
 
 async def keep_browser_alive():
-    global _last_activity_time, _browser_keepalive_task
+    global _last_activity_time
 
-    while True:
-        await asyncio.sleep(60)
-        if browser is None:
-            continue
+    try:
+        while True:
+            now = asyncio.get_event_loop().time()
+            idle = now - _last_activity_time
+            remaining = IDLE_TIMEOUT - idle
 
-        idle_time = asyncio.get_event_loop().time() - _last_activity_time
-        if idle_time > IDLE_TIMEOUT:
-            logger.info(f"Браузер бездействовал {idle_time:.0f} сек → закрываем")
-            await close_browser()
-            break
+            if remaining <= 0:
+                logger.info(f"Браузер бездействовал {idle:.0f} сек → закрываем")
+                await close_browser()
+                break
+
+            await asyncio.sleep(min(remaining, 60.0))
+
+    except asyncio.CancelledError:
+        logger.debug("keep_browser_alive cancelled")
+        raise
+    except Exception as e:
+        logger.exception("Ошибка в keep_browser_alive")
 
 
 def touch_browser_activity():
@@ -233,6 +258,10 @@ async def get_shared_page() -> Page:
 
     if shared_page is not None and not shared_page.is_closed():
         return shared_page
+
+    if browser_context is None:
+        logger.error("browser_context is None после launch_browser — критично!")
+        raise RuntimeError("Browser context lost")
 
     logger.info("Создаём новую общую страницу")
     shared_page = await browser_context.new_page()
