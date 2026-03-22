@@ -656,20 +656,13 @@ async def remove_subscriber(user_id: int) -> bool:
 
 
 async def get_user_bookmark(user_id: int) -> Optional[str]:
-    try:
-        key = f"bookmark:{user_id}"
-        value = await redis_client.get(key)
-        return value.decode() if value else None
-    except Exception:
-        return None
+    value = await redis_client.hget("user:bookmarks", str(user_id))
+    return value.decode() if value else None
 
 
 async def save_user_bookmark(user_id: int, chapter_id: str):
-    try:
-        key = f"bookmark:{user_id}"
-        await redis_client.set(key, chapter_id, ex=2592000)  # 30 дней
-    except Exception as e:
-        logger.error(f"Ошибка сохранения закладки: {e}")
+    await redis_client.hset("user:bookmarks", str(user_id), chapter_id)
+    await redis_client.expire("user:bookmarks", 2592000 * 3)
 
 
 async def notify_all_subscribers(text: str, parse_mode: str = None):
