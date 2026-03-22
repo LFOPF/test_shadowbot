@@ -1426,7 +1426,7 @@ async def on_startup():
         count = await redis_client.hlen("glossary:terms")
         logger.info(f"Глоссарий в Redis: {count} терминов")
     except Exception as e:
-    logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
+        logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
     
     try:
         await launch_browser()
