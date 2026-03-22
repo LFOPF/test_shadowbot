@@ -1107,7 +1107,8 @@ async def admin_clear_cache(callback: types.CallbackQuery):
     try:
         await redis_client.delete("first_chapter")
         await callback.answer("Кэш очищен")
-        await callback.message.edit_text(
+        await safe_edit_text(
+            callback.message,
             "✅ Кэш первой главы очищен.",
             reply_markup=admin_status_buttons
         )
@@ -1131,7 +1132,7 @@ async def admin_show_subscribers(callback: types.CallbackQuery):
         return
     subs = await load_subscribers()
     text = f"Всего подписчиков: {len(subs)}" if subs else "Нет подписчиков."
-    await callback.message.edit_text(text, reply_markup=admin_status_buttons)
+    await safe_edit_text(callback.message, text, reply_markup=admin_status_buttons)
     await callback.answer()
 
 
@@ -1140,7 +1141,7 @@ async def admin_show_logs(callback: types.CallbackQuery):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     text = "Последние 10 логов:\n" + "\n".join(list(log_buffer)[-10:]) if log_buffer else "Логи отсутствуют."
-    await callback.message.edit_text(text, reply_markup=admin_status_buttons)
+    await safe_edit_text(callback.message, text, reply_markup=admin_status_buttons)
     await callback.answer()
 
 
@@ -1148,7 +1149,7 @@ async def admin_user_manage(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
-    await callback.message.edit_text("Выберите действие:", reply_markup=admin_user_manage_buttons)
+    await safe_edit_text(callback.message, "Выберите действие:", reply_markup=admin_user_manage_buttons)
     await callback.answer()
 
 
@@ -1156,7 +1157,7 @@ async def admin_back_to_main(callback: types.CallbackQuery):
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
-    await callback.message.edit_text("Выберите действие:", reply_markup=admin_status_buttons)
+    await safe_edit_text(callback.message, "Выберите действие:", reply_markup=admin_status_buttons)
     await callback.answer()
 
 
@@ -1226,7 +1227,7 @@ async def process_admin_user_id(message: types.Message, state: FSMContext):
 
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("Действие отменено.", reply_markup=admin_status_buttons)
+    await safe_edit_text(callback.message, "Действие отменено.", reply_markup=admin_status_buttons)
     await callback.answer()
 
 
@@ -1403,9 +1404,9 @@ async def force_monitor_run(msg: types.Message):
     logger.info("Принудительная проверка")
     try:
         await monitor(check_once=True)
-        await msg.edit_text("✅ Проверка завершена.", reply_markup=admin_status_buttons)
+        await safe_edit_text(msg, "✅ Проверка завершена.", reply_markup=admin_status_buttons)
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
+        await safe_edit_text(msg, f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
 
 
 async def monitor(check_once=False):
