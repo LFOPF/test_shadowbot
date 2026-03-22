@@ -517,12 +517,21 @@ async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION
             return url
 
         cache = await get_chapter_cache(chapter_id)
+
+        if cache.get("telegraph_url"):
+            return cache["telegraph_url"]
+
         if cache.get("status") == "failed":
             return None
 
         await asyncio.sleep(TRANSLATION_WAIT_STEP)
 
-    return await get_cached_telegraph(chapter_id)
+    url = await get_cached_telegraph(chapter_id)
+    if url:
+        return url
+
+    cache = await get_chapter_cache(chapter_id)
+    return cache.get("telegraph_url")
 
 
 async def save_translation_error(chapter_id: str, error: str) -> None:
@@ -538,6 +547,27 @@ async def get_translation_error(chapter_id: str) -> Optional[str]:
         return value.decode() if value else None
     except Exception as e:
         logger.error(f"get_translation_error error for {chapter_id}: {e}")
+        return None
+
+
+async def get_chapter_meta(chapter_id: str) -> Optional[Dict[str, str]]:
+    try:
+        data = await redis_client.hgetall(f"chapter_meta:{chapter_id}")
+        if not data:
+            return None
+
+        decoded = {k.decode(): v.decode() for k, v in data.items()}
+
+        if not decoded.get("id") or not decoded.get("title") or not decoded.get("link"):
+            return None
+
+        return {
+            "id": decoded["id"],
+            "title": decoded["title"],
+            "link": decoded["link"],
+        }
+    except Exception as e:
+        logger.error(f"get_chapter_meta error for {chapter_id}: {e}")
         return None
 
 
@@ -1574,19 +1604,26 @@ async def send_chapter_to_user(
             await save_user_bookmark(uid, str(chapter_num))
             return True
 
-        if status_msg:
-            await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
+        chapter = await get_chapter_meta(str(chapter_num))
 
-        chapter = await find_chapter_by_number(chapter_num)
-        if not chapter:
-            await safe_delete(status_msg)
-            await (initial_message or status_msg).answer(
-                f"❌ Глава {chapter_num} не найдена.",
-                reply_markup=await get_main_menu(uid)
-            )
-            return False
+        if chapter:
+            logger.info(f"Глава {chapter_num} найдена в chapter_meta кэше")
+            if status_msg:
+                await safe_edit_text(status_msg, f"📦 Глава {chapter_num} найдена в кэше, подготавливаю перевод...")
+        else:
+            if status_msg:
+                await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
 
-        await save_chapter_meta(chapter)
+            chapter = await find_chapter_by_number(chapter_num)
+            if not chapter:
+                await safe_delete(status_msg)
+                await (initial_message or status_msg).answer(
+                    f"❌ Глава {chapter_num} не найдена.",
+                    reply_markup=await get_main_menu(uid)
+                )
+                return False
+
+            await save_chapter_meta(chapter)
 
         in_progress = await is_translation_in_progress(chapter["id"])
 
@@ -1659,6 +1696,8 @@ async def monitor(check_once=False):
             async with monitor_lock:
                 html = await fetch_html(TARGET_URL)
                 chapters = parse_chapters(html)
+                for ch in chapters:
+                    await save_chapter_meta(ch)
                 last_str = await get_last_chapter()
                 last_int = int(last_str) if last_str and last_str.isdigit() else 0
 
