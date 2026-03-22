@@ -1150,6 +1150,8 @@ async def monitor(check_once=False):
 async def on_startup():
     global _last_activity_time
     logger.info("Бот запущен. Инициализация...")
+    logger.info(f"Текущая директория: {os.getcwd()}")
+    logger.info(f"Список файлов в корне: {os.listdir('.')}")
     try:
         await launch_browser()
     except Exception as e:
