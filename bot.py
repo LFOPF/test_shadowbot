@@ -41,7 +41,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
-IDLE_TIMEOUT = 45             # 20 минут бездействия → закрываем браузер
+IDLE_TIMEOUT = 1200             # 20 минут
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
