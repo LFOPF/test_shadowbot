@@ -508,7 +508,37 @@ async def save_cached_title(chapter_id: str, title: str):
     except Exception as e:
         logger.error(f"save_cached_title error: {e}")
 
+async def get_chapter_original_text(chapter_id: str) -> Optional[str]:
+    try:
+        value = await redis_client.get(f"chapter:original:{chapter_id}")
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_chapter_original_text error for {chapter_id}: {e}")
+        return None
 
+
+async def save_chapter_original_text(chapter_id: str, text: str) -> None:
+    try:
+        await redis_client.set(f"chapter:original:{chapter_id}", text)
+    except Exception as e:
+        logger.error(f"save_chapter_original_text error for {chapter_id}: {e}")
+
+
+async def get_chapter_translated_text(chapter_id: str) -> Optional[str]:
+    try:
+        value = await redis_client.get(f"chapter:translated:{chapter_id}")
+        return value.decode() if value else None
+    except Exception as e:
+        logger.error(f"get_chapter_translated_text error for {chapter_id}: {e}")
+        return None
+
+
+async def save_chapter_translated_text(chapter_id: str, text: str) -> None:
+    try:
+        await redis_client.set(f"chapter:translated:{chapter_id}", text)
+    except Exception as e:
+        logger.error(f"save_chapter_translated_text error for {chapter_id}: {e}")
+        
 async def get_chapter_cache(chapter_id: str) -> dict[str, str]:
     try:
         data = await redis_client.hgetall(f"chapter:{chapter_id}")
@@ -523,8 +553,9 @@ async def get_chapter_cache(chapter_id: str) -> dict[str, str]:
 async def save_chapter_cache(chapter_id: str, mapping: dict[str, str]) -> None:
     try:
         payload = {k: str(v) for k, v in mapping.items() if v is not None}
-        if payload:
-            await redis_client.hset(f"chapter:{chapter_id}", mapping=payload)
+        if not payload:
+            return
+        await redis_client.hset(f"chapter:{chapter_id}", mapping=payload)
     except Exception as e:
         logger.error(f"save_chapter_cache error for {chapter_id}: {e}")
 
@@ -574,8 +605,10 @@ async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION
             return url
 
         cache = await get_chapter_cache(chapter_id)
+
         if cache.get("telegraph_url"):
             return cache["telegraph_url"]
+
         if cache.get("status") == "failed":
             return None
 
@@ -1135,18 +1168,13 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     await save_chapter_meta(ch)
 
+    # 1. Быстрый путь: уже есть готовый Telegraph
     url = await get_cached_telegraph(cid)
     if url:
         logger.info(f"Глава {cid} найдена в telegraph-кэше")
         return url, True
 
-    cache = await get_chapter_cache(cid)
-    cached_url = cache.get("telegraph_url")
-    if cached_url:
-        await save_telegraph_url(cid, cached_url)
-        logger.info(f"Глава {cid} найдена в chapter-кэше")
-        return cached_url, True
-
+    # 2. Если кто-то уже переводит эту главу — ждём, а не запускаем второй перевод
     if await is_translation_in_progress(cid):
         logger.info(f"Глава {cid} уже переводится другим процессом, ждём результат")
         ready_url = await wait_for_ready_translation(cid)
@@ -1155,6 +1183,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         logger.warning(f"Ожидание перевода главы {cid} завершилось без результата")
         return None, False
 
+    # 3. Пытаемся взять lock
     lock_acquired = await acquire_translation_lock(cid)
     if not lock_acquired:
         logger.info(f"Не удалось взять lock для главы {cid}, ждём готовый результат")
@@ -1165,10 +1194,17 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     try:
         await set_chapter_status(cid, "processing")
-        await save_chapter_cache(cid, {"source_url": source_url, "source_title": title})
 
         cache = await get_chapter_cache(cid)
-        original_text = cache.get("original_text")
+
+        # Сохраняем мету отдельно
+        await save_chapter_cache(cid, {
+            "source_url": source_url,
+            "source_title": title,
+        })
+
+        # 4. Оригинальный текст: либо из Redis string, либо парсим сайт
+        original_text = await get_chapter_original_text(cid)
         if not original_text:
             try:
                 original_text = await fetch_chapter_text(source_url)
@@ -1177,13 +1213,16 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 await set_chapter_status(cid, "failed", "fetch_failed")
                 await save_translation_error(cid, "fetch_failed")
                 return None, False
-            await save_chapter_cache(cid, {"original_text": original_text})
 
-        translated_text = cache.get("translated_text")
+            await save_chapter_original_text(cid, original_text)
+
+        # 5. Перевод текста: либо из Redis string, либо переводим
+        translated_text = await get_chapter_translated_text(cid)
         if not translated_text:
             translated_text = await translate_text(original_text)
-            await save_chapter_cache(cid, {"translated_text": translated_text})
+            await save_chapter_translated_text(cid, translated_text)
 
+        # 6. Заголовок: либо из кэша, либо переводим
         translated_title = cache.get("translated_title") or await get_cached_title(cid)
         if translated_title and re.search(r"[А-Яа-яЁё]", translated_title):
             translated_title_clean = clean_title_for_telegraph(translated_title)
@@ -1193,13 +1232,29 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 translated_title_clean = clean_title_for_telegraph(title)
 
         await save_cached_title(cid, translated_title_clean)
-        await save_chapter_cache(cid, {"translated_title": translated_title_clean})
+        await save_chapter_cache(cid, {
+            "translated_title": translated_title_clean,
+        })
 
+        # 7. Если в новом chapter hash уже есть telegraph_url, используем его
+        if cache.get("telegraph_url"):
+            await set_chapter_status(cid, "ready")
+            return cache["telegraph_url"], True
+
+        # 8. Создаём Telegraph из уже готового translated_text
         html = text_to_html(translated_text)
-        new_url = await create_telegraph_page(title=translated_title_clean, content_html=html)
+        new_url = await create_telegraph_page(
+            title=translated_title_clean,
+            content_html=html
+        )
+
         if new_url:
             await save_telegraph_url(cid, new_url)
-            await save_chapter_cache(cid, {"telegraph_url": new_url})
+            await save_chapter_cache(cid, {
+                "telegraph_url": new_url,
+                "status": "ready",
+                "error": "",
+            })
             await set_chapter_status(cid, "ready")
             return new_url, True
 
@@ -1207,11 +1262,13 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         await set_chapter_status(cid, "failed", "telegraph_failed")
         await save_translation_error(cid, "telegraph_failed")
         return None, False
+
     except Exception as e:
         logger.exception(f"process_chapter_translation error for {cid}: {e}")
         await set_chapter_status(cid, "failed", "unexpected_error")
         await save_translation_error(cid, "unexpected_error")
         raise
+
     finally:
         await release_translation_lock(cid)
 
