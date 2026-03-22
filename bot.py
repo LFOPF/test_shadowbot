@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 import json
+import html
 from typing import Optional, Set, List, Dict, Any
 from urllib.parse import urlparse
 from collections import deque
@@ -41,7 +42,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
-IDLE_TIMEOUT = 1200             # 20 минут
+IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "360"))  # 6 min
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
@@ -68,7 +69,7 @@ RETRY_API = dict(
     reraise=True,
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=1.5, min=4, max=90),
-    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, asyncio.TimeoutError, Exception)),
+    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, asyncio.TimeoutError)),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     after=after_log(logger, logging.INFO),
 )
@@ -89,11 +90,12 @@ bot: Optional[Bot] = None
 playwright_instance: Optional[Playwright] = None
 browser: Optional[Browser] = None
 browser_context: Optional[BrowserContext] = None
-shared_page: Optional[Page] = None
 _last_activity_time = 0.0
 _browser_keepalive_task: Optional[asyncio.Task] = None
 _browser_lock = asyncio.Lock()
 _browser_is_closing = False
+monitor_lock = asyncio.Lock()
+http_session: Optional[aiohttp.ClientSession] = None
 # glossary_dict: Dict[str, str] = {}  трайнем через хэш
 SYSTEM_PROMPT = (
     "Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave. "
@@ -127,10 +129,12 @@ class AdminActions(StatesGroup):
 
 # ======================== БРАУЗЕР + IDLE-ТАЙМЕР ========================
 async def launch_browser():
-    global playwright_instance, browser, browser_context, shared_page
+    global playwright_instance, browser, browser_context
 
-    if browser is not None:
-        return
+    async with _browser_lock:
+        if browser is not None:
+            touch_browser_activity()
+            return
 
     logger.info("Запуск браузера Playwright...")
     try:
@@ -154,21 +158,15 @@ async def launch_browser():
             ignore_https_errors=True,
         )
 
-        shared_page = await browser_context.new_page()
-        await shared_page.set_viewport_size({"width": 1280, "height": 720})
-        await shared_page.set_extra_http_headers({
-            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        })
-        await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
-
-        logger.info("Браузер запущен и страница создана")
+        touch_browser_activity()
+        logger.info("Браузер запущен")
     except Exception as e:
         logger.exception("Критическая ошибка при запуске браузера")
         raise
 
 
 async def close_browser():
-    global browser, browser_context, shared_page, playwright_instance
+    global browser, browser_context, playwright_instance
     global _browser_keepalive_task, _browser_is_closing
 
     async with _browser_lock:
@@ -216,7 +214,6 @@ async def close_browser():
         finally:
             browser = None
             browser_context = None
-            shared_page = None
             playwright_instance = None
             _browser_is_closing = False
 
@@ -271,29 +268,34 @@ def _should_block(route) -> bool:
     return False
 
 
-async def get_shared_page() -> Page:
-    global shared_page
-
+async def create_page() -> Page:
     touch_browser_activity()
 
-    if browser is None:
+    if browser is None or browser_context is None:
         await launch_browser()
-
-    if shared_page is not None and not shared_page.is_closed():
-        return shared_page
 
     if browser_context is None:
         logger.error("browser_context is None после launch_browser — критично!")
         raise RuntimeError("Browser context lost")
 
-    logger.info("Создаём новую общую страницу")
-    shared_page = await browser_context.new_page()
-    await shared_page.set_viewport_size({"width": 1280, "height": 720})
-    await shared_page.set_extra_http_headers({
+    page = await browser_context.new_page()
+    await page.set_viewport_size({"width": 1280, "height": 720})
+    await page.set_extra_http_headers({
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
     })
-    await shared_page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
-    return shared_page
+    await page.route("**/*", lambda route: route.abort() if _should_block(route) else route.continue_())
+    return page
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global http_session
+
+    if http_session is None or http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=130, connect=20, sock_read=120)
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10, ttl_dns_cache=300)
+        http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+    return http_session
 
 
 def extract_chapter_id(text: str) -> Optional[str]:
@@ -362,7 +364,7 @@ async def load_glossary_to_redis(force: bool = False):
         # Сортируем
         sorted_terms = dict(sorted(terms.items(), key=lambda x: len(x[0]), reverse=True))
         
-        await redis_client.hmset(redis_key, sorted_terms)
+        await redis_client.hset(redis_key, mapping=sorted_terms)
         
         logger.info(f"Глоссарий успешно загружен в Redis → {len(sorted_terms)} терминов")
         
@@ -407,7 +409,10 @@ async def get_relevant_glossary(text: str) -> str:
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
-    return ''.join(f"<p>{p.replace('\n', '<br>')}</p>" for p in paragraphs if p.strip())
+    return ''.join(
+        f"<p>{html.escape(p).replace('\n', '<br>')}</p>"
+        for p in paragraphs if p.strip()
+    )
 
 
 def get_page_url(page_num: int) -> str:
@@ -477,10 +482,8 @@ async def save_cached_title(chapter_id: str, title: str):
 
 async def load_subscribers() -> Set[int]:
     try:
-        data = await redis_client.get("subscribers")
-        if data:
-            return set(json.loads(data.decode()))
-        return set()
+        values = await redis_client.smembers("subscribers")
+        return {int(v.decode() if isinstance(v, bytes) else v) for v in values}
     except Exception as e:
         logger.error(f"load_subscribers error: {e}")
         return set()
@@ -488,9 +491,20 @@ async def load_subscribers() -> Set[int]:
 
 async def save_subscribers(subs: Set[int]):
     try:
-        await redis_client.set("subscribers", json.dumps(list(subs)))
+        pipe = redis_client.pipeline()
+        pipe.delete("subscribers")
+        if subs:
+            pipe.sadd("subscribers", *[str(uid) for uid in subs])
+        await pipe.execute()
     except Exception as e:
         logger.error(f"save_subscribers error: {e}")
+
+
+async def add_subscriber(user_id: int) -> None:
+    try:
+        await redis_client.sadd("subscribers", str(user_id))
+    except Exception as e:
+        logger.error(f"add_subscriber error: {e}")
 
 
 async def get_last_chapter() -> Optional[str]:
@@ -561,13 +575,15 @@ async def unblock_user(user_id: int):
 
 
 async def remove_subscriber(user_id: int) -> bool:
-    subs = await load_subscribers()
-    if user_id in subs:
-        subs.remove(user_id)
-        await save_subscribers(subs)
-        logger.info(f"Пользователь {user_id} удалён из подписчиков")
-        return True
-    return False
+    try:
+        removed = await redis_client.srem("subscribers", str(user_id))
+        if removed:
+            logger.info(f"Пользователь {user_id} удалён из подписчиков")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"remove_subscriber error: {e}")
+        return False
 
 
 async def get_user_bookmark(user_id: int) -> Optional[str]:
@@ -588,25 +604,26 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 @retry(**RETRY_WEB)
 async def fetch_html(url: str) -> str:
-    page = await get_shared_page()
+    page = await create_page()
     try:
-        await page.goto(url, wait_until="networkidle", timeout=90000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
         try:
             await page.wait_for_selector('a:has-text("Chapter")', timeout=40000)
         except PlaywrightError:
             logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1500)
         return await page.content()
     except Exception as e:
         logger.error(f"Ошибка в fetch_html на {url}: {e}")
+        raise
+    finally:
         if not page.is_closed():
             await page.close()
-        raise
 
 
 @retry(**RETRY_WEB)
 async def fetch_chapter_text(url: str) -> str:
-    page = await get_shared_page()
+    page = await create_page()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_selector('div.text#arrticle', timeout=60000)
@@ -626,9 +643,10 @@ async def fetch_chapter_text(url: str) -> str:
         return content.strip() if content else "[Текст не найден]"
     except Exception as e:
         logger.error(f"Ошибка в fetch_chapter_text на {url}: {e}")
+        raise
+    finally:
         if not page.is_closed():
             await page.close()
-        raise
 
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
@@ -710,29 +728,6 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
     return None
 
 
-SYSTEM_PROMPT = (
-    "Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave. "
-    "Ты переводишь на уровне лучших русскоязычных команд (RanobeLib, Rulate, BookWire). "
-    "Твоя задача — сделать текст живым, атмосферным, кинематографичным и естественным, как будто это оригинальная русская книга.\n\n"
-    "Обязательно соблюдай:\n"
-    "• Живой литературный русский: варьируй длину предложений, используй динамичный ритм, создавай напряжение.\n"
-    "• Сохраняй чёрный юмор, иронию и внутренние мысли Санни.\n"
-    "• Идеальные склонения, род, падежи и местоимения.\n"
-    "• Точные имена: Sunny = Санни, Nephis = Нефис (никогда Неф!), Azarax = Азаракс, Killer = Убийца, Shadow Legion = Теневой Легион.\n\n"
-    "СТРОГИЙ ЗАПРЕТ (нарушение = ошибка):\n"
-    "• НИКОГДА не добавляй ватермарки, обфускации, символы, названия сайтов или ботов (особенно ŔãŊօΒЁS, ranobes, Shadow Slave Bot, даты и т.п.).\n"
-    "• Выводи ТОЛЬКО чистый текст перевода главы. Никаких заголовков, дат, подписей, примечаний и лишних строк."
-    "• Очень важно соблюдать склонения, местоимения и падежи"
-    "• НЕ ДОЛЖНО БЫТЬ ТАКОГО И ПОДОБНОГО ЭТОМУ: он держал чашку кофе - не дешевЫЙ синтетическИЙ пойлО"
-)
-
-USER_PROMPT_TEMPLATE = (
-    "Переведи следующий текст главы на русский язык максимально качественно и литературно. "
-    "Сделай перевод живым, атмосферным и естественным. Сохрани характер Санни, его внутренний сарказм и мысли. "
-    "Используй динамичные предложения и правильный ритм русского языка.\n\n"
-    "Текст для перевода:\n\n{text}"
-)
-
 
 @retry(**RETRY_API)
 async def translate_text(text: str) -> str:
@@ -740,7 +735,7 @@ async def translate_text(text: str) -> str:
         logger.warning("Текст слишком длинный, обрезаем")
         text = text[:120000] + "\n... [обрезано]"
 
-    glossary_section = get_relevant_glossary(text)
+    glossary_section = await get_relevant_glossary(text)
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -766,12 +761,11 @@ async def translate_text(text: str) -> str:
         "frequency_penalty": 0.08
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
+    session = await get_http_session()
+    async with session.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=130
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -829,8 +823,9 @@ async def create_telegraph_page(
 
     for attempt in range(2):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post("https://api.telegra.ph/createPage", json=payload, timeout=30) as resp:
+            session = await get_http_session()
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+            async with session.post("https://api.telegra.ph/createPage", json=payload, timeout=timeout) as resp:
                     data = await resp.json()
                     if data.get("ok"):
                         url = data["result"]["url"]
@@ -873,8 +868,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         return None, False
 
     translated = await translate_text(text)
-    translated_title = await translate_text(title)
-    translated_title_clean = clean_title_for_telegraph(translated_title)
+    translated_title_clean = clean_title_for_telegraph(title)
 
     await save_cached_title(cid, translated_title_clean)
 
@@ -981,8 +975,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
     subs = await load_subscribers()
     if uid not in subs:
-        subs.add(uid)
-        await save_subscribers(subs)
+        await add_subscriber(uid)
         await message.answer(
             "✅ Подписка оформлена!\n\nИспользуйте кнопки меню для навигации.",
             reply_markup=await get_main_menu(uid)
@@ -1015,8 +1008,7 @@ async def button_subscribe(message: types.Message, state: FSMContext):
     if uid in subs:
         await message.answer("Вы уже подписаны.", reply_markup=await get_main_menu(uid))
     else:
-        subs.add(uid)
-        await save_subscribers(subs)
+        await add_subscriber(uid)
         await message.answer("✅ Вы подписались!", reply_markup=await get_main_menu(uid))
 
 
@@ -1028,8 +1020,7 @@ async def button_unsubscribe(message: types.Message, state: FSMContext):
         return
     subs = await load_subscribers()
     if uid in subs:
-        subs.remove(uid)
-        await save_subscribers(subs)
+        await remove_subscriber(uid)
         await message.answer("❌ Вы отписались.", reply_markup=await get_main_menu(uid))
     else:
         await message.answer("Вы не были подписаны.", reply_markup=await get_main_menu(uid))
@@ -1355,58 +1346,66 @@ async def force_monitor_run(msg: types.Message):
 async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
-        touch_browser_activity()
         try:
-            html = await fetch_html(TARGET_URL)
-            chapters = parse_chapters(html)
-            last_str = await get_last_chapter()
-            last_int = int(last_str) if last_str and last_str.isdigit() else 0
+            async with monitor_lock:
+                html = await fetch_html(TARGET_URL)
+                chapters = parse_chapters(html)
+                last_str = await get_last_chapter()
+                last_int = int(last_str) if last_str and last_str.isdigit() else 0
 
-            new_chapters = [ch for ch in reversed(chapters) if int(ch['id']) > last_int]
+                new_chapters = [ch for ch in reversed(chapters) if int(ch['id']) > last_int]
 
-            if new_chapters:
-                logger.info(f"Новых глав: {len(new_chapters)}")
-                translated_urls = []
-                failed = []
+                if new_chapters:
+                    logger.info(f"Новых глав: {len(new_chapters)}")
+                    translated_urls = []
+                    failed = []
+                    last_successful_id = last_int
+                    stop_on_first_failure = False
 
-                for i, ch in enumerate(new_chapters):
-                    try:
-                        url, success = await process_chapter_translation(ch)
-                        if success and url:
-                            translated_urls.append((ch['id'], url))
-                        else:
+                    for i, ch in enumerate(new_chapters):
+                        if stop_on_first_failure:
                             failed.append(ch['id'])
-                    except Exception as e:
-                        logger.exception(f"Ошибка главы {ch['id']}")
-                        failed.append(ch['id'])
-                    if i < len(new_chapters) - 1:
-                        await asyncio.sleep(10)
+                            continue
+                        try:
+                            url, success = await process_chapter_translation(ch)
+                            if success and url:
+                                translated_urls.append((ch['id'], url))
+                                last_successful_id = int(ch['id'])
+                            else:
+                                failed.append(ch['id'])
+                                stop_on_first_failure = True
+                        except Exception:
+                            logger.exception(f"Ошибка главы {ch['id']}")
+                            failed.append(ch['id'])
+                            stop_on_first_failure = True
+                        if i < len(new_chapters) - 1 and not stop_on_first_failure:
+                            await asyncio.sleep(10)
 
-                if ADMIN_ID:
-                    admin_id = int(ADMIN_ID)
-                    if translated_urls:
-                        await bot.send_message(
-                            admin_id,
-                            "✅ Переведены новые главы:\n" + "\n".join(f"• {cid}: {url}" for cid, url in translated_urls),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True
+                    if ADMIN_ID:
+                        admin_id = int(ADMIN_ID)
+                        if translated_urls:
+                            await bot.send_message(
+                                admin_id,
+                                "✅ Переведены новые главы:\n" + "\n".join(f"• {cid}: {url}" for cid, url in translated_urls),
+                                parse_mode="HTML",
+                                disable_web_page_preview=True
+                            )
+                        if failed:
+                            await bot.send_message(admin_id, f"❌ Не удалось: {', '.join(map(str, failed))}")
+
+                    if last_successful_id > last_int:
+                            await save_last_chapter(str(last_successful_id))
+
+                    for cid, url in translated_urls:
+                        chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
+                        notify_text = (
+                            f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}"
+                            if chapter_info else f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}"
                         )
-                    if failed:
-                        await bot.send_message(admin_id, f"❌ Не удалось: {', '.join(map(str, failed))}")
+                        await notify_all_subscribers(notify_text, parse_mode="HTML")
 
-                max_id = max(int(ch['id']) for ch in new_chapters)
-                await save_last_chapter(str(max_id))
-
-                for cid, url in translated_urls:
-                    chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
-                    notify_text = (
-                        f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}"
-                        if chapter_info else f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}"
-                    )
-                    await notify_all_subscribers(notify_text, parse_mode="HTML")
-
-            else:
-                logger.info("Новых глав нет")
+                else:
+                    logger.info("Новых глав нет")
 
         except Exception as e:
             logger.exception(f"Критическая ошибка мониторинга: {e}")
@@ -1418,8 +1417,7 @@ async def monitor(check_once=False):
 
 
 async def on_startup():
-    global _last_activity_time
-    logger.info("Бот запущен. Запускаем браузер, глоссарий и мониторинг...")
+    logger.info("Бот запущен. Загружаем глоссарий и запускаем мониторинг...")
    
     try:
         await load_glossary_to_redis(force=False)
@@ -1428,21 +1426,17 @@ async def on_startup():
     except Exception as e:
         logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
     
-    try:
-        await launch_browser()
-    except Exception as e:
-        logger.exception("Ошибка запуска браузера при старте")
-        
-    _last_activity_time = asyncio.get_event_loop().time()
     asyncio.create_task(monitor())
-    asyncio.create_task(keep_browser_alive())
-    
-    logger.info("Мониторинг и idle-таймер запущены")
+    logger.info("Мониторинг запущен; браузер будет стартовать лениво по запросу")
 
 
 async def on_shutdown():
+    global http_session
     logger.info("Выключение...")
     await close_browser()
+    if http_session and not http_session.closed:
+        await http_session.close()
+        http_session = None
     if redis_client:
         await redis_client.aclose()
 
@@ -1488,4 +1482,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
