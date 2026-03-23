@@ -1,148 +1,188 @@
 # ShadowBot
 
-Асинхронный Telegram-бот для автоматического перевода веб-новелл с упором на снижение стоимости перевода, повторное использование уже обработанных данных и стабильную работу в многопользовательской среде.
+ShadowBot — Telegram-бот для запроса и перевода глав Shadow Slave с тремя отдельными процессами: `bot-api`, `worker` и `scheduler`. Процессы координируются через Redis, тяжелый парсинг выполняется Playwright, перевод — через OpenRouter, публикация — в Telegraph.
 
-## Что делает бот
+## Что было сломано
 
-- парсит главы с сайта через Playwright, включая страницы с JavaScript;
-- переводит главы через LLM-провайдер OpenRouter;
-- применяет глоссарий терминов для консистентности имен и ключевых понятий;
-- публикует итоговый перевод в Telegraph в формате удобных для чтения статей;
-- отслеживает появление новых глав;
-- поддерживает пользовательские подписки и закладки;
-- минимизирует повторные расходы на перевод за счёт Redis-кэша и блокировок на уровне главы.
+До рефакторинга почти вся логика жила в одном `bot.py`, а `bot_api.py`, `worker.py`, `scheduler.py` были только thin wrapper'ами над монолитом. Это приводило к проблемам:
 
-## Архитектура
+- роли физически не были разделены;
+- использовались глобальные singleton-переменные для Redis, Bot, Playwright и HTTP-сессии;
+- любой процесс мог инициализировать лишние зависимости;
+- lifecycle браузера и сетевых клиентов было трудно предсказать и корректно завершать;
+- отладка очередей, кэша, lock'ов и waiters была сложной.
 
-Проект разделён на три независимых процесса, которые координируются через Redis-очереди и общие статусы глав.
+## Что теперь реализовано
 
-### Основные компоненты
+Новая структура:
 
-- **bot-api / aiogram** — только Telegram UX: команды, кнопки, FSM, выдача уже готовых ссылок и постановка пользовательских запросов в очередь.
-- **worker** — только тяжёлый pipeline: поиск главы, парсинг через Playwright, перевод через OpenRouter, публикация в Telegraph и обновление статусов главы в Redis.
-- **scheduler / notifier** — только фон: периодический `monitor()`, постановка задач в очередь и массовые/адресные Telegram-уведомления.
-- **Redis** — слой координации: метаданные глав, статусы обработки, переводы, подписки, закладки, блокировки и очереди задач.
-- **Playwright** — загрузка и парсинг глав с поддержкой JavaScript.
-- **OpenRouter / LLM** — перевод текста главы на русский язык.
-- **Telegraph** — публикация готового перевода для удобного чтения вне Telegram.
+```text
+app/
+  bot/app.py                # aiogram handlers и UX
+  config.py                 # env + валидация ролей
+  core/lifecycle.py         # bootstrap / shutdown
+  core/state.py             # DI-container
+  queues/jobs.py            # Redis queues + dedupe helpers
+  repositories/redis_repo.py# Redis state, cache, waiters, locks
+  services/chapter_flow.py  # выдача главы пользователю и постановка в очередь
+  services/http.py          # shared aiohttp lifecycle
+  services/monitor.py       # scheduler monitoring
+  services/notifications.py # notifier loop
+  services/parser.py        # Playwright lifecycle + parsing
+  services/telegraph.py     # Telegraph publishing
+  services/translation.py   # OpenRouter + glossary
+  services/worker_pipeline.py # heavy chapter pipeline
+```
 
-### Поток обработки главы
+Архитектура по ролям:
 
-1. Пользователь запрашивает главу в `bot-api`.
-2. `bot-api` проверяет Redis: если ссылка уже готова, она сразу возвращается пользователю.
-3. Если главы ещё нет, `bot-api` быстро ставит задачу в очередь и отвечает, что глава обрабатывается.
-4. `worker` читает очередь, при необходимости находит главу на сайте, парсит исходный текст, переводит его и публикует результат в Telegraph.
-5. `worker` обновляет статусы и кэш в Redis, а также ставит уведомление в очередь notifier.
-6. `scheduler/notifier` отправляет адресное сообщение пользователю о готовности главы или массовую рассылку подписчикам о новых главах.
-7. Повторные запросы к той же главе получают готовый URL из Redis без повторного heavy-пайплайна.
+- `python bot_api.py` — только Telegram polling, FSM, подписки, закладки, постановка задач в очередь и выдача готовых ссылок.
+- `python worker.py` — только heavy pipeline: поиск главы, Playwright, перевод, Telegraph, обновление кэша, lock'ов и статусов.
+- `python scheduler.py` — только scheduler/notifier: мониторинг новых глав и доставка уведомлений.
 
-## Почему Redis — центральный элемент
+## Основной flow
 
-Redis используется не только как кэш, но и как слой координации:
+1. Пользователь запрашивает главу в Telegram.
+2. `bot-api` проверяет кэш Telegraph URL и chapter status в Redis.
+3. Если перевода нет, бот ставит job в Redis queue и сохраняет waiters.
+4. `worker` берет job, ищет главу, берет chapter-level lock, повторно использует original/translated cache при наличии.
+5. `worker` переводит текст через OpenRouter, публикует в Telegraph, сохраняет `telegraph_url`, status, error и translation signature.
+6. `scheduler` отправляет адресное уведомление ожидающим пользователям или broadcast подписчикам.
 
-- хранит статусы глав (`в обработке`, `готово`, `ошибка`);
-- позволяет избежать повторного перевода одной и той же главы;
-- ускоряет повторные выдачи переведённых глав;
-- используется для короткоживущих блокировок, которые защищают от дублирующей работы;
-- помогает переживать кратковременные пики нагрузки при одновременных запросах.
+## Redis-координация, которая сохранена
 
-Такой подход особенно важен для LLM-пайплайна, где лишние запросы напрямую увеличивают стоимость работы сервиса.
+Сохранены и приведены в рабочее состояние:
 
-## Защита от дублирующей работы
-
-Ключевая оптимизация проекта — блокировка на уровне главы.
-
-Если несколько пользователей одновременно запрашивают одну и ту же главу:
-
-- первый запрос получает право на обработку;
-- остальные не запускают новый парсинг и не создают дополнительные запросы в OpenRouter;
-- ожидающие запросы получают результат после завершения единственного перевода.
-
-Это снижает расход токенов, экономит ресурсы Playwright и повышает предсказуемость поведения бота под нагрузкой.
-
-## Надёжность и устойчивость
-
-В проекте предусмотрены:
-
-- повторные попытки для сетевых запросов и внешних API;
-- обработка ошибок браузера и Telegram API;
-- ограничение параллелизма для Playwright;
-- освобождение ресурсов браузера при простое;
-- кэширование глоссария;
-- буфер логов для диагностики.
-
-## Технологии
-
-- Python 3.12
-- aiogram 3
-- Redis
-- Playwright
-- aiohttp
-- BeautifulSoup
-- tenacity
-- Telegraph API
-- OpenRouter API
+- chapter status cache;
+- original text cache;
+- translated text cache;
+- Telegraph URL cache;
+- translation signature invalidation;
+- waiters для нескольких пользователей на одну главу;
+- dedupe ключи очередей;
+- chapter translation lock;
+- subscribers, blocked users, bookmarks, monitor state.
 
 ## Переменные окружения
 
-Обязательные переменные:
+### Обязательные для `bot-api`
 
 - `BOT_TOKEN`
+- `REDIS_URL`
+
+### Обязательные для `worker`
+
 - `OPENROUTER_API_KEY`
 - `TELEGRAPH_ACCESS_TOKEN`
 - `REDIS_URL`
 
-Дополнительные переменные:
+### Обязательные для `scheduler`
+
+- `BOT_TOKEN`
+- `REDIS_URL`
+
+### Полезные дополнительные
 
 - `ADMIN_ID`
+- `TARGET_URL`
+- `NOVEL_ID`
+- `CHECK_INTERVAL`
 - `BROWSER_IDLE_TIMEOUT`
 - `PLAYWRIGHT_CONCURRENCY`
 - `GLOSSARY_CACHE_TTL`
+- `TRANSLATION_CACHE_VERSION`
+- `JOB_DEDUP_TTL`
+- `BOT_READY_WAIT_TIMEOUT`
+- `OPENROUTER_MODEL`
 
-## Локальный запуск
+Скопируйте шаблон:
+
+```bash
+cp .env.example .env
+```
+
+## Локальный запуск без Docker
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium-headless-shell
+```
 
-# Telegram API / FSM
+Запустите Redis любым удобным способом, например:
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine
+```
+
+После настройки `.env` поднимайте роли в отдельных терминалах:
+
+```bash
 python bot_api.py
-
-# Heavy worker
 python worker.py
-
-# Monitor + notifier
 python scheduler.py
 ```
 
-## Docker
+## Локальный запуск через Docker Compose
 
-В репозитории есть `Dockerfile`, рассчитанный на запуск в контейнерной среде вроде Railway.
+```bash
+cp .env.example .env
+# заполните .env своими токенами
 
-Сборка и запуск локально:
+docker compose up --build
+```
+
+Compose поднимает:
+
+- `redis`
+- `bot-api`
+- `worker`
+- `scheduler`
+
+## Docker / один образ для трех ролей
+
+Один и тот же образ используется для всех ролей. Роль определяется через `SHADOWBOT_ROLE`.
+
+Примеры:
 
 ```bash
 docker build -t shadowbot .
-docker run --env-file .env shadowbot
+
+docker run --rm --env-file .env -e SHADOWBOT_ROLE=bot-api shadowbot
+
+docker run --rm --env-file .env -e SHADOWBOT_ROLE=worker shadowbot
+
+docker run --rm --env-file .env -e SHADOWBOT_ROLE=scheduler shadowbot
 ```
 
-## Развёртывание на Railway
+## Типовые сценарии и поведение
 
-Для Railway или другого PaaS проект теперь лучше разворачивать тремя сервисами от одного образа:
+### Повторный запрос той же главы
 
-1. `bot-api` c `SHADOWBOT_ROLE=bot-api`;
-2. `worker` c `SHADOWBOT_ROLE=worker`;
-3. `scheduler` c `SHADOWBOT_ROLE=scheduler`;
-4. всем сервисам нужен общий Redis;
-5. `worker` и `scheduler` должны иметь доступ к целевому сайту, а `worker` — ещё и к OpenRouter/Telegraph.
+Если глава уже переведена, `bot-api` мгновенно вернет URL из Redis без повторного pipeline.
 
-## Фокус проекта
+### Одновременные запросы одной главы
 
-Главная цель проекта — **снижать стоимость и задержки перевода**, не жертвуя качеством и стабильностью. Для этого архитектура делает ставку на:
+- первый запрос ставит job и инициирует перевод;
+- остальные пользователи попадают в waiters;
+- worker не запускает второй expensive перевод для той же главы, пока активен lock;
+- после завершения notifier рассылает один и тот же результат всем ожидающим.
 
-- повторное использование результатов;
-- минимизацию числа LLM-запросов;
-- координацию конкурентных запросов через Redis;
-- асинхронную обработку и бережное использование браузерных ресурсов.
+### Новые главы
+
+`scheduler` периодически мониторит `TARGET_URL`, кладет новые главы в очередь и рассылает уведомления подписчикам после готовности перевода.
+
+## Типовые ошибки
+
+- `Для роли ... не заданы обязательные переменные` — не заполнены env для конкретной роли.
+- `OpenRouter HTTP ...` — проверьте `OPENROUTER_API_KEY`, лимиты и сеть.
+- `Telegraph error` — проверьте `TELEGRAPH_ACCESS_TOKEN`.
+- ошибки Playwright — убедитесь, что выполнен `playwright install chromium-headless-shell` или используйте Docker image из репозитория.
+- если бот не выдает главы, проверьте что одновременно работают `worker` и `scheduler`, а не только `bot-api`.
+
+## Компромиссы рефакторинга
+
+- транспорт очередей оставлен на Redis Lists, но вынесен в отдельный queue layer с dedupe-ключами;
+- сохранена бизнес-логика исходного проекта, но без общих глобальных объектов;
+- `bot.py` оставлен как compatibility entrypoint для старого сценария запуска через `SHADOWBOT_ROLE`, однако реальный рекомендуемый запуск — через `bot_api.py`, `worker.py`, `scheduler.py`.
