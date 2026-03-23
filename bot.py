@@ -1126,8 +1126,8 @@ async def translate_text(text: str) -> str:
             {"role": "user", "content": first_pass_user_prompt},
         ],
         stage_name="first_pass_translation",
-        temperature=0.9,
-        top_p=0.92,
+        temperature=0.8,
+        top_p=0.95,
         presence_penalty=0.15,
         frequency_penalty=0.08,
     )
@@ -1159,7 +1159,7 @@ async def translate_text(text: str) -> str:
                 {"role": "user", "content": second_pass_user_prompt},
             ],
             stage_name="second_pass_editing",
-            temperature=0.55,
+            temperature=0.75,
             top_p=0.9,
             presence_penalty=0.05,
             frequency_penalty=0.03,
@@ -1267,7 +1267,7 @@ async def translate_title(title: str) -> str:
             },
             {"role": "user", "content": source_title}
         ],
-        "temperature": 0.2,
+        "temperature": 0.4,
         "top_p": 0.9,
         "max_tokens": 120,
     }
