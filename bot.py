@@ -1346,13 +1346,16 @@ async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_mark
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
+async def is_user_subscribed(user_id: int) -> bool:
     subs = await load_subscribers()
-    is_subscribed = user_id in subs
+    return user_id in subs
+
+
+async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     is_admin = ADMIN_ID is not None and str(user_id) == ADMIN_ID
 
     buttons = [
-        [KeyboardButton(text="📌 Моя закладка"), KeyboardButton(text="📖 Выбор главы")],
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📖 Выбор главы")],
         [KeyboardButton(text="⬅️ Предыдущая глава"), KeyboardButton(text="➡️ Следующая глава")],
         [KeyboardButton(text="🤝 Поддержать")],
     ]
@@ -1361,16 +1364,42 @@ async def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         row3.insert(0, KeyboardButton(text="📊 Статус"))
     buttons.append(row3)
 
-    if is_subscribed:
-        buttons.append([KeyboardButton(text="❌ Отписаться")])
-    else:
-        buttons.append([KeyboardButton(text="✅ Подписаться")])
-
     return ReplyKeyboardMarkup(
         keyboard=buttons,
         resize_keyboard=True,
         input_field_placeholder="Выберите действие..."
     )
+
+
+async def get_profile_menu(user_id: int) -> ReplyKeyboardMarkup:
+    is_subscribed = await is_user_subscribed(user_id)
+    subscribe_button = "❌ Отписаться от рассылки" if is_subscribed else "✅ Подписаться на рассылку"
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📌 Моя закладка")],
+            [KeyboardButton(text=subscribe_button)],
+            [KeyboardButton(text="⬅️ Назад")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие..."
+    )
+
+
+async def ensure_subscription(message: types.Message) -> bool:
+    uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("Вы заблокированы.")
+        return False
+    if await is_user_subscribed(uid):
+        return True
+
+    await message.answer(
+        "🔒 Этот раздел доступен только подписчикам бота.\n\n"
+        "Нажмите «✅ Подписаться на рассылку» в профиле, чтобы открыть доступ к главам и навигации.",
+        reply_markup=await get_main_menu(uid)
+    )
+    return False
 
 
 cancel_keyboard = ReplyKeyboardMarkup(
@@ -1406,15 +1435,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы. Обратитесь к администратору.")
         return
-    subs = await load_subscribers()
-    if uid not in subs:
-        await add_subscriber(uid)
-        await message.answer(
-            "✅ Подписка оформлена!\n\nИспользуйте кнопки меню для навигации.",
-            reply_markup=await get_main_menu(uid)
-        )
-    else:
-        await message.answer("Вы уже подписаны!", reply_markup=await get_main_menu(uid))
+    if await is_user_subscribed(uid):
+        await message.answer("С возвращением! Используйте кнопки меню для навигации.", reply_markup=await get_main_menu(uid))
+        return
+    await message.answer(
+        "👋 Добро пожаловать!\n\n"
+        "Чтобы пользоваться главами, навигацией и получать новые главы, сначала подпишитесь через кнопку «👤 Мой профиль».",
+        reply_markup=await get_main_menu(uid)
+    )
 
 
 async def button_support(message: types.Message, state: FSMContext):
@@ -1431,32 +1459,45 @@ async def button_support(message: types.Message, state: FSMContext):
     )
 
 
-async def button_subscribe(message: types.Message, state: FSMContext):
+async def button_profile(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
         return
-    subs = await load_subscribers()
-    if uid in subs:
-        await message.answer("Вы уже подписаны.", reply_markup=await get_main_menu(uid))
+    await message.answer("👤 Профиль", reply_markup=await get_profile_menu(uid))
+
+
+async def button_profile_subscribe(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    if await is_user_blocked(uid):
+        await message.answer("Вы заблокированы.")
+        return
+    if await is_user_subscribed(uid):
+        await message.answer("Вы уже подписаны на рассылку.", reply_markup=await get_profile_menu(uid))
     else:
         await add_subscriber(uid)
-        await message.answer("✅ Вы подписались!", reply_markup=await get_main_menu(uid))
+        await message.answer("✅ Вы подписались на рассылку и получили доступ к функциям бота.", reply_markup=await get_profile_menu(uid))
 
 
-async def button_unsubscribe(message: types.Message, state: FSMContext):
+async def button_profile_unsubscribe(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
         return
-    subs = await load_subscribers()
-    if uid in subs:
+    if await is_user_subscribed(uid):
         await remove_subscriber(uid)
-        await message.answer("❌ Вы отписались.", reply_markup=await get_main_menu(uid))
+        await message.answer("❌ Вы отписались от рассылки.", reply_markup=await get_profile_menu(uid))
     else:
-        await message.answer("Вы не были подписаны.", reply_markup=await get_main_menu(uid))
+        await message.answer("Вы не были подписаны на рассылку.", reply_markup=await get_profile_menu(uid))
+
+
+async def button_back_to_main(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    await message.answer("↩️ Возвращаю в главное меню.", reply_markup=await get_main_menu(uid))
 
 
 async def button_status(message: types.Message, state: FSMContext):
@@ -1600,8 +1641,7 @@ async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
 
 
 async def button_choose_chapter(message: types.Message, state: FSMContext):
-    if await is_user_blocked(message.from_user.id):
-        await message.answer("Вы заблокированы.")
+    if not await ensure_subscription(message):
         return
     await state.clear()
     await state.set_state(ChapterSelection.waiting_for_chapter)
@@ -1614,6 +1654,8 @@ async def button_choose_chapter(message: types.Message, state: FSMContext):
 
 async def button_bookmark(message: types.Message, state: FSMContext):
     await state.clear()
+    if not await ensure_subscription(message):
+        return
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
@@ -1624,6 +1666,8 @@ async def button_bookmark(message: types.Message, state: FSMContext):
 
 async def button_prev(message: types.Message, state: FSMContext):
     await state.clear()
+    if not await ensure_subscription(message):
+        return
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
@@ -1633,24 +1677,35 @@ async def button_prev(message: types.Message, state: FSMContext):
     if prev_num < 1:
         await message.answer("Это первая глава.", reply_markup=await get_main_menu(uid))
         return
-    await send_chapter_to_user(uid, prev_num, initial_message=message)
+    status_msg = await message.answer(f"🔍 Обработка главы {prev_num}...")
+    await send_chapter_to_user(uid, prev_num, status_msg=status_msg)
 
 
 async def button_next(message: types.Message, state: FSMContext):
     await state.clear()
+    if not await ensure_subscription(message):
+        return
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
         await message.answer("Нет закладки.", reply_markup=await get_main_menu(uid))
         return
     next_num = int(bookmark) + 1
-    await send_chapter_to_user(uid, next_num, initial_message=message)
+    status_msg = await message.answer(f"🔍 Обработка главы {next_num}...")
+    await send_chapter_to_user(uid, next_num, status_msg=status_msg)
 
 
 async def process_chapter_number(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if await is_user_blocked(uid):
         await message.answer("Вы заблокированы.")
+        await state.clear()
+        return
+    if not await is_user_subscribed(uid):
+        await message.answer(
+            "🔒 Выбор главы доступен только подписчикам бота.",
+            reply_markup=await get_main_menu(uid)
+        )
         await state.clear()
         return
 
@@ -1675,10 +1730,11 @@ async def button_help(message: types.Message, state: FSMContext):
     is_admin = ADMIN_ID is not None and str(uid) == ADMIN_ID
     help_text = (
         "🤖 Доступные команды:\n"
-        "📌 Моя закладка — текущая глава\n"
-        "📖 Выбор главы — ввести номер\n"
-        "⬅️ / ➡️ — предыдущая / следующая\n"
-        "✅ / ❌ — подписка / отписка\n"
+        "👤 Мой профиль — меню профиля\n"
+        "📌 Моя закладка — открыть сохранённую главу\n"
+        "📖 Выбор главы — ввести номер главы\n"
+        "⬅️ / ➡️ — предыдущая / следующая глава\n"
+        "✅ / ❌ — подписка или отписка от рассылки в профиле\n"
         "🤝 Поддержать — Boosty\n"
         "❓ Помощь — это сообщение"
     )
@@ -1915,6 +1971,7 @@ async def main():
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
     dp.message.register(process_admin_user_id, AdminActions.waiting_for_user_id)
 
+    dp.message.register(button_profile, lambda m: m.text == "👤 Мой профиль")
     dp.message.register(button_choose_chapter, lambda m: m.text == "📖 Выбор главы")
     dp.message.register(button_bookmark, lambda m: m.text == "📌 Моя закладка")
     dp.message.register(button_prev, lambda m: m.text == "⬅️ Предыдущая глава")
@@ -1922,8 +1979,9 @@ async def main():
     dp.message.register(button_support, lambda m: m.text == "🤝 Поддержать")
     dp.message.register(button_status, lambda m: m.text == "📊 Статус")
     dp.message.register(button_help, lambda m: m.text == "❓ Помощь")
-    dp.message.register(button_subscribe, lambda m: m.text == "✅ Подписаться")
-    dp.message.register(button_unsubscribe, lambda m: m.text == "❌ Отписаться")
+    dp.message.register(button_profile_subscribe, lambda m: m.text == "✅ Подписаться на рассылку")
+    dp.message.register(button_profile_unsubscribe, lambda m: m.text == "❌ Отписаться от рассылки")
+    dp.message.register(button_back_to_main, lambda m: m.text == "⬅️ Назад")
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(handle_other_text)
 
