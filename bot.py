@@ -439,7 +439,7 @@ async def get_relevant_glossary(text: str) -> str:
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
     return ''.join(
-        f"<p>{html.escape(p).replace('\n', '<br>')}</p>"
+        "<p>" + html.escape(p).replace('\n', '<br>') + "</p>"
         for p in paragraphs if p.strip()
     )
 
