@@ -5,6 +5,7 @@ import re
 import json
 import html
 import time
+import hashlib
 from typing import Optional, Set, List, Dict, Any
 from urllib.parse import urlparse
 from collections import deque
@@ -56,6 +57,7 @@ TRANSLATION_WAIT_STEP = 2
 ERROR_TTL = 5 * 60
 PLAYWRIGHT_CONCURRENCY = int(os.getenv("PLAYWRIGHT_CONCURRENCY", "2"))
 GLOSSARY_CACHE_TTL = int(os.getenv("GLOSSARY_CACHE_TTL", "300"))
+TRANSLATION_CACHE_VERSION = os.getenv("TRANSLATION_CACHE_VERSION", "v1")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -522,6 +524,39 @@ async def save_chapter_original_text(chapter_id: str, text: str) -> None:
         await redis_client.set(f"chapter:original:{chapter_id}", text)
     except Exception as e:
         logger.error(f"save_chapter_original_text error for {chapter_id}: {e}")
+
+
+def build_translation_signature(original_text: str) -> str:
+    payload = json.dumps({
+        "cache_version": TRANSLATION_CACHE_VERSION,
+        "system_prompt": SYSTEM_PROMPT,
+        "user_prompt": USER_PROMPT_TEMPLATE,
+        "text_sha256": hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def invalidate_outdated_chapter_cache(chapter_id: str, cache: dict[str, str], translation_signature: str) -> dict[str, str]:
+    cached_signature = cache.get("translation_signature")
+    if not cached_signature or cached_signature == translation_signature:
+        return cache
+
+    logger.info(
+        "Сигнатура перевода для главы %s изменилась, сбрасываем устаревшие перевод и Telegraph",
+        chapter_id,
+    )
+    await redis_client.delete(f"chapter:translated:{chapter_id}")
+    await redis_client.hdel("telegraph_urls", chapter_id)
+    await save_chapter_cache(chapter_id, {
+        "translation_signature": translation_signature,
+        "telegraph_url": "",
+        "translated_title": "",
+        "status": "stale",
+        "error": "",
+    })
+    refreshed_cache = await get_chapter_cache(chapter_id)
+    refreshed_cache["translation_signature"] = translation_signature
+    return refreshed_cache
 
 
 async def get_chapter_translated_text(chapter_id: str) -> Optional[str]:
@@ -1168,13 +1203,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     await save_chapter_meta(ch)
 
-    # 1. Быстрый путь: уже есть готовый Telegraph
-    url = await get_cached_telegraph(cid)
-    if url:
-        logger.info(f"Глава {cid} найдена в telegraph-кэше")
-        return url, True
-
-    # 2. Если кто-то уже переводит эту главу — ждём, а не запускаем второй перевод
+    # 1. Если кто-то уже переводит эту главу — ждём, а не запускаем второй перевод
     if await is_translation_in_progress(cid):
         logger.info(f"Глава {cid} уже переводится другим процессом, ждём результат")
         ready_url = await wait_for_ready_translation(cid)
@@ -1183,7 +1212,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         logger.warning(f"Ожидание перевода главы {cid} завершилось без результата")
         return None, False
 
-    # 3. Пытаемся взять lock
+    # 2. Пытаемся взять lock
     lock_acquired = await acquire_translation_lock(cid)
     if not lock_acquired:
         logger.info(f"Не удалось взять lock для главы {cid}, ждём готовый результат")
@@ -1215,6 +1244,22 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 return None, False
 
             await save_chapter_original_text(cid, original_text)
+
+        translation_signature = build_translation_signature(original_text)
+        cache = await invalidate_outdated_chapter_cache(cid, cache, translation_signature)
+        await save_chapter_cache(cid, {
+            "translation_signature": translation_signature,
+        })
+
+        url = cache.get("telegraph_url") or await get_cached_telegraph(cid)
+        if url:
+            logger.info(f"Глава {cid} найдена в актуальном telegraph-кэше")
+            await save_chapter_cache(cid, {
+                "telegraph_url": url,
+                "status": "ready",
+                "error": "",
+            })
+            return url, True
 
         # 5. Перевод текста: либо из Redis string, либо переводим
         translated_text = await get_chapter_translated_text(cid)
