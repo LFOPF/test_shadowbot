@@ -115,10 +115,12 @@ class PlaywrightManager:
                 return
             self._closing = True
             try:
-                if self._keepalive_task:
-                    self._keepalive_task.cancel()
-                    await asyncio.gather(self._keepalive_task, return_exceptions=True)
-                    self._keepalive_task = None
+                keepalive_task = self._keepalive_task
+                self._keepalive_task = None
+                current_task = asyncio.current_task()
+                if keepalive_task and keepalive_task is not current_task:
+                    keepalive_task.cancel()
+                    await asyncio.gather(keepalive_task, return_exceptions=True)
                 if self._context:
                     await self._context.close()
                 if self._browser:
