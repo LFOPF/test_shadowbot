@@ -1659,7 +1659,7 @@ async def button_bookmark(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("У вас ещё нет закладки.", reply_markup=await get_main_menu(uid))
+        await message.answer("У вас ещё нет закладки. Пожалуйста, воспользуйтесь выбором главы.", reply_markup=await get_main_menu(uid))
         return
     await send_chapter_to_user(uid, int(bookmark), initial_message=message)
 
@@ -1671,7 +1671,7 @@ async def button_prev(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("Нет закладки.", reply_markup=await get_main_menu(uid))
+        await message.answer("Нет закладки. Пожалуйста, воспользуйтесь выбором главы.", reply_markup=await get_main_menu(uid))
         return
     prev_num = int(bookmark) - 1
     if prev_num < 1:
@@ -1688,7 +1688,7 @@ async def button_next(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     bookmark = await get_user_bookmark(uid)
     if not bookmark:
-        await message.answer("Нет закладки.", reply_markup=await get_main_menu(uid))
+        await message.answer("Нет закладки. Пожалуйста, воспользуйтесь выбором главы.", reply_markup=await get_main_menu(uid))
         return
     next_num = int(bookmark) + 1
     status_msg = await message.answer(f"🔍 Обработка главы {next_num}...")
