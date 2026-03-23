@@ -111,89 +111,28 @@ _glossary_cache: Optional[Dict[str, str]] = None
 _glossary_cache_expires_at = 0.0
 _glossary_cache_lock = asyncio.Lock()
 # glossary_dict: Dict[str, str] = {}  трайнем через хэш
-SYSTEM_PROMPT = (
-"Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave.\n\n"
-"Твоя задача — не просто переводить текст, а ПЕРЕПИСЫВАТЬ его как оригинальное художественное произведение на русском языке.\n\n"
-"Перевод должен звучать так, будто он изначально написан на русском, на уровне лучших русскоязычных переводов ранобэ.\n\n"
-"━━━━━━━━━━━━━━━━━━\n"
-"ОСНОВНЫЕ ПРИНЦИПЫ:\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"• НЕ сохраняй структуру оригинальных предложений.\n"
-"• Свободно перестраивай фразы, объединяй или разбивай предложения.\n"
-"• Делай текст живым, естественным и литературным.\n\n"
-"• Перед написанием:\n"
-"  1. Пойми сцену\n"
-"  2. Представь, как бы русский автор это написал\n"
-"  3. Только потом формулируй текст\n\n"
-"• Используй естественный русский язык:\n"
-"  - вариативный ритм (чередование коротких и длинных предложений)\n"
-"  - выразительные формулировки\n"
-"  - плавные переходы\n\n"
-"━━━━━━━━━━━━━━━━━━\n"
-"АНТИ-КАЛЬКА (КРИТИЧЕСКИ ВАЖНО):\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"ЗАПРЕЩЕНО:\n"
-"• буквальный перенос структуры английского\n"
-"• перегруженные конструкции\n"
-"• фразы вроде:\n"
-"  - \"он был тем, кто...\"\n"
-"  - \"чем он мог надеяться когда-либо понять\"\n"
-"  - \"на самом деле, если бы...\"\n\n"
-"ЕСЛИ ФРАЗА ЗВУЧИТ КАК ПЕРЕВОД — ПЕРЕПИШИ ЕЁ ПОЛНОСТЬЮ.\n\n"
-"ХОРОШО:\n"
-"• простые, точные и естественные формулировки\n"
-"• живой ритм\n"
-"• ощущение оригинального текста\n\n"
-"━━━━━━━━━━━━━━━━━━\n"
-"СТИЛЬ:\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"• Сохраняй атмосферу, напряжение и кинематографичность\n"
-"• Передавай внутренние мысли Санни с сарказмом и характером\n"
-"• Допускается лёгкая адаптация формулировок ради естественности\n\n"
-"━━━━━━━━━━━━━━━━━━\n"
-"ГРАММАТИКА:\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"• Идеальные склонения, род, падежи\n"
-"• Естественные местоимения\n"
-"• Никаких корявых конструкций\n\n"
-"━━━━━━━━━━━━━━━━━━\n"
-"ИМЕНА (СТРОГО):\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"Sunny = Санни\n"
-"Nephis = Нефис\n"
-"Azarax = Азаракс\n"
-"Killer = Убийца\n"
-"Shadow Legion = Теневой Легион\n\n"
-"━━━━━━━━━━━━━━━━━━\n"
-"СТРОГИЕ ЗАПРЕТЫ:\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"• НЕ добавляй ничего от себя (комментарии, пояснения)\n"
-"• НЕ добавляй названия сайтов, ботов, даты, ватермарки и т.д.\n"
-"• НЕ пиши заголовки\n"
-"• НЕ делай пометки\n\n"
-"━━━━━━━━━━━━━━━━━━\n\n"
-"Выводи ТОЛЬКО чистый художественный текст перевода."
-)
+PROMPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt.txt")
+USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt.txt")
+TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
 
-USER_PROMPT_TEMPLATE = (
-    "Переведи следующий текст на русский язык как художественное произведение. "
-    "ВАЖНО: "
-    "- Это не буквальный перевод "
-    "- Это литературная адаптация "
-    "- Текст должен звучать как оригинальный русский роман/новэлла "
-    "Сделай текст: "
-    "• живым"
-    "• естественным"
-    "• динамичным"
-    "• без кальки с английского"
-    "Если предложение звучит неестественно — перепиши его полностью. "
-    "Сохрани: "
-    "• смысл"
-    "• атмосферу"
-    "• характер персонажей (особенно сарказм Санни)"
-    "Текст для перевода: "
-    "{text}"
-)
+
+def load_prompt_file(path: str, fallback: str = "") -> str:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if content:
+                return content
+            logger.warning("Prompt-файл пустой: %s", path)
+    except FileNotFoundError:
+        logger.error("Prompt-файл не найден: %s", path)
+    except Exception:
+        logger.exception("Не удалось загрузить prompt-файл: %s", path)
+    return fallback
+
+
+SYSTEM_PROMPT = load_prompt_file(SYSTEM_PROMPT_PATH)
+USER_PROMPT_TEMPLATE = load_prompt_file(USER_PROMPT_PATH)
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -498,6 +437,82 @@ async def get_relevant_glossary(text: str) -> str:
         + "\n".join(relevant)
         + "\n\nНе придумывай другие варианты перевода для этих слов."
     )
+
+
+def sanitize_model_output(text: str) -> str:
+    if not text:
+        return ""
+
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    cleaned = re.sub(r"^```[\w-]*\n?", "", cleaned)
+    cleaned = re.sub(r"\n?```$", "", cleaned)
+
+    lines = []
+    junk_line_patterns = [
+        r"^\s*(перевод|edited translation|final translation|translation|translated text)\s*:?\s*$",
+        r"^\s*(глава|chapter)\s+\d+\s*$",
+        r"^\s*(готовый перевод|отредактированный перевод|художественный перевод)\s*:?\s*$",
+        r"^\s*(shadow slave translator|openrouter|telegram bot)\s*$",
+        r"^\s*(с уважением|thanks|thank you).*$",
+    ]
+
+    for raw_line in cleaned.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        if any(re.match(pattern, line, flags=re.IGNORECASE) for pattern in junk_line_patterns):
+            continue
+        lines.append(line)
+
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    return cleaned.strip()
+
+
+async def request_translation_completion(
+    *,
+    session: aiohttp.ClientSession,
+    headers: Dict[str, str],
+    messages: List[Dict[str, str]],
+    stage_name: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int = 8192,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+) -> str:
+    payload = {
+        "model": TRANSLATION_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+    }
+
+    async with session.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+    ) as resp:
+        if resp.status == 200:
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"]
+            cleaned = sanitize_model_output(content or "")
+            if not cleaned:
+                raise ValueError(f"{stage_name}: пустой ответ модели")
+            return cleaned
+
+        if resp.status == 429:
+            logger.warning("Rate limit от OpenRouter на этапе %s", stage_name)
+            raise aiohttp.ClientError(f"Rate limit during {stage_name}")
+
+        text_resp = await resp.text()
+        logger.error("OpenRouter %s %s: %s", stage_name, resp.status, text_resp[:500])
+        raise aiohttp.ClientError(f"HTTP {resp.status} during {stage_name}")
 
 def text_to_html(text: str) -> str:
     paragraphs = text.split('\n\n')
@@ -1080,6 +1095,9 @@ async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[st
 
 @retry(**RETRY_API)
 async def translate_text(text: str) -> str:
+    if not SYSTEM_PROMPT or not USER_PROMPT_TEMPLATE:
+        raise RuntimeError("Не удалось загрузить system_prompt.txt или user_prompt.txt")
+
     if len(text) > 120000:
         logger.warning("Текст слишком длинный, обрезаем")
         text = text[:120000] + "\n... [обрезано]"
@@ -1092,42 +1110,66 @@ async def translate_text(text: str) -> str:
         "X-Title": SITE_NAME,
         "Content-Type": "application/json"
     }
-    
-    system_prompt = SYSTEM_PROMPT
-    if glossary_section:
-        system_prompt = glossary_section + "\n\n" + SYSTEM_PROMPT
-
-    payload = {
-        "model": "google/gemini-2.5-flash-lite",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)}
-        ],
-        "temperature": 0.90,
-        "top_p": 0.92,
-        "max_tokens": 8192,
-        "presence_penalty": 0.15,
-        "frequency_penalty": 0.08
-    }
 
     session = await get_http_session()
-    async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return content.strip() if content else "[Ошибка: пустой ответ]"
+    system_prompt = SYSTEM_PROMPT
+    if glossary_section:
+        system_prompt = f"{glossary_section}\n\n{SYSTEM_PROMPT}"
 
-            elif resp.status == 429:
-                logger.warning("Rate limit от OpenRouter")
-                raise aiohttp.ClientError("Rate limit")
-            else:
-                text_resp = await resp.text()
-                logger.error(f"OpenRouter {resp.status}: {text_resp[:500]}")
-                raise aiohttp.ClientError(f"HTTP {resp.status}")
+    first_pass_user_prompt = USER_PROMPT_TEMPLATE.format(text=text, stage="translation", draft="", source_text=text)
+    logger.info("Старт первого прохода перевода: %s символов", len(text))
+    first_pass = await request_translation_completion(
+        session=session,
+        headers=headers,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": first_pass_user_prompt},
+        ],
+        stage_name="first_pass_translation",
+        temperature=0.9,
+        top_p=0.92,
+        presence_penalty=0.15,
+        frequency_penalty=0.08,
+    )
+
+    second_pass_user_prompt = (
+        "Ниже исходный английский фрагмент и его русский черновик.\n\n"
+        "Сделай ТОЛЬКО редактуру русского текста.\n"
+        "Убери кальку, тяжёлые и машинные конструкции, выправь ритм и естественность.\n"
+        "Сохрани смысл, атмосферу, терминологию из глоссария и характер Санни.\n"
+        "Не добавляй комментарии, заголовки, markdown, пояснения или альтернативные версии.\n\n"
+        f"Исходник:\n{text}\n\n"
+        f"Черновой перевод:\n{first_pass}"
+    )
+
+    try:
+        logger.info("Старт второго прохода редактуры: %s символов", len(first_pass))
+        second_pass = await request_translation_completion(
+            session=session,
+            headers=headers,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"{system_prompt}\n\n"
+                        "Ты выступаешь как финальный литературный редактор русского текста. "
+                        "Не пересказывай и не объясняй правки — верни только готовую отредактированную версию."
+                    ),
+                },
+                {"role": "user", "content": second_pass_user_prompt},
+            ],
+            stage_name="second_pass_editing",
+            temperature=0.55,
+            top_p=0.9,
+            presence_penalty=0.05,
+            frequency_penalty=0.03,
+        )
+        return second_pass
+    except Exception:
+        logger.exception("Второй проход перевода не удался, возвращаем результат первого прохода")
+        if first_pass:
+            return first_pass
+        raise
 
 
 @retry(
