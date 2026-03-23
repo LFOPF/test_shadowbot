@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir --upgrade pip \
     && playwright install chromium-headless-shell
 
 COPY glossary.txt .
-COPY *.py .
+COPY app ./app
+COPY bot.py bot_api.py worker.py scheduler.py .
+COPY .env.example README.md docker-compose.yml ./
 
-CMD ["python", "bot.py"]
+ENTRYPOINT ["python", "bot.py"]

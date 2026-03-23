@@ -1,0 +1,32 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  bot-api:
+    build: .
+    env_file: .env
+    environment:
+      SHADOWBOT_ROLE: bot-api
+    depends_on:
+      - redis
+    command: ["python", "bot_api.py"]
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      SHADOWBOT_ROLE: worker
+    depends_on:
+      - redis
+    command: ["python", "worker.py"]
+
+  scheduler:
+    build: .
+    env_file: .env
+    environment:
+      SHADOWBOT_ROLE: scheduler
+    depends_on:
+      - redis
+    command: ["python", "scheduler.py"]
