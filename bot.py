@@ -859,6 +859,25 @@ async def dequeue_json_job(queue_name: str, timeout: int = 5) -> Optional[dict[s
         return None
 
 
+async def add_chapter_waiter(identity: str, user_id: int) -> None:
+    try:
+        await redis_client.sadd(f"chapter:waiters:{identity}", str(user_id))
+        await redis_client.expire(f"chapter:waiters:{identity}", JOB_DEDUP_TTL * 4)
+    except Exception as e:
+        logger.error(f"add_chapter_waiter error for {identity}: {e}")
+
+
+async def pop_chapter_waiters(identity: str) -> Set[int]:
+    try:
+        key = f"chapter:waiters:{identity}"
+        values = await redis_client.smembers(key)
+        await redis_client.delete(key)
+        return {int(v.decode() if isinstance(v, bytes) else v) for v in values}
+    except Exception as e:
+        logger.error(f"pop_chapter_waiters error for {identity}: {e}")
+        return set()
+
+
 async def enqueue_chapter_job(
     *,
     chapter_number: Optional[int] = None,
@@ -871,6 +890,8 @@ async def enqueue_chapter_job(
     identity = chapter_id if chapter_id is not None else (str(chapter_number) if chapter_number is not None else None)
     if identity is None:
         return False
+    if requested_by and notify_user:
+        await add_chapter_waiter(identity, int(requested_by))
     payload = {
         "chapter_number": chapter_number,
         "chapter_id": chapter_id,
@@ -1989,8 +2010,13 @@ async def worker_loop():
         notify_user = bool(job.get("notify_user"))
         broadcast = bool(job.get("broadcast"))
         source = job.get("source", "user")
+        identity = str(chapter_id) if chapter_id is not None else (str(chapter_number) if chapter_number is not None else None)
 
         try:
+            waiters = await pop_chapter_waiters(identity) if identity else set()
+            if requested_by and notify_user:
+                waiters.add(int(requested_by))
+
             chapter = await get_chapter_meta(str(chapter_id)) if chapter_id else None
             if chapter is None and chapter_number is not None:
                 chapter = await find_chapter_by_number(int(chapter_number))
@@ -1998,23 +2024,27 @@ async def worker_loop():
                     await save_chapter_meta(chapter)
 
             if chapter is None:
-                if requested_by and notify_user:
+                for user_id in waiters:
                     await enqueue_notification_job({
                         "type": "user_chapter_failed",
-                        "user_id": requested_by,
+                        "user_id": user_id,
                         "chapter_number": chapter_number,
                         "reason": "not_found",
                     })
                 continue
 
+            chapter_identity = str(chapter.get("id") or identity)
+            late_waiters = await pop_chapter_waiters(chapter_identity)
+            waiters.update(late_waiters)
+
             url, success = await process_chapter_translation(chapter)
             if success and url:
                 if source == "monitor":
                     await save_last_chapter(chapter["id"])
-                if requested_by and notify_user:
+                for user_id in waiters:
                     await enqueue_notification_job({
                         "type": "user_chapter_ready",
-                        "user_id": requested_by,
+                        "user_id": user_id,
                         "chapter_id": chapter["id"],
                         "chapter_title": chapter["title"],
                         "url": url,
@@ -2028,10 +2058,10 @@ async def worker_loop():
                     })
                 continue
 
-            if requested_by and notify_user:
+            for user_id in waiters:
                 await enqueue_notification_job({
                     "type": "user_chapter_failed",
-                    "user_id": requested_by,
+                    "user_id": user_id,
                     "chapter_number": chapter_number or chapter["id"],
                     "reason": await get_translation_error(chapter["id"]) or "unexpected_error",
                 })
