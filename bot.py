@@ -7,6 +7,9 @@ import html
 import time
 import hashlib
 from typing import Optional, Set, List, Dict, Any
+from dataclasses import dataclass
+from contextlib import asynccontextmanager
+import uuid
 from urllib.parse import urlparse
 from collections import deque
 from tenacity import (
@@ -52,6 +55,8 @@ CHAPTERS_PER_PAGE = 25
 TELEGRAPH_TITLE_MAX_LENGTH = 200
 NOVEL_ID = "1205249"
 TRANSLATION_LOCK_TTL = 15 * 60
+USER_CHAPTER_REQUEST_LOCK_TTL = int(os.getenv("USER_CHAPTER_REQUEST_LOCK_TTL", "600"))
+USER_CHAPTER_CANCEL_TTL = int(os.getenv("USER_CHAPTER_CANCEL_TTL", "120"))
 TRANSLATION_WAIT_TIMEOUT = 90
 TRANSLATION_WAIT_STEP = 2
 ERROR_TTL = 5 * 60
@@ -679,33 +684,152 @@ async def set_chapter_status(chapter_id: str, status: str, error: str = "") -> N
     })
 
 
-async def acquire_translation_lock(chapter_id: str) -> bool:
+@dataclass
+class RedisLockHandle:
+    key: str
+    token: str
+
+
+def _translation_lock_key(chapter_id: str) -> str:
+    return f"translation:lock:{chapter_id}"
+
+
+def _user_chapter_lock_key(user_id: int) -> str:
+    return f"user:chapter_request_lock:{user_id}"
+
+
+def _user_chapter_cancel_key(user_id: int) -> str:
+    return f"user:chapter_request_cancel:{user_id}"
+
+
+async def acquire_redis_lock(lock_key: str, ttl: int) -> Optional[RedisLockHandle]:
+    token = uuid.uuid4().hex
     try:
-        result = await redis_client.set(
-            f"translation:lock:{chapter_id}",
-            str(int(time.time())),
-            ex=TRANSLATION_LOCK_TTL,
-            nx=True,
-        )
-        return bool(result)
+        acquired = await redis_client.set(lock_key, token, ex=ttl, nx=True)
+        if acquired:
+            return RedisLockHandle(key=lock_key, token=token)
+        return None
     except Exception as e:
-        logger.error(f"acquire_translation_lock error for {chapter_id}: {e}")
+        logger.error("acquire_redis_lock error for %s: %s", lock_key, e)
+        return None
+
+
+async def release_redis_lock(lock: Optional[RedisLockHandle]) -> None:
+    if not lock:
+        return
+    try:
+        await redis_client.eval(
+            """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+            """,
+            1,
+            lock.key,
+            lock.token,
+        )
+    except Exception as e:
+        logger.error("release_redis_lock error for %s: %s", lock.key, e)
+
+
+async def lock_exists(lock_key: str) -> bool:
+    try:
+        return bool(await redis_client.exists(lock_key))
+    except Exception as e:
+        logger.error("lock_exists error for %s: %s", lock_key, e)
         return False
+
+
+async def acquire_translation_lock_handle(chapter_id: str) -> Optional[RedisLockHandle]:
+    return await acquire_redis_lock(_translation_lock_key(chapter_id), TRANSLATION_LOCK_TTL)
+
+
+async def acquire_translation_lock(chapter_id: str) -> bool:
+    lock = await acquire_translation_lock_handle(chapter_id)
+    if lock:
+        await release_redis_lock(lock)
+        return True
+    return False
 
 
 async def release_translation_lock(chapter_id: str) -> None:
     try:
-        await redis_client.delete(f"translation:lock:{chapter_id}")
+        await redis_client.delete(_translation_lock_key(chapter_id))
     except Exception as e:
         logger.error(f"release_translation_lock error for {chapter_id}: {e}")
 
 
+async def release_translation_lock_handle(lock: Optional[RedisLockHandle]) -> None:
+    await release_redis_lock(lock)
+
+
 async def is_translation_in_progress(chapter_id: str) -> bool:
+    return await lock_exists(_translation_lock_key(chapter_id))
+
+
+async def acquire_user_chapter_lock_handle(user_id: int) -> Optional[RedisLockHandle]:
+    return await acquire_redis_lock(_user_chapter_lock_key(user_id), USER_CHAPTER_REQUEST_LOCK_TTL)
+
+
+async def acquire_user_chapter_lock(user_id: int) -> bool:
+    lock = await acquire_user_chapter_lock_handle(user_id)
+    if lock:
+        await release_redis_lock(lock)
+        return True
+    return False
+
+
+async def release_user_chapter_lock(user_id: int, token: Optional[str] = None) -> None:
+    if token:
+        await release_redis_lock(RedisLockHandle(key=_user_chapter_lock_key(user_id), token=token))
+        return
     try:
-        return bool(await redis_client.exists(f"translation:lock:{chapter_id}"))
+        await redis_client.delete(_user_chapter_lock_key(user_id))
     except Exception as e:
-        logger.error(f"is_translation_in_progress error for {chapter_id}: {e}")
-        return False
+        logger.error("release_user_chapter_lock error for %s: %s", user_id, e)
+
+
+async def is_user_chapter_request_in_progress(user_id: int) -> bool:
+    return await lock_exists(_user_chapter_lock_key(user_id))
+
+
+async def mark_user_chapter_request_cancelled(user_id: int) -> None:
+    try:
+        await redis_client.set(_user_chapter_cancel_key(user_id), "1", ex=USER_CHAPTER_CANCEL_TTL)
+    except Exception as e:
+        logger.error("mark_user_chapter_request_cancelled error for %s: %s", user_id, e)
+
+
+async def clear_user_chapter_request_cancelled(user_id: int) -> None:
+    try:
+        await redis_client.delete(_user_chapter_cancel_key(user_id))
+    except Exception as e:
+        logger.error("clear_user_chapter_request_cancelled error for %s: %s", user_id, e)
+
+
+async def is_user_chapter_request_cancelled(user_id: int) -> bool:
+    return await lock_exists(_user_chapter_cancel_key(user_id))
+
+
+class UserChapterRequestCancelled(Exception):
+    pass
+
+
+async def raise_if_user_request_cancelled(user_id: int) -> None:
+    if await is_user_chapter_request_cancelled(user_id):
+        raise UserChapterRequestCancelled(f"User {user_id} cancelled chapter request")
+
+
+@asynccontextmanager
+async def user_chapter_request_lock(user_id: int):
+    lock = await acquire_user_chapter_lock_handle(user_id)
+    try:
+        yield lock
+    finally:
+        if lock:
+            await release_user_chapter_lock(user_id, lock.token)
+            await clear_user_chapter_request_cancelled(user_id)
 
 
 async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION_WAIT_TIMEOUT) -> Optional[str]:
@@ -1323,36 +1447,35 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
     await save_chapter_meta(ch)
 
-    # 1. Если кто-то уже переводит эту главу — ждём, а не запускаем второй перевод
-    if await is_translation_in_progress(cid):
-        logger.info(f"Глава {cid} уже переводится другим процессом, ждём результат")
-        ready_url = await wait_for_ready_translation(cid)
-        if ready_url:
-            return ready_url, True
-        logger.warning(f"Ожидание перевода главы {cid} завершилось без результата")
-        return None, False
+    ready_url = await get_cached_telegraph(cid)
+    if not ready_url:
+        ready_url = (await get_chapter_cache(cid)).get("telegraph_url")
+    if ready_url:
+        logger.info("Глава %s уже есть в готовом кэше, повторный перевод не нужен", cid)
+        return ready_url, True
 
-    # 2. Пытаемся взять lock
-    lock_acquired = await acquire_translation_lock(cid)
-    if not lock_acquired:
-        logger.info(f"Не удалось взять lock для главы {cid}, ждём готовый результат")
+    chapter_lock = await acquire_translation_lock_handle(cid)
+    if not chapter_lock:
+        logger.info("Глава %s уже обрабатывается другим процессом, ждём готовый результат", cid)
         ready_url = await wait_for_ready_translation(cid)
         if ready_url:
             return ready_url, True
+        logger.warning("Ожидание перевода главы %s завершилось без результата", cid)
         return None, False
 
     try:
         await set_chapter_status(cid, "processing")
-
         cache = await get_chapter_cache(cid)
-
-        # Сохраняем мету отдельно
         await save_chapter_cache(cid, {
             "source_url": source_url,
             "source_title": title,
         })
 
-        # 4. Оригинальный текст: либо из Redis string, либо парсим сайт
+        url = cache.get("telegraph_url") or await get_cached_telegraph(cid)
+        if url:
+            await save_chapter_cache(cid, {"telegraph_url": url, "status": "ready", "error": ""})
+            return url, True
+
         original_text = await get_chapter_original_text(cid)
         if not original_text:
             try:
@@ -1362,32 +1485,23 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 await set_chapter_status(cid, "failed", "fetch_failed")
                 await save_translation_error(cid, "fetch_failed")
                 return None, False
-
             await save_chapter_original_text(cid, original_text)
 
         translation_signature = build_translation_signature(original_text)
         cache = await invalidate_outdated_chapter_cache(cid, cache, translation_signature)
-        await save_chapter_cache(cid, {
-            "translation_signature": translation_signature,
-        })
+        await save_chapter_cache(cid, {"translation_signature": translation_signature})
 
         url = cache.get("telegraph_url") or await get_cached_telegraph(cid)
         if url:
             logger.info(f"Глава {cid} найдена в актуальном telegraph-кэше")
-            await save_chapter_cache(cid, {
-                "telegraph_url": url,
-                "status": "ready",
-                "error": "",
-            })
+            await save_chapter_cache(cid, {"telegraph_url": url, "status": "ready", "error": ""})
             return url, True
 
-        # 5. Перевод текста: либо из Redis string, либо переводим
         translated_text = await get_chapter_translated_text(cid)
         if not translated_text:
             translated_text = await translate_text(original_text)
             await save_chapter_translated_text(cid, translated_text)
 
-        # 6. Заголовок: либо из кэша, либо переводим
         translated_title = cache.get("translated_title") or await get_cached_title(cid)
         if translated_title and re.search(r"[А-Яа-яЁё]", translated_title):
             translated_title_clean = clean_title_for_telegraph(translated_title)
@@ -1397,29 +1511,19 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
                 translated_title_clean = clean_title_for_telegraph(title)
 
         await save_cached_title(cid, translated_title_clean)
-        await save_chapter_cache(cid, {
-            "translated_title": translated_title_clean,
-        })
+        await save_chapter_cache(cid, {"translated_title": translated_title_clean})
 
-        # 7. Если в новом chapter hash уже есть telegraph_url, используем его
-        if cache.get("telegraph_url"):
+        url = (await get_chapter_cache(cid)).get("telegraph_url") or await get_cached_telegraph(cid)
+        if url:
             await set_chapter_status(cid, "ready")
-            return cache["telegraph_url"], True
+            return url, True
 
-        # 8. Создаём Telegraph из уже готового translated_text
         html = text_to_html(translated_text)
-        new_url = await create_telegraph_page(
-            title=translated_title_clean,
-            content_html=html
-        )
+        new_url = await create_telegraph_page(title=translated_title_clean, content_html=html)
 
         if new_url:
             await save_telegraph_url(cid, new_url)
-            await save_chapter_cache(cid, {
-                "telegraph_url": new_url,
-                "status": "ready",
-                "error": "",
-            })
+            await save_chapter_cache(cid, {"telegraph_url": new_url, "status": "ready", "error": ""})
             await set_chapter_status(cid, "ready")
             return new_url, True
 
@@ -1435,7 +1539,7 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
         raise
 
     finally:
-        await release_translation_lock(cid)
+        await release_translation_lock_handle(chapter_lock)
 
 
 async def notify_all_subscribers(text: str, parse_mode: str = "HTML", reply_markup=None):
@@ -1844,18 +1948,44 @@ async def process_chapter_number(message: types.Message, state: FSMContext):
         return
 
     if message.text == "❌ Отмена":
+        if await is_user_chapter_request_in_progress(uid):
+            await mark_user_chapter_request_cancelled(uid)
+            await message.answer(
+                "🛑 Текущий запрос главы отменяется. Если перевод уже запущен, он может завершиться в фоне, но новый запрос можно будет отправить после завершения отмены.",
+                reply_markup=await get_main_menu(uid)
+            )
+        else:
+            await message.answer("Ввод отменён.", reply_markup=await get_main_menu(uid))
         await state.clear()
-        await message.answer("Ввод отменён.", reply_markup=await get_main_menu(uid))
         return
 
     if not message.text.isdigit():
         await message.answer("Введите число или нажмите Отмена.", reply_markup=cancel_keyboard)
         return
 
+    lock = await acquire_user_chapter_lock_handle(uid)
+    if not lock:
+        await message.answer(
+            "⏳ У вас уже обрабатывается запрос главы. Дождитесь завершения текущего запроса или отмените его.",
+            reply_markup=cancel_keyboard
+        )
+        return
+
     chapter_num = int(message.text)
-    status_msg = await message.answer(f"🔍 Обработка главы {chapter_num}...")
-    await send_chapter_to_user(uid, chapter_num, status_msg=status_msg)
-    await state.clear()
+    status_msg = None
+    try:
+        await clear_user_chapter_request_cancelled(uid)
+        status_msg = await message.answer(f"🔍 Обработка главы {chapter_num}...")
+        await raise_if_user_request_cancelled(uid)
+        await send_chapter_to_user(uid, chapter_num, status_msg=status_msg)
+    except UserChapterRequestCancelled:
+        logger.info("Запрос главы пользователя %s отменён до отправки результата", uid)
+        await safe_delete(status_msg)
+        await message.answer("🛑 Запрос главы отменён.", reply_markup=await get_main_menu(uid))
+    finally:
+        await release_user_chapter_lock(uid, lock.token)
+        await clear_user_chapter_request_cancelled(uid)
+        await state.clear()
 
 
 async def button_help(message: types.Message, state: FSMContext):
@@ -1892,6 +2022,7 @@ async def send_chapter_to_user(
         return False
 
     try:
+        await raise_if_user_request_cancelled(uid)
         cached_url = await get_cached_telegraph(str(chapter_num))
         if not cached_url:
             chapter_cache = await get_chapter_cache(str(chapter_num))
@@ -1908,6 +2039,7 @@ async def send_chapter_to_user(
             await save_user_bookmark(uid, str(chapter_num))
             return True
 
+        await raise_if_user_request_cancelled(uid)
         chapter = await get_chapter_meta(str(chapter_num))
         if chapter:
             logger.info(f"Глава {chapter_num} найдена в chapter_meta кэше")
@@ -1933,7 +2065,9 @@ async def send_chapter_to_user(
             else:
                 await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
 
+        await raise_if_user_request_cancelled(uid)
         url, success = await process_chapter_translation(chapter)
+        await raise_if_user_request_cancelled(uid)
         await safe_delete(status_msg)
 
         if success and url:
@@ -1961,6 +2095,10 @@ async def send_chapter_to_user(
             "❌ Не удалось создать перевод. Попробуйте позже.",
             reply_markup=await get_main_menu(uid)
         )
+        return False
+    except UserChapterRequestCancelled:
+        logger.info("send_chapter_to_user cancelled for user %s", uid)
+        await safe_delete(status_msg)
         return False
     except Exception as e:
         logger.exception(f"send_chapter_to_user error: {e}")
