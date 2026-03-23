@@ -1571,13 +1571,11 @@ async def button_status(message: types.Message, state: FSMContext):
 
 
 async def admin_clear_cache(callback: types.CallbackQuery):
-    global _glossary_cache, _glossary_cache_expires_at
-
     if ADMIN_ID is None or str(callback.from_user.id) != ADMIN_ID:
         await callback.answer("Доступ запрещён", show_alert=True)
         return
     try:
-        preserved_keys = {"last_chapter", "subscribers"}
+        preserved_keys = {"last_chapter", "subscribers", "glossary:terms"}
         deleted_keys = 0
 
         async for key in redis_client.scan_iter(match="*"):
@@ -1586,15 +1584,13 @@ async def admin_clear_cache(callback: types.CallbackQuery):
                 continue
             deleted_keys += await redis_client.delete(key)
 
-        _glossary_cache = None
-        _glossary_cache_expires_at = 0.0
-
         await callback.answer("Данные Redis очищены")
         await safe_edit_text(
             callback.message,
             (
                 "✅ Все данные Redis удалены, кроме "
-                "<code>last_chapter</code> и <code>subscribers</code>.\n"
+                "<code>last_chapter</code>, <code>subscribers</code> "
+                "и <code>glossary:terms</code>.\n"
                 f"Удалено ключей: <b>{deleted_keys}</b>."
             ),
             parse_mode="HTML",
