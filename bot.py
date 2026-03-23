@@ -2011,6 +2011,8 @@ async def worker_loop():
         broadcast = bool(job.get("broadcast"))
         source = job.get("source", "user")
         identity = str(chapter_id) if chapter_id is not None else (str(chapter_number) if chapter_number is not None else None)
+        waiters: Set[int] = set()
+        chapter: Optional[Dict[str, str]] = None
 
         try:
             waiters = await pop_chapter_waiters(identity) if identity else set()
@@ -2067,6 +2069,19 @@ async def worker_loop():
                 })
         except Exception:
             logger.exception("Ошибка обработки chapter job: %s", job)
+            failure_reason = "unexpected_error"
+            if chapter is not None:
+                failure_reason = await get_translation_error(chapter["id"]) or failure_reason
+            elif chapter_id is not None:
+                failure_reason = await get_translation_error(str(chapter_id)) or failure_reason
+
+            for user_id in waiters:
+                await enqueue_notification_job({
+                    "type": "user_chapter_failed",
+                    "user_id": user_id,
+                    "chapter_number": chapter_number or chapter_id,
+                    "reason": failure_reason,
+                })
 
 
 async def notification_loop():
