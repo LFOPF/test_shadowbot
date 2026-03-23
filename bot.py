@@ -33,14 +33,12 @@ from bs4 import BeautifulSoup
 import aiohttp
 
 # ======================== НАСТРОЙКИ ========================
+ROLE = os.getenv("SHADOWBOT_ROLE", "bot-api")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAPH_ACCESS_TOKEN = os.getenv("TELEGRAPH_ACCESS_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
 ADMIN_ID = os.getenv("ADMIN_ID")
-
-if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
-    raise ValueError("Не заданы все обязательные переменные окружения")
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
@@ -58,6 +56,11 @@ ERROR_TTL = 5 * 60
 PLAYWRIGHT_CONCURRENCY = int(os.getenv("PLAYWRIGHT_CONCURRENCY", "2"))
 GLOSSARY_CACHE_TTL = int(os.getenv("GLOSSARY_CACHE_TTL", "300"))
 TRANSLATION_CACHE_VERSION = os.getenv("TRANSLATION_CACHE_VERSION", "v1")
+CHAPTER_JOB_QUEUE = "queue:chapter_jobs"
+NOTIFICATION_JOB_QUEUE = "queue:notification_jobs"
+MONITOR_TRIGGER_QUEUE = "queue:monitor_triggers"
+JOB_DEDUP_TTL = int(os.getenv("JOB_DEDUP_TTL", "300"))
+BOT_READY_WAIT_TIMEOUT = int(os.getenv("BOT_READY_WAIT_TIMEOUT", "3"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -110,6 +113,7 @@ playwright_semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
 _glossary_cache: Optional[Dict[str, str]] = None
 _glossary_cache_expires_at = 0.0
 _glossary_cache_lock = asyncio.Lock()
+background_tasks: list[asyncio.Task] = []
 # glossary_dict: Dict[str, str] = {}  трайнем через хэш
 SYSTEM_PROMPT = (
     "Ты — профессиональный литературный переводчик веб-новелл, специализирующийся на Shadow Slave. "
@@ -133,6 +137,27 @@ USER_PROMPT_TEMPLATE = (
     "Используй динамичные предложения и правильный ритм русского языка.\n\n"
     "Текст для перевода:\n\n{text}"
 )
+
+
+def validate_environment() -> None:
+    required_by_role = {
+        "bot-api": ["BOT_TOKEN", "REDIS_URL"],
+        "worker": ["OPENROUTER_API_KEY", "TELEGRAPH_ACCESS_TOKEN", "REDIS_URL"],
+        "scheduler": ["BOT_TOKEN", "REDIS_URL"],
+    }
+    required = required_by_role.get(ROLE)
+    if required is None:
+        raise ValueError(f"Неизвестная роль SHADOWBOT_ROLE={ROLE!r}")
+
+    values = {
+        "BOT_TOKEN": BOT_TOKEN,
+        "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
+        "TELEGRAPH_ACCESS_TOKEN": TELEGRAPH_ACCESS_TOKEN,
+        "REDIS_URL": REDIS_URL,
+    }
+    missing = [name for name in required if not values.get(name)]
+    if missing:
+        raise ValueError(f"Для роли {ROLE} не заданы обязательные переменные: {', '.join(missing)}")
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -806,6 +831,76 @@ async def save_last_chapter(ch_id: str):
         await redis_client.set("last_chapter", ch_id)
     except Exception as e:
         logger.error(f"save_last_chapter error: {e}")
+
+
+async def enqueue_json_job(queue_name: str, payload: dict[str, Any], dedupe_key: Optional[str] = None, dedupe_ttl: int = JOB_DEDUP_TTL) -> bool:
+    try:
+        if dedupe_key:
+            acquired = await redis_client.set(dedupe_key, "1", ex=dedupe_ttl, nx=True)
+            if not acquired:
+                return False
+        await redis_client.lpush(queue_name, json.dumps(payload, ensure_ascii=False))
+        return True
+    except Exception as e:
+        logger.error(f"enqueue_json_job error for {queue_name}: {e}")
+        return False
+
+
+async def dequeue_json_job(queue_name: str, timeout: int = 5) -> Optional[dict[str, Any]]:
+    try:
+        item = await redis_client.brpop(queue_name, timeout=timeout)
+        if not item:
+            return None
+        _, raw_payload = item
+        payload = raw_payload.decode() if isinstance(raw_payload, bytes) else raw_payload
+        return json.loads(payload)
+    except Exception as e:
+        logger.error(f"dequeue_json_job error for {queue_name}: {e}")
+        return None
+
+
+async def enqueue_chapter_job(
+    *,
+    chapter_number: Optional[int] = None,
+    chapter_id: Optional[str] = None,
+    requested_by: Optional[int] = None,
+    source: str = "user",
+    notify_user: bool = False,
+    broadcast: bool = False,
+) -> bool:
+    identity = chapter_id if chapter_id is not None else (str(chapter_number) if chapter_number is not None else None)
+    if identity is None:
+        return False
+    payload = {
+        "chapter_number": chapter_number,
+        "chapter_id": chapter_id,
+        "requested_by": requested_by,
+        "source": source,
+        "notify_user": notify_user,
+        "broadcast": broadcast,
+    }
+    return await enqueue_json_job(
+        CHAPTER_JOB_QUEUE,
+        payload,
+        dedupe_key=f"queue:chapter_job:dedupe:{identity}",
+    )
+
+
+async def enqueue_notification_job(payload: dict[str, Any]) -> bool:
+    dedupe_key = None
+    job_type = payload.get("type")
+    if job_type == "broadcast_new_chapter":
+        dedupe_key = f"queue:notification:broadcast:{payload.get('chapter_id')}"
+    return await enqueue_json_job(NOTIFICATION_JOB_QUEUE, payload, dedupe_key=dedupe_key)
+
+
+async def enqueue_monitor_trigger(reason: str = "manual") -> bool:
+    return await enqueue_json_job(
+        MONITOR_TRIGGER_QUEUE,
+        {"reason": reason, "created_at": int(time.time())},
+        dedupe_key=f"queue:monitor_trigger:{reason}",
+        dedupe_ttl=30,
+    )
 
 
 @retry(**RETRY_WEB)
@@ -1749,7 +1844,6 @@ async def send_chapter_to_user(
     status_msg: Optional[types.Message] = None,
     initial_message: Optional[types.Message] = None,
 ) -> bool:
-    touch_browser_activity()
     uid = user_id
     if await is_user_blocked(uid):
         await safe_delete(status_msg)
@@ -1777,57 +1871,43 @@ async def send_chapter_to_user(
         chapter = await get_chapter_meta(str(chapter_num))
         if chapter:
             logger.info(f"Глава {chapter_num} найдена в chapter_meta кэше")
-            if status_msg:
-                await safe_edit_text(status_msg, f"📦 Глава {chapter_num} найдена в кэше, подготавливаю перевод...")
-        else:
-            if status_msg:
-                await safe_edit_text(status_msg, f"🔍 Поиск главы {chapter_num} на сайте...")
-            chapter = await find_chapter_by_number(chapter_num)
-            if not chapter:
+            url = await wait_for_ready_translation(chapter["id"], timeout=BOT_READY_WAIT_TIMEOUT)
+            if url:
                 await safe_delete(status_msg)
                 await (initial_message or status_msg).answer(
-                    f"❌ Глава {chapter_num} не найдена.",
-                    reply_markup=await get_main_menu(uid)
+                    f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}",
+                    parse_mode="HTML",
+                    reply_markup=await get_main_menu(uid),
                 )
-                return False
-            await save_chapter_meta(chapter)
+                await save_user_bookmark(uid, chapter["id"])
+                return True
 
-        in_progress = await is_translation_in_progress(chapter["id"])
-        if status_msg:
-            if in_progress:
-                await safe_edit_text(status_msg, f"⏳ Глава {chapter_num} уже переводится, ожидаю готовый результат...")
-            else:
-                await safe_edit_text(status_msg, f"📥 Загружаю и перевожу главу {chapter_num}...")
-
-        url, success = await process_chapter_translation(chapter)
+        queued = await enqueue_chapter_job(
+            chapter_number=chapter_num,
+            chapter_id=chapter["id"] if chapter else None,
+            requested_by=uid,
+            source="user",
+            notify_user=True,
+            broadcast=False,
+        )
         await safe_delete(status_msg)
-
-        if success and url:
-            text = f"📖 <b>{chapter['title']}</b>\n\n🔗 {url}"
+        if queued:
             await (initial_message or status_msg).answer(
-                text, parse_mode="HTML", reply_markup=await get_main_menu(uid)
-            )
-            await save_user_bookmark(uid, chapter['id'])
-            return True
-
-        recent_error = await get_translation_error(chapter["id"])
-        if recent_error:
-            error_map = {
-                "fetch_failed": "❌ Не удалось загрузить текст главы. Попробуйте позже.",
-                "telegraph_failed": "❌ Перевод получен, но не удалось создать страницу Telegraph. Попробуйте позже.",
-                "unexpected_error": "❌ Во время обработки главы произошла ошибка. Попробуйте позже.",
-            }
-            await (initial_message or status_msg).answer(
-                error_map.get(recent_error, "❌ Не удалось создать перевод. Попробуйте позже."),
+                (
+                    f"⏳ Глава {chapter_num} поставлена в обработку.\n"
+                    "Я пришлю ссылку отдельным сообщением, как только worker закончит перевод."
+                ),
                 reply_markup=await get_main_menu(uid)
             )
-            return False
-
-        await (initial_message or status_msg).answer(
-            "❌ Не удалось создать перевод. Попробуйте позже.",
-            reply_markup=await get_main_menu(uid)
-        )
-        return False
+        else:
+            await (initial_message or status_msg).answer(
+                (
+                    f"⏳ Глава {chapter_num} уже обрабатывается.\n"
+                    "Когда перевод будет готов, scheduler/notifier отправит вам ссылку."
+                ),
+                reply_markup=await get_main_menu(uid)
+            )
+        return True
     except Exception as e:
         logger.exception(f"send_chapter_to_user error: {e}")
         await safe_delete(status_msg)
@@ -1836,8 +1916,6 @@ async def send_chapter_to_user(
             reply_markup=await get_main_menu(uid)
         )
         return False
-    finally:
-        touch_browser_activity()
 
 
 async def handle_other_text(message: types.Message, state: FSMContext):
@@ -1855,8 +1933,8 @@ async def handle_other_text(message: types.Message, state: FSMContext):
 async def force_monitor_run(msg: types.Message):
     logger.info("Принудительная проверка")
     try:
-        await monitor(check_once=True)
-        await safe_edit_text(msg, "✅ Проверка завершена.", reply_markup=admin_status_buttons)
+        await enqueue_monitor_trigger("manual")
+        await safe_edit_text(msg, "✅ Проверка поставлена в очередь scheduler.", reply_markup=admin_status_buttons)
     except Exception as e:
         await safe_edit_text(msg, f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
 
@@ -1877,52 +1955,14 @@ async def monitor(check_once=False):
 
                 if new_chapters:
                     logger.info(f"Новых глав: {len(new_chapters)}")
-                    translated_urls = []
-                    failed = []
-                    last_successful_id = last_int
-                    stop_on_first_failure = False
-
-                    for i, ch in enumerate(new_chapters):
-                        if stop_on_first_failure:
-                            failed.append(ch['id'])
-                            continue
-                        try:
-                            url, success = await process_chapter_translation(ch)
-                            if success and url:
-                                translated_urls.append((ch['id'], url))
-                                last_successful_id = int(ch['id'])
-                            else:
-                                failed.append(ch['id'])
-                                stop_on_first_failure = True
-                        except Exception:
-                            logger.exception(f"Ошибка главы {ch['id']}")
-                            failed.append(ch['id'])
-                            stop_on_first_failure = True
-                        if i < len(new_chapters) - 1 and not stop_on_first_failure:
-                            await asyncio.sleep(10)
-
-                    if ADMIN_ID:
-                        admin_id = int(ADMIN_ID)
-                        if translated_urls:
-                            await bot.send_message(
-                                admin_id,
-                                "✅ Переведены новые главы:\n" + "\n".join(f"• {cid}: {url}" for cid, url in translated_urls),
-                                parse_mode="HTML",
-                                disable_web_page_preview=True
-                            )
-                        if failed:
-                            await bot.send_message(admin_id, f"❌ Не удалось: {', '.join(map(str, failed))}")
-
-                    if last_successful_id > last_int:
-                            await save_last_chapter(str(last_successful_id))
-
-                    for cid, url in translated_urls:
-                        chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
-                        notify_text = (
-                            f"📢 <b>Новая глава!</b>\n\n📖 <b>{chapter_info['title']}</b>\n\n🔗 {url}"
-                            if chapter_info else f"📢 <b>Новая глава {cid}!</b>\n\n🔗 {url}"
+                    for ch in new_chapters:
+                        await enqueue_chapter_job(
+                            chapter_id=ch["id"],
+                            chapter_number=int(ch["id"]),
+                            source="monitor",
+                            notify_user=False,
+                            broadcast=True,
                         )
-                        await notify_all_subscribers(notify_text, parse_mode="HTML")
 
                 else:
                     logger.info("Новых глав нет")
@@ -1936,23 +1976,137 @@ async def monitor(check_once=False):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+async def worker_loop():
+    logger.info("Worker loop запущен")
+    while True:
+        job = await dequeue_json_job(CHAPTER_JOB_QUEUE, timeout=5)
+        if not job:
+            continue
+
+        chapter_id = job.get("chapter_id")
+        chapter_number = job.get("chapter_number")
+        requested_by = job.get("requested_by")
+        notify_user = bool(job.get("notify_user"))
+        broadcast = bool(job.get("broadcast"))
+        source = job.get("source", "user")
+
+        try:
+            chapter = await get_chapter_meta(str(chapter_id)) if chapter_id else None
+            if chapter is None and chapter_number is not None:
+                chapter = await find_chapter_by_number(int(chapter_number))
+                if chapter:
+                    await save_chapter_meta(chapter)
+
+            if chapter is None:
+                if requested_by and notify_user:
+                    await enqueue_notification_job({
+                        "type": "user_chapter_failed",
+                        "user_id": requested_by,
+                        "chapter_number": chapter_number,
+                        "reason": "not_found",
+                    })
+                continue
+
+            url, success = await process_chapter_translation(chapter)
+            if success and url:
+                if source == "monitor":
+                    await save_last_chapter(chapter["id"])
+                if requested_by and notify_user:
+                    await enqueue_notification_job({
+                        "type": "user_chapter_ready",
+                        "user_id": requested_by,
+                        "chapter_id": chapter["id"],
+                        "chapter_title": chapter["title"],
+                        "url": url,
+                    })
+                if broadcast:
+                    await enqueue_notification_job({
+                        "type": "broadcast_new_chapter",
+                        "chapter_id": chapter["id"],
+                        "chapter_title": chapter["title"],
+                        "url": url,
+                    })
+                continue
+
+            if requested_by and notify_user:
+                await enqueue_notification_job({
+                    "type": "user_chapter_failed",
+                    "user_id": requested_by,
+                    "chapter_number": chapter_number or chapter["id"],
+                    "reason": await get_translation_error(chapter["id"]) or "unexpected_error",
+                })
+        except Exception:
+            logger.exception("Ошибка обработки chapter job: %s", job)
+
+
+async def notification_loop():
+    logger.info("Notification loop запущен")
+    while True:
+        job = await dequeue_json_job(NOTIFICATION_JOB_QUEUE, timeout=5)
+        if not job:
+            continue
+        try:
+            job_type = job.get("type")
+            if job_type == "broadcast_new_chapter":
+                text = f"📢 <b>Новая глава!</b>\n\n📖 <b>{job['chapter_title']}</b>\n\n🔗 {job['url']}"
+                await notify_all_subscribers(text, parse_mode="HTML")
+            elif job_type == "user_chapter_ready":
+                await save_user_bookmark(int(job["user_id"]), str(job["chapter_id"]))
+                await bot.send_message(
+                    int(job["user_id"]),
+                    f"📖 <b>{job['chapter_title']}</b>\n\n🔗 {job['url']}",
+                    parse_mode="HTML",
+                    reply_markup=await get_main_menu(int(job["user_id"])),
+                    disable_web_page_preview=True,
+                )
+            elif job_type == "user_chapter_failed":
+                reason = job.get("reason")
+                error_map = {
+                    "not_found": "❌ Глава не найдена.",
+                    "fetch_failed": "❌ Не удалось загрузить текст главы. Попробуйте позже.",
+                    "telegraph_failed": "❌ Перевод получен, но не удалось создать страницу Telegraph. Попробуйте позже.",
+                    "unexpected_error": "❌ Во время обработки главы произошла ошибка. Попробуйте позже.",
+                }
+                await bot.send_message(
+                    int(job["user_id"]),
+                    error_map.get(reason, "❌ Не удалось создать перевод. Попробуйте позже."),
+                    reply_markup=await get_main_menu(int(job["user_id"])),
+                )
+        except Exception:
+            logger.exception("Ошибка обработки notification job: %s", job)
+
+
+async def monitor_trigger_loop():
+    logger.info("Scheduler monitor loop запущен")
+    while True:
+        trigger = await dequeue_json_job(MONITOR_TRIGGER_QUEUE, timeout=CHECK_INTERVAL)
+        if trigger:
+            logger.info("Получен trigger мониторинга: %s", trigger)
+        try:
+            await monitor(check_once=True)
+        except Exception:
+            logger.exception("Ошибка monitor(check_once=True)")
+
+
 async def on_startup():
-    logger.info("Бот запущен. Загружаем глоссарий и запускаем мониторинг...")
-   
+    logger.info("Процесс %s запущен. Загружаем глоссарий при необходимости...", ROLE)
     try:
-        await load_glossary_to_redis(force=False)
-        terms = await get_glossary_terms(force_refresh=True)
-        logger.info(f"Глоссарий в Redis: {len(terms)} терминов")
+        if ROLE in {"worker", "scheduler"}:
+            await load_glossary_to_redis(force=False)
+            terms = await get_glossary_terms(force_refresh=True)
+            logger.info(f"Глоссарий в Redis: {len(terms)} терминов")
     except Exception as e:
         logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
-    
-    asyncio.create_task(monitor())
-    logger.info("Мониторинг запущен; браузер будет стартовать лениво по запросу")
 
 
 async def on_shutdown():
-    global http_session
+    global http_session, background_tasks
     logger.info("Выключение...")
+    for task in background_tasks:
+        task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        background_tasks = []
     await close_browser()
     if http_session and not http_session.closed:
         await http_session.close()
@@ -1961,11 +2115,7 @@ async def on_shutdown():
         await redis_client.aclose()
 
 
-async def main():
-    global redis_client, bot
-    redis_client = await redis.from_url(REDIS_URL)
-    await ensure_subscribers_key()
-    bot = Bot(token=BOT_TOKEN)
+def build_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=RedisStorage(redis_client))
 
     dp.message.register(process_chapter_number, ChapterSelection.waiting_for_chapter)
@@ -1996,11 +2146,53 @@ async def main():
     dp.callback_query.register(admin_unblock, lambda c: c.data == "admin_unblock")
     dp.callback_query.register(admin_remove_sub, lambda c: c.data == "admin_remove_sub")
     dp.callback_query.register(admin_cancel, lambda c: c.data == "admin_cancel")
+    return dp
 
+
+async def run_bot_api():
+    global bot
+    bot = Bot(token=BOT_TOKEN)
+    dp = build_dispatcher()
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-
     await dp.start_polling(bot)
+
+
+async def run_worker():
+    await on_startup()
+    try:
+        await worker_loop()
+    finally:
+        await on_shutdown()
+
+
+async def run_scheduler():
+    global bot, background_tasks
+    bot = Bot(token=BOT_TOKEN)
+    await on_startup()
+    background_tasks = [
+        asyncio.create_task(notification_loop()),
+        asyncio.create_task(monitor_trigger_loop()),
+    ]
+    try:
+        await asyncio.gather(*background_tasks)
+    finally:
+        await on_shutdown()
+
+
+async def main():
+    global redis_client, bot
+    validate_environment()
+    redis_client = await redis.from_url(REDIS_URL)
+    await ensure_subscribers_key()
+    if ROLE == "bot-api":
+        await run_bot_api()
+    elif ROLE == "worker":
+        await run_worker()
+    elif ROLE == "scheduler":
+        await run_scheduler()
+    else:
+        raise ValueError(f"Неизвестная роль SHADOWBOT_ROLE={ROLE!r}")
 
 
 if __name__ == "__main__":

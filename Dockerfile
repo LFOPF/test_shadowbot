@@ -19,6 +19,6 @@ RUN pip install --no-cache-dir --upgrade pip \
     && playwright install chromium-headless-shell
 
 COPY glossary.txt .
-COPY bot.py .
+COPY *.py .
 
 CMD ["python", "bot.py"]
