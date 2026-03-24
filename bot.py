@@ -171,6 +171,52 @@ class TelegraphRetriableError(Exception):
     """Temporary Telegraph error that should trigger retry."""
 
 
+class ChapterNonRetriableError(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class ChapterRetriableError(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def is_retriable_processing_error(exc: Exception) -> bool:
+    return isinstance(exc, (
+        aiohttp.ClientError,
+        ConnectionError,
+        asyncio.TimeoutError,
+        TelegraphRetriableError,
+        OSError,
+    ))
+
+
+async def run_retriable_step(
+    *,
+    step_name: str,
+    func,
+    attempts: int = 3,
+    base_delay: float = 1.0,
+):
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func()
+        except Exception as exc:
+            if not is_retriable_processing_error(exc) or attempt >= attempts:
+                raise
+            delay = min(base_delay * (2 ** (attempt - 1)), 8.0)
+            logger.warning(
+                "Временная ошибка на шаге %s (попытка %s/%s): %s",
+                step_name,
+                attempt,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(delay)
+
+
 def _is_prompt_file_ready(path: str) -> bool:
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -1056,7 +1102,7 @@ async def wait_for_ready_translation(chapter_id: str, timeout: int = TRANSLATION
         if cache.get("telegraph_url"):
             return cache["telegraph_url"]
 
-        if cache.get("status") == "failed":
+        if cache.get("status") in {"failed", "retryable_error"}:
             return None
 
         await asyncio.sleep(TRANSLATION_WAIT_STEP)
@@ -1919,13 +1965,6 @@ async def translate_title(title: str) -> str:
             return clean_title_for_telegraph(source_title)
 
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=5, max=120),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=before_sleep_log(logger, logging.ERROR),
-)
 async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str], bool]:
     cid = ch["id"]
     title = ch["title"]
@@ -1976,33 +2015,40 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
         if not original_text:
             try:
-                parsed_page = await fetch_chapter_page_data(source_url)
-                if not parsed_page.valid_title or not parsed_page.valid_body:
-                    logger.warning(
-                        "Глава %s отклонена при загрузке: title_source=%s body_source=%s reasons=%s",
-                        cid,
-                        parsed_page.title_source,
-                        parsed_page.body_source,
-                        ",".join(parsed_page.reasons),
-                    )
-                    await set_chapter_status(cid, "failed", "fetch_failed")
-                    await save_translation_error(cid, "fetch_failed")
-                    return None, False
-                if parsed_page.chapter_number != int(cid):
-                    logger.warning(
-                        "Глава %s отклонена: номер в заголовке %s не совпадает",
-                        cid,
-                        parsed_page.chapter_number,
-                    )
-                    await set_chapter_status(cid, "failed", "fetch_failed")
-                    await save_translation_error(cid, "fetch_failed")
-                    return None, False
-                original_text = parsed_page.body
-            except Exception:
-                logger.exception(f"Ошибка загрузки главы {cid}")
-                await set_chapter_status(cid, "failed", "fetch_failed")
-                await save_translation_error(cid, "fetch_failed")
-                return None, False
+                parsed_page = await run_retriable_step(
+                    step_name=f"fetch_chapter_page_data:{cid}",
+                    func=lambda: fetch_chapter_page_data(source_url),
+                    attempts=3,
+                )
+            except Exception as e:
+                if is_retriable_processing_error(e):
+                    raise ChapterRetriableError("fetch_temporary_error") from e
+                raise
+
+            if not parsed_page.valid_title:
+                logger.warning(
+                    "Глава %s отклонена: invalid_title title_source=%s reasons=%s",
+                    cid,
+                    parsed_page.title_source,
+                    ",".join(parsed_page.reasons),
+                )
+                raise ChapterNonRetriableError("invalid_title")
+            if not parsed_page.valid_body:
+                logger.warning(
+                    "Глава %s отклонена: invalid_body body_source=%s reasons=%s",
+                    cid,
+                    parsed_page.body_source,
+                    ",".join(parsed_page.reasons),
+                )
+                raise ChapterNonRetriableError("invalid_body")
+            if parsed_page.chapter_number != int(cid):
+                logger.warning(
+                    "Глава %s отклонена: номер в заголовке %s не совпадает",
+                    cid,
+                    parsed_page.chapter_number,
+                )
+                raise ChapterNonRetriableError("chapter_mismatch")
+            original_text = parsed_page.body
             await save_chapter_original_text(cid, original_text)
 
         translation_signature = build_translation_signature(original_text)
@@ -2017,16 +2063,38 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
 
         translated_text = await get_chapter_translated_text(cid)
         if not translated_text:
-            translated_text = await translate_text(original_text)
+            try:
+                translated_text = await run_retriable_step(
+                    step_name=f"translate_text:{cid}",
+                    func=lambda: translate_text(original_text),
+                    attempts=2,
+                )
+            except Exception as e:
+                if is_retriable_processing_error(e):
+                    raise ChapterRetriableError("translate_temporary_error") from e
+                raise ChapterNonRetriableError("translate_logic_error") from e
+            if not translated_text or not translated_text.strip():
+                raise ChapterNonRetriableError("empty_translation")
             await save_chapter_translated_text(cid, translated_text)
 
         translated_title = cache.get("translated_title") or await get_cached_title(cid)
         if translated_title and re.search(r"[А-Яа-яЁё]", translated_title):
             translated_title_clean = clean_title_for_telegraph(translated_title)
         else:
-            translated_title_clean = await translate_title(title)
+            try:
+                translated_title_clean = await run_retriable_step(
+                    step_name=f"translate_title:{cid}",
+                    func=lambda: translate_title(title),
+                    attempts=2,
+                )
+            except Exception as e:
+                if is_retriable_processing_error(e):
+                    raise ChapterRetriableError("title_temporary_error") from e
+                raise ChapterNonRetriableError("invalid_title") from e
             if not translated_title_clean:
                 translated_title_clean = clean_title_for_telegraph(title)
+        if not translated_title_clean or not translated_title_clean.strip():
+            raise ChapterNonRetriableError("invalid_title")
 
         await save_cached_title(cid, translated_title_clean)
         await save_chapter_cache(cid, {"translated_title": translated_title_clean})
@@ -2037,7 +2105,16 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
             return url, True
 
         html = text_to_html(translated_text)
-        new_url = await create_telegraph_page(title=translated_title_clean, content_html=html)
+        try:
+            new_url = await run_retriable_step(
+                step_name=f"create_telegraph_page:{cid}",
+                func=lambda: create_telegraph_page(title=translated_title_clean, content_html=html),
+                attempts=3,
+            )
+        except Exception as e:
+            if is_retriable_processing_error(e):
+                raise ChapterRetriableError("telegraph_temporary_error") from e
+            raise
 
         if new_url:
             await save_telegraph_url(cid, new_url)
@@ -2046,15 +2123,27 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
             return new_url, True
 
         logger.error(f"Не удалось создать Telegraph для главы {cid}")
-        await set_chapter_status(cid, "failed", "telegraph_failed")
-        await save_translation_error(cid, "telegraph_failed")
-        return None, False
+        raise ChapterRetriableError("telegraph_failed")
 
+    except ChapterNonRetriableError as e:
+        logger.warning("process_chapter_translation non-retriable for %s: %s", cid, e.code)
+        await set_chapter_status(cid, "failed", e.code)
+        await save_translation_error(cid, e.code)
+        return None, False
+    except ChapterRetriableError as e:
+        logger.warning("process_chapter_translation retriable for %s: %s", cid, e.code)
+        await set_chapter_status(cid, "retryable_error", e.code)
+        await save_translation_error(cid, e.code)
+        return None, False
     except Exception as e:
         logger.exception(f"process_chapter_translation error for {cid}: {e}")
-        await set_chapter_status(cid, "failed", "unexpected_error")
-        await save_translation_error(cid, "unexpected_error")
-        raise
+        if is_retriable_processing_error(e):
+            await set_chapter_status(cid, "retryable_error", "temporary_error")
+            await save_translation_error(cid, "temporary_error")
+        else:
+            await set_chapter_status(cid, "failed", "unexpected_error")
+            await save_translation_error(cid, "unexpected_error")
+        return None, False
 
     finally:
         await release_translation_lock_handle(chapter_lock)
