@@ -68,6 +68,7 @@ MIN_CHAPTER_BODY_LENGTH = int(os.getenv("MIN_CHAPTER_BODY_LENGTH", "400"))
 DUPLICATE_BODY_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_BODY_SIMILARITY_THRESHOLD", "0.97"))
 CHAPTER_TITLE_PATTERN = re.compile(r"^\s*Chapter\s+(\d{1,6})(?:\s*:\s*.+)?\s*$", re.IGNORECASE)
 CHAPTER_LINK_PATTERN = re.compile(rf"/chapters/{NOVEL_ID}/(\d+)\.html", re.IGNORECASE)
+WINDOW_DATA_PATTERN = re.compile(r"window\.__DATA__\s*=\s*(\{.*?\})\s*;</script>", re.IGNORECASE | re.DOTALL)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1244,40 +1245,121 @@ async def fetch_chapter_text(url: str) -> str:
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, 'html.parser')
-    chapters = []
-    for a in soup.find_all('a', href=True):
-        text = a.get_text(strip=True)
-        href = a['href']
-        link = 'https://ranobes.net' + href if not href.startswith('http') else href
-        if NOVEL_ID not in link:
-            continue
+    chapters: List[Dict[str, str]] = []
+    seen_ids: set[str] = set()
+    diagnostics: List[str] = []
+    window_data_found = False
 
-        parsed_url = urlparse(link)
-        chapter_match = CHAPTER_LINK_PATTERN.search(parsed_url.path)
-        if not chapter_match:
-            continue
+    data_match = WINDOW_DATA_PATTERN.search(html)
+    if data_match:
+        window_data_found = True
+        try:
+            payload = json.loads(data_match.group(1))
+            payload_chapters = payload.get("chapters", []) if isinstance(payload, dict) else []
+            diagnostics.append(f"window.__DATA__.chapters={len(payload_chapters)}")
+            for item in payload_chapters:
+                if not isinstance(item, dict):
+                    continue
+                raw_title = (item.get("title") or "").strip()
+                chapter_number = extract_chapter_number_from_title(raw_title)
+                link = (item.get("link") or "").strip()
+                source_id = str(item.get("id", "")).strip()
+                if chapter_number is None or not link:
+                    continue
+                cid = str(chapter_number)
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                chapters.append({
+                    'id': cid,
+                    'source_id': source_id,
+                    'raw_title': raw_title,
+                    'title': clean_title(raw_title),
+                    'link': link if link.startswith('http') else f"https://ranobes.net{link}"
+                })
+        except json.JSONDecodeError:
+            diagnostics.append("window.__DATA__ json decode failed")
+        except Exception as e:
+            diagnostics.append(f"window.__DATA__ parse error: {e}")
+    else:
+        diagnostics.append("window.__DATA__ not found")
 
-        if not is_valid_chapter_title(text):
-            continue
+    if not chapters:
+        fallback_selectors = (
+            'a[rel="chapter"]',
+            'a.chapter-item',
+            'a.chapter-item.txt-dec',
+        )
+        for selector in fallback_selectors:
+            matched = soup.select(selector)
+            diagnostics.append(f"fallback {selector}={len(matched)}")
+            for a in matched:
+                raw_title = a.get_text(" ", strip=True)
+                chapter_number = extract_chapter_number_from_title(raw_title)
+                if chapter_number is None:
+                    title_node = a.select_one('.title')
+                    if title_node:
+                        raw_title = title_node.get_text(" ", strip=True)
+                        chapter_number = extract_chapter_number_from_title(raw_title)
+                href = (a.get('href') or "").strip()
+                if chapter_number is None or not href:
+                    continue
+                link = href if href.startswith('http') else f"https://ranobes.net{href}"
+                if NOVEL_ID not in link:
+                    continue
+                cid = str(chapter_number)
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                parsed_url = urlparse(link)
+                source_match = re.search(r"/(\d+)\.html$", parsed_url.path)
+                chapters.append({
+                    'id': cid,
+                    'source_id': source_match.group(1) if source_match else "",
+                    'raw_title': raw_title,
+                    'title': clean_title(raw_title),
+                    'link': link
+                })
 
-        cid = chapter_match.group(1)
-        title_number = extract_chapter_number_from_title(text)
-        if title_number is None or int(cid) != title_number:
-            logger.warning("Пропущена запись из списка глав из-за mismatch id/title: id=%s title=%r", cid, text)
-            continue
+    if not chapters:
+        legacy_count = 0
+        for a in soup.find_all('a', href=True):
+            href = (a.get('href') or "").strip()
+            if not href:
+                continue
+            link = href if href.startswith('http') else f"https://ranobes.net{href}"
+            parsed_url = urlparse(link)
+            chapter_match = CHAPTER_LINK_PATTERN.search(parsed_url.path)
+            if not chapter_match:
+                continue
+            legacy_count += 1
+            raw_title = a.get_text(" ", strip=True)
+            chapter_number = extract_chapter_number_from_title(raw_title)
+            if chapter_number is None:
+                continue
+            cid = str(chapter_number)
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            chapters.append({
+                'id': cid,
+                'source_id': chapter_match.group(1),
+                'raw_title': raw_title,
+                'title': clean_title(raw_title),
+                'link': link
+            })
+        diagnostics.append(f"legacy /chapters links={legacy_count}")
 
-        chapters.append({
-            'id': cid,
-            'raw_title': text,
-            'title': clean_title(text),
-            'link': link
-        })
     chapters.sort(key=lambda x: int(x['id']), reverse=True)
 
     if chapters:
         logger.info(f"Найдено глав: {len(chapters)} | Самая новая: {chapters[0]['id']} — {chapters[0]['raw_title']!r}")
     else:
-        logger.error("Не найдено ни одной главы — структура сайта изменилась?")
+        logger.error(
+            "Не найдено ни одной главы. diagnostics=%s | window_data_found=%s",
+            "; ".join(diagnostics),
+            window_data_found,
+        )
     return chapters
 
 

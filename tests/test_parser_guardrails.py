@@ -1,6 +1,7 @@
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
+from pathlib import Path
 
 os.environ.setdefault('BOT_TOKEN', 'test')
 os.environ.setdefault('OPENROUTER_API_KEY', 'test')
@@ -115,6 +116,30 @@ class ParserGuardrailsTests(unittest.IsolatedAsyncioTestCase):
         chapters = bot.parse_chapters(html)
         self.assertEqual(len(chapters), 1)
         self.assertEqual(chapters[0]['id'], '2898')
+
+    def test_parse_chapters_from_window_data(self):
+        fixture = Path(__file__).with_name("fixtures") / "Shadow Slave _ Chapters.html"
+        html = fixture.read_text(encoding="utf-8")
+
+        chapters = bot.parse_chapters(html)
+
+        self.assertTrue(chapters)
+        self.assertEqual(chapters[0]["id"], "2898")
+        self.assertEqual(
+            chapters[0]["link"],
+            "https://ranobes.net/shadow-slave-v741610-1205249/3132434.html",
+        )
+        self.assertEqual(chapters[0]["source_id"], "3132434")
+
+    def test_parse_chapters_fallback_from_novel_page(self):
+        fixture = Path(__file__).with_name("fixtures") / "Shadow Slave by Guiltythree.html"
+        html = fixture.read_text(encoding="utf-8")
+
+        chapters = bot.parse_chapters(html)
+
+        self.assertTrue(chapters)
+        self.assertEqual(chapters[0]["id"], "2898")
+        self.assertEqual(chapters[0]["source_id"], "3132434")
 
     async def test_no_stale_body_fallback_when_source_url_changes(self):
         chapter = {'id': '2898', 'title': 'Chapter 2898: Malign and Destructive', 'link': 'https://example/new'}
