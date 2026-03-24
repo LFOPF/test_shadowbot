@@ -170,10 +170,6 @@ class TelegraphRetriableError(Exception):
     """Temporary Telegraph error that should trigger retry."""
 
 
-class TelegraphNonRetriableError(Exception):
-    """Permanent Telegraph error that should not trigger retry."""
-
-
 def _is_prompt_file_ready(path: str) -> bool:
     try:
         with open(path, 'r', encoding='utf-8') as f:
