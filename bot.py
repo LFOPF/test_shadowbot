@@ -165,6 +165,102 @@ class ParsedChapterPage:
     valid_body: bool
     reasons: List[str]
 
+
+class TelegraphRetriableError(Exception):
+    """Temporary Telegraph error that should trigger retry."""
+
+
+def _is_prompt_file_ready(path: str) -> bool:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return bool(f.read().strip())
+    except Exception:
+        return False
+
+
+async def run_startup_checks() -> None:
+    required_prompt_files = [
+        ("system_prompt", SYSTEM_PROMPT_PATH),
+        ("user_prompt", USER_PROMPT_PATH),
+    ]
+
+    for label, path in required_prompt_files:
+        if not _is_prompt_file_ready(path):
+            raise RuntimeError(f"startup_check_failed: {label}_invalid path={path}")
+
+    glossary_path = os.path.join(PROMPTS_DIR, "glossary.txt")
+    try:
+        with open(glossary_path, 'r', encoding='utf-8') as glossary_file:
+            glossary_file.read(1)
+    except Exception as exc:
+        raise RuntimeError(f"startup_check_failed: glossary_unreadable path={glossary_path}") from exc
+
+    await redis_client.ping()
+    logger.info("startup_check_passed")
+
+
+def _is_retriable_telegra_ph_status(status: int) -> bool:
+    return status in {408, 425, 429, 500, 502, 503, 504}
+
+
+@retry(**RETRY_WEB)
+async def _search_chapter_in_page_window(chapter_number: int, left: int, right: int) -> Optional[Dict[str, str]]:
+    while left <= right:
+        mid = (left + right) // 2
+        html = await fetch_html(get_page_url(mid))
+        if not html:
+            right = mid - 1
+            continue
+
+        chapters = parse_chapters(html)
+        if not chapters:
+            right = mid - 1
+            continue
+
+        first_id = int(chapters[0]['id'])
+        last_id = int(chapters[-1]['id'])
+
+        if chapter_number > first_id:
+            right = mid - 1
+        elif chapter_number < last_id:
+            left = mid + 1
+        else:
+            for ch in chapters:
+                if int(ch['id']) == chapter_number:
+                    return ch
+            return None
+
+        await asyncio.sleep(0.5)
+
+    return None
+
+
+async def _find_chapter_with_extended_range(chapter_number: int) -> Optional[Dict[str, str]]:
+    window_size = MAX_PAGES
+    max_windows = 3
+
+    for window_idx in range(max_windows):
+        left = MAX_PAGES + 1 + window_idx * window_size
+        right = left + window_size - 1
+
+        found = await _search_chapter_in_page_window(chapter_number, left, right)
+        if found:
+            return found
+
+        edge_html = await fetch_html(get_page_url(right))
+        if not edge_html:
+            break
+
+        edge_chapters = parse_chapters(edge_html)
+        if not edge_chapters:
+            break
+
+        oldest_on_edge_page = int(edge_chapters[-1]['id'])
+        if chapter_number >= oldest_on_edge_page:
+            break
+
+    return None
+
 # ======================== БРАУЗЕР + IDLE-ТАЙМЕР ========================
 async def launch_browser():
     global playwright_instance, browser, browser_context
@@ -616,7 +712,11 @@ async def request_translation_completion(
     ) as resp:
         if resp.status == 200:
             data = await resp.json()
-            content = data["choices"][0]["message"]["content"]
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise ValueError(f"{stage_name}: некорректный ответ модели") from exc
+
             cleaned = sanitize_model_output(content or "")
             if not cleaned:
                 raise ValueError(f"{stage_name}: пустой ответ модели")
@@ -1457,31 +1557,29 @@ async def find_chapter_by_number(chapter_number: int) -> Optional[Dict[str, str]
 
 @retry(**RETRY_WEB)
 async def find_chapter_by_number_binary(chapter_number: int) -> Optional[Dict[str, str]]:
-    left, right = 1, MAX_PAGES
-    while left <= right:
-        mid = (left + right) // 2
-        url = get_page_url(mid)
-        html = await fetch_html(url)
-        if not html:
-            right = mid - 1
-            continue
-        chapters = parse_chapters(html)
-        if not chapters:
-            right = mid - 1
-            continue
-        first_id = int(chapters[0]['id'])
-        last_id = int(chapters[-1]['id'])
-        if chapter_number > first_id:
-            right = mid - 1
-        elif chapter_number < last_id:
-            left = mid + 1
-        else:
-            for ch in chapters:
-                if int(ch['id']) == chapter_number:
-                    return ch
-            return None
-        await asyncio.sleep(0.5)
-    return None
+    found = await _search_chapter_in_page_window(chapter_number, 1, MAX_PAGES)
+    if found:
+        return found
+
+    max_page_html = await fetch_html(get_page_url(MAX_PAGES))
+    if not max_page_html:
+        return None
+
+    max_page_chapters = parse_chapters(max_page_html)
+    if not max_page_chapters:
+        return None
+
+    oldest_in_limited_range = int(max_page_chapters[-1]['id'])
+    if chapter_number >= oldest_in_limited_range:
+        return None
+
+    logger.warning(
+        "page_limit_reached chapter=%s max_pages=%s oldest_in_limit=%s",
+        chapter_number,
+        MAX_PAGES,
+        oldest_in_limited_range,
+    )
+    return await _find_chapter_with_extended_range(chapter_number)
 
 
 
@@ -1585,7 +1683,12 @@ async def translate_text(text: str) -> str:
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_fixed(5) + wait_exponential(min=2, max=60),
-    retry=retry_if_exception_type((aiohttp.ClientError, ConnectionError, Exception)),
+    retry=retry_if_exception_type((
+        aiohttp.ClientError,
+        ConnectionError,
+        asyncio.TimeoutError,
+        TelegraphRetriableError,
+    )),
 )
 async def create_telegraph_page(
     title: str,
@@ -1623,26 +1726,42 @@ async def create_telegraph_page(
     }
 
     for attempt in range(2):
+        session = await get_http_session()
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
         try:
-            session = await get_http_session()
-            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
             async with session.post("https://api.telegra.ph/createPage", json=payload, timeout=timeout) as resp:
-                    data = await resp.json()
-                    if data.get("ok"):
-                        url = data["result"]["url"]
-                        logger.info(f"Создана страница Telegraph: {url}")
-                        return url
-                    else:
-                        error = data.get('error')
-                        logger.error(f"Telegraph error: {data}")
-                        if error == 'TITLE_TOO_LONG' and attempt == 0:
-                            clean_title_text = clean_title_text[:150] + "..."
-                            payload["title"] = clean_title_text
-                            continue
-                        return None
-        except Exception as e:
-            logger.exception(f"Ошибка при создании страницы Telegraph: {e}")
+                if _is_retriable_telegra_ph_status(resp.status):
+                    logger.warning("Telegraph retriable_error status=%s", resp.status)
+                    raise TelegraphRetriableError(f"status={resp.status}")
+
+                data = await resp.json()
+                if data.get("ok"):
+                    url = data["result"]["url"]
+                    logger.info(f"Создана страница Telegraph: {url}")
+                    return url
+
+                error = data.get('error')
+                if error == 'TITLE_TOO_LONG' and attempt == 0:
+                    clean_title_text = clean_title_text[:150] + "..."
+                    payload["title"] = clean_title_text
+                    logger.info("Telegraph non_retriable_error type=TITLE_TOO_LONG action=trim_title")
+                    continue
+
+                if error in {'PATH_NUM_NOT_FOUND', 'CONTENT_FORMAT_INVALID', 'ACCESS_TOKEN_INVALID'}:
+                    logger.error("Telegraph non_retriable_error type=%s", error)
+                    return None
+
+                logger.warning("Telegraph retriable_error type=%s", error)
+                raise TelegraphRetriableError(f"error={error}")
+        except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError) as exc:
+            logger.warning("Telegraph retriable_error type=network error=%s", exc)
+            raise
+        except TelegraphRetriableError:
+            raise
+        except Exception as exc:
+            logger.error("Telegraph non_retriable_error type=unexpected error=%s", exc)
             return None
+
     return None
 
 
@@ -2553,14 +2672,12 @@ async def monitor(check_once=False):
 
 async def on_startup():
     logger.info("Бот запущен. Загружаем глоссарий и запускаем мониторинг...")
-   
-    try:
-        await load_glossary_to_redis(force=False)
-        terms = await get_glossary_terms(force_refresh=True)
-        logger.info(f"Глоссарий в Redis: {len(terms)} терминов")
-    except Exception as e:
-        logger.error(f"Не удалось загрузить/проверить глоссарий: {e}")
-    
+
+    await run_startup_checks()
+    await load_glossary_to_redis(force=False)
+    terms = await get_glossary_terms(force_refresh=True)
+    logger.info(f"Глоссарий в Redis: {len(terms)} терминов")
+
     asyncio.create_task(monitor())
     logger.info("Мониторинг запущен; браузер будет стартовать лениво по запросу")
 
