@@ -237,8 +237,15 @@ def _is_truthy_env(value: Optional[str], default: bool = True) -> bool:
     return default
 
 
+PREFER_HTTP_FIRST_DEFAULT = _is_truthy_env(os.getenv("PREFER_HTTP_FIRST"), default=True)
+
+
 def monitor_strict_order_enabled() -> bool:
     return _is_truthy_env(os.getenv("MONITOR_STRICT_ORDER"), default=True)
+
+
+def prefer_http_first_enabled() -> bool:
+    return _is_truthy_env(os.getenv("PREFER_HTTP_FIRST"), default=PREFER_HTTP_FIRST_DEFAULT)
 
 
 async def run_startup_checks() -> None:
@@ -1370,6 +1377,42 @@ async def save_user_bookmark(user_id: int, chapter_id: str):
 
 @retry(**RETRY_WEB)
 async def fetch_html(url: str) -> str:
+    if prefer_http_first_enabled():
+        try:
+            html = await fetch_html_http(url)
+            chapters = parse_chapters(html)
+            if chapters and _chapters_payload_complete(chapters):
+                logger.info("fetch_html path=http_first url=%s chapters=%s", url, len(chapters))
+                return html
+            logger.info(
+                "fetch_html path=playwright_fallback url=%s reason=incomplete_or_empty chapters=%s",
+                url,
+                len(chapters),
+            )
+        except Exception as e:
+            logger.warning("fetch_html http_first failed url=%s err=%s", url, e)
+            logger.info("fetch_html path=playwright_fallback url=%s reason=http_error", url)
+    else:
+        logger.info("fetch_html path=playwright_only url=%s reason=prefer_http_first_disabled", url)
+
+    return await fetch_html_playwright(url)
+
+
+async def fetch_html_http(url: str) -> str:
+    session = await get_http_session()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    }
+    async with session.get(url, headers=headers, allow_redirects=True) as response:
+        response.raise_for_status()
+        return await response.text()
+
+
+async def fetch_html_playwright(url: str) -> str:
     async with playwright_semaphore:
         page = await create_page()
         try:
@@ -1390,6 +1433,31 @@ async def fetch_html(url: str) -> str:
 
 @retry(**RETRY_WEB)
 async def fetch_chapter_page_data(url: str) -> ParsedChapterPage:
+    if prefer_http_first_enabled():
+        try:
+            html = await fetch_html_http(url)
+            parsed = parse_chapter_page_html(html)
+            if parsed.valid_title and parsed.valid_body:
+                logger.info("fetch_chapter_page_data path=http_first url=%s", url)
+                return parsed
+            logger.info(
+                "fetch_chapter_page_data path=playwright_fallback url=%s reasons=%s",
+                url,
+                ",".join(parsed.reasons) if parsed.reasons else "invalid_or_incomplete",
+            )
+        except Exception as e:
+            logger.warning("fetch_chapter_page_data http_first failed url=%s err=%s", url, e)
+            logger.info("fetch_chapter_page_data path=playwright_fallback url=%s reason=http_error", url)
+    else:
+        logger.info(
+            "fetch_chapter_page_data path=playwright_only url=%s reason=prefer_http_first_disabled",
+            url,
+        )
+
+    return await fetch_chapter_page_data_playwright(url)
+
+
+async def fetch_chapter_page_data_playwright(url: str) -> ParsedChapterPage:
     async with playwright_semaphore:
         page = await create_page()
         try:
@@ -1403,6 +1471,16 @@ async def fetch_chapter_page_data(url: str) -> ParsedChapterPage:
         finally:
             if not page.is_closed():
                 await page.close()
+
+
+def _chapters_payload_complete(chapters: List[Dict[str, str]]) -> bool:
+    if not chapters:
+        return False
+    required_fields = ("id", "title", "link")
+    for chapter in chapters:
+        if any(not chapter.get(field) for field in required_fields):
+            return False
+    return True
 
 
 @retry(**RETRY_WEB)
