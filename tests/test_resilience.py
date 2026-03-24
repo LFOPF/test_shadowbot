@@ -1,5 +1,7 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
@@ -101,10 +103,39 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await bot.run_startup_checks()
 
+    async def test_startup_check_glossary_missing_has_clear_path(self):
+        missing_path = '/tmp/definitely_missing_glossary_test.txt'
+        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, True]), \
+             patch.object(bot, 'GLOSSARY_PATH', missing_path):
+            with self.assertRaises(RuntimeError) as cm:
+                await bot.run_startup_checks()
+        self.assertIn(missing_path, str(cm.exception))
+
     async def test_startup_check_fails_when_redis_unavailable(self):
         bot.redis_client.ping_error = ConnectionError('redis down')
         with self.assertRaises(ConnectionError):
             await bot.run_startup_checks()
+
+    async def test_glossary_load_uses_absolute_path_independent_of_cwd(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            glossary_file = Path(tmpdir) / 'glossary.txt'
+            glossary_file.write_text('Sunny=Санни\n', encoding='utf-8')
+            current = os.getcwd()
+            os.chdir('/')
+            try:
+                with patch.object(bot, 'GLOSSARY_PATH', str(glossary_file)):
+                    await bot.load_glossary_to_redis(force=True)
+            finally:
+                os.chdir(current)
+
+        terms = await bot.redis_client.hgetall('glossary:terms')
+        self.assertIn(b'Sunny', terms)
+        self.assertEqual(terms[b'Sunny'].decode('utf-8'), 'Санни')
+
+    async def test_glossary_load_force_false_preserves_existing_cache_logic(self):
+        await bot.redis_client.hset('glossary:terms', mapping={'Existing': 'Существующий'})
+        with patch('builtins.open', side_effect=AssertionError('must not read file when cache exists')):
+            await bot.load_glossary_to_redis(force=False)
 
     async def test_create_telegraph_page_retries_on_temporary_error(self):
         session = FakeSession([

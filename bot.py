@@ -126,6 +126,7 @@ _glossary_cache_lock = asyncio.Lock()
 PROMPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt.txt")
 USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt.txt")
+GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
 TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
 
@@ -225,6 +226,21 @@ def _is_prompt_file_ready(path: str) -> bool:
         return False
 
 
+def _is_truthy_env(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def monitor_strict_order_enabled() -> bool:
+    return _is_truthy_env(os.getenv("MONITOR_STRICT_ORDER"), default=True)
+
+
 async def run_startup_checks() -> None:
     required_prompt_files = [
         ("system_prompt", SYSTEM_PROMPT_PATH),
@@ -235,12 +251,18 @@ async def run_startup_checks() -> None:
         if not _is_prompt_file_ready(path):
             raise RuntimeError(f"startup_check_failed: {label}_invalid path={path}")
 
-    glossary_path = os.path.join(PROMPTS_DIR, "glossary.txt")
     try:
-        with open(glossary_path, 'r', encoding='utf-8') as glossary_file:
-            glossary_file.read(1)
+        with open(GLOSSARY_PATH, 'r', encoding='utf-8') as glossary_file:
+            first_char = glossary_file.read(1)
+            if not first_char:
+                raise RuntimeError(f"startup_check_failed: glossary_empty path={GLOSSARY_PATH}")
+            glossary_file.seek(0)
+            if not glossary_file.read().strip():
+                raise RuntimeError(f"startup_check_failed: glossary_empty path={GLOSSARY_PATH}")
+    except RuntimeError:
+        raise
     except Exception as exc:
-        raise RuntimeError(f"startup_check_failed: glossary_unreadable path={glossary_path}") from exc
+        raise RuntimeError(f"startup_check_failed: glossary_unreadable path={GLOSSARY_PATH}") from exc
 
     await redis_client.ping()
     logger.info("startup_check_passed")
@@ -614,13 +636,13 @@ async def load_glossary_to_redis(force: bool = False):
     
     try:
         terms = {}
-        with open('glossary.txt', 'r', encoding='utf-8') as f:
+        with open(GLOSSARY_PATH, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
                 if '=' not in line:
-                    logger.warning(f"glossary.txt:{line_num} — строка без '='")
+                    logger.warning("%s:%s — строка без '='", GLOSSARY_PATH, line_num)
                     continue
                 
                 key, value = line.split('=', 1)
@@ -631,7 +653,7 @@ async def load_glossary_to_redis(force: bool = False):
                     terms[key] = value
         
         if not terms:
-            logger.warning("Глоссарий пустой или невалидный")
+            logger.warning("Глоссарий пустой или невалидный: %s", GLOSSARY_PATH)
             return
         
         # Сортируем
@@ -642,9 +664,9 @@ async def load_glossary_to_redis(force: bool = False):
         logger.info(f"Глоссарий успешно загружен в Redis → {len(sorted_terms)} терминов")
         
     except FileNotFoundError:
-        logger.error("Файл glossary.txt не найден")
+        logger.error("Файл глоссария не найден: %s", GLOSSARY_PATH)
     except Exception as e:
-        logger.exception("Ошибка при загрузке глоссария в Redis")
+        logger.exception("Ошибка при загрузке глоссария в Redis из %s", GLOSSARY_PATH)
 
 
 async def get_glossary_terms(force_refresh: bool = False) -> Dict[str, str]:
@@ -2770,6 +2792,26 @@ async def validate_monitor_candidate(ch: Dict[str, str], previous_latest_id: int
     return True, "ok"
 
 
+def _is_monitor_temporary_error(error_code: str) -> bool:
+    return error_code in {
+        "fetch_temporary_error",
+        "translate_temporary_error",
+        "title_temporary_error",
+        "temporary_error",
+        "validate_temporary_error",
+    }
+
+
+def _is_monitor_telegraph_error(error_code: str) -> bool:
+    return error_code in {"telegraph_temporary_error", "telegraph_failed"}
+
+
+async def _mark_monitor_quarantine(chapter_id: str, reason: str) -> None:
+    await set_chapter_status(chapter_id, "quarantined", reason)
+    await save_translation_error(chapter_id, reason)
+    await save_chapter_cache(chapter_id, {"monitor_state": "quarantined"})
+
+
 async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
@@ -2786,41 +2828,95 @@ async def monitor(check_once=False):
 
                 if new_chapters:
                     logger.info(f"Новых глав: {len(new_chapters)}")
+                    strict_order = monitor_strict_order_enabled()
+                    logger.info("monitor_policy strict_order=%s", strict_order)
                     translated_urls = []
                     failed = []
-                    last_successful_id = last_int
-                    stop_on_first_failure = False
+                    quarantined = []
+                    temporary_failed = []
+                    telegraph_failed = []
+                    success_ids = set()
+                    order_blocked = False
 
                     for i, ch in enumerate(new_chapters):
-                        if stop_on_first_failure:
-                            failed.append(ch['id'])
+                        cid = ch['id']
+                        chapter_cache = await get_chapter_cache(cid)
+                        if chapter_cache.get("status") == "ready" and chapter_cache.get("monitor_published") == "1":
+                            success_ids.add(int(cid))
+                            logger.info(
+                                "monitor_decision=already_published chapter=%s url=%s",
+                                cid, ch["link"],
+                            )
                             continue
                         try:
-                            is_valid, reason = await validate_monitor_candidate(ch, last_successful_id)
+                            if strict_order and order_blocked:
+                                await save_chapter_cache(cid, {"monitor_state": "deferred_order"})
+                                logger.info(
+                                    "monitor_decision=deferred chapter=%s reason=blocked_by_previous_failure",
+                                    cid,
+                                )
+                                failed.append(cid)
+                                continue
+
+                            previous_for_validation = last_int if strict_order else max(last_int, int(cid) - 1)
+                            is_valid, reason = await validate_monitor_candidate(ch, previous_for_validation)
                             if not is_valid:
                                 logger.warning(
                                     "monitor_decision=quarantined chapter=%s reason=%s url=%s",
-                                    ch["id"], reason, ch["link"],
+                                    cid, reason, ch["link"],
                                 )
-                                failed.append(ch['id'])
-                                stop_on_first_failure = True
+                                await _mark_monitor_quarantine(cid, reason)
+                                failed.append(cid)
+                                quarantined.append(cid)
+                                order_blocked = order_blocked or strict_order
                                 continue
 
                             url, success = await process_chapter_translation(ch)
                             if success and url:
-                                logger.info("monitor_decision=published chapter=%s url=%s", ch["id"], ch["link"])
-                                translated_urls.append((ch['id'], url))
-                                last_successful_id = int(ch['id'])
+                                logger.info("monitor_decision=published chapter=%s url=%s", cid, ch["link"])
+                                success_ids.add(int(cid))
+                                if chapter_cache.get("monitor_published") != "1":
+                                    translated_urls.append((cid, url))
+                                await save_chapter_cache(cid, {"monitor_state": "published", "monitor_published": "1"})
                             else:
-                                logger.warning("monitor_decision=skipped chapter=%s reason=translation_failed", ch["id"])
-                                failed.append(ch['id'])
-                                stop_on_first_failure = True
+                                error_code = await get_translation_error(cid) or "translation_failed"
+                                failed.append(cid)
+                                if _is_monitor_temporary_error(error_code):
+                                    temporary_failed.append(cid)
+                                    await save_chapter_cache(cid, {"monitor_state": "retry_scheduled"})
+                                    logger.warning(
+                                        "monitor_decision=retryable chapter=%s reason=%s",
+                                        cid, error_code,
+                                    )
+                                elif _is_monitor_telegraph_error(error_code):
+                                    telegraph_failed.append(cid)
+                                    await save_chapter_cache(cid, {"monitor_state": "telegraph_failed"})
+                                    logger.warning(
+                                        "monitor_decision=telegraph_failed chapter=%s reason=%s",
+                                        cid, error_code,
+                                    )
+                                else:
+                                    quarantined.append(cid)
+                                    await _mark_monitor_quarantine(cid, error_code)
+                                    logger.warning(
+                                        "monitor_decision=failed chapter=%s reason=%s",
+                                        cid, error_code,
+                                    )
+                                order_blocked = order_blocked or strict_order
                         except Exception:
-                            logger.exception(f"Ошибка главы {ch['id']}")
-                            failed.append(ch['id'])
-                            stop_on_first_failure = True
-                        if i < len(new_chapters) - 1 and not stop_on_first_failure:
+                            logger.exception(f"Ошибка главы {cid}")
+                            failed.append(cid)
+                            temporary_failed.append(cid)
+                            await set_chapter_status(cid, "retryable_error", "monitor_exception")
+                            await save_translation_error(cid, "monitor_exception")
+                            await save_chapter_cache(cid, {"monitor_state": "retry_scheduled"})
+                            order_blocked = order_blocked or strict_order
+                        if i < len(new_chapters) - 1 and (not strict_order or not order_blocked):
                             await asyncio.sleep(10)
+
+                    last_successful_id = last_int
+                    while (last_successful_id + 1) in success_ids:
+                        last_successful_id += 1
 
                     if ADMIN_ID:
                         admin_id = int(ADMIN_ID)
@@ -2832,10 +2928,18 @@ async def monitor(check_once=False):
                                 disable_web_page_preview=True
                             )
                         if failed:
-                            await bot.send_message(admin_id, f"❌ Не удалось: {', '.join(map(str, failed))}")
+                            details = []
+                            if quarantined:
+                                details.append(f"quarantine: {', '.join(map(str, quarantined))}")
+                            if temporary_failed:
+                                details.append(f"temporary: {', '.join(map(str, temporary_failed))}")
+                            if telegraph_failed:
+                                details.append(f"telegraph: {', '.join(map(str, telegraph_failed))}")
+                            suffix = "\n" + "\n".join(details) if details else ""
+                            await bot.send_message(admin_id, f"❌ Не удалось: {', '.join(map(str, failed))}{suffix}")
 
                     if last_successful_id > last_int:
-                            await save_last_chapter(str(last_successful_id))
+                        await save_last_chapter(str(last_successful_id))
 
                     for cid, url in translated_urls:
                         chapter_info = next((ch for ch in new_chapters if ch['id'] == cid), None)
