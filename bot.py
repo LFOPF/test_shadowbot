@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 import json
+import ast
 import html
 import time
 import hashlib
@@ -67,8 +68,8 @@ TRANSLATION_CACHE_VERSION = os.getenv("TRANSLATION_CACHE_VERSION", "v1")
 MIN_CHAPTER_BODY_LENGTH = int(os.getenv("MIN_CHAPTER_BODY_LENGTH", "400"))
 DUPLICATE_BODY_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_BODY_SIMILARITY_THRESHOLD", "0.97"))
 CHAPTER_TITLE_PATTERN = re.compile(r"^\s*Chapter\s+(\d{1,6})(?:\s*:\s*.+)?\s*$", re.IGNORECASE)
-CHAPTER_LINK_PATTERN = re.compile(rf"/chapters/{NOVEL_ID}/(\d+)\.html", re.IGNORECASE)
-WINDOW_DATA_PATTERN = re.compile(r"window\.__DATA__\s*=\s*(\{.*?\})\s*;</script>", re.IGNORECASE | re.DOTALL)
+CHAPTER_LINK_PATTERN = re.compile(rf"/[^/]*-{NOVEL_ID}/(\d+)\.html$", re.IGNORECASE)
+WINDOW_DATA_ASSIGN_PATTERN = re.compile(r"window\.__DATA__\s*=", re.IGNORECASE)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1250,11 +1251,13 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     diagnostics: List[str] = []
     window_data_found = False
 
-    data_match = WINDOW_DATA_PATTERN.search(html)
-    if data_match:
+    data_raw = extract_window_data_object(html)
+    if data_raw:
         window_data_found = True
         try:
-            payload = json.loads(data_match.group(1))
+            payload = parse_window_data_payload(data_raw)
+            if not isinstance(payload, dict):
+                raise ValueError("window.__DATA__ is not an object")
             payload_chapters = payload.get("chapters", []) if isinstance(payload, dict) else []
             diagnostics.append(f"window.__DATA__.chapters={len(payload_chapters)}")
             for item in payload_chapters:
@@ -1277,8 +1280,8 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
                     'title': clean_title(raw_title),
                     'link': link if link.startswith('http') else f"https://ranobes.net{link}"
                 })
-        except json.JSONDecodeError:
-            diagnostics.append("window.__DATA__ json decode failed")
+        except ValueError as e:
+            diagnostics.append(f"window.__DATA__ decode failed: {e}")
         except Exception as e:
             diagnostics.append(f"window.__DATA__ parse error: {e}")
     else:
@@ -1286,6 +1289,9 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
 
     if not chapters:
         fallback_selectors = (
+            f'.last-chapters a[href*="-{NOVEL_ID}/"][href$=".html"]',
+            f'.chapters a[href*="-{NOVEL_ID}/"][href$=".html"]',
+            f'.chapter-list a[href*="-{NOVEL_ID}/"][href$=".html"]',
             'a[rel="chapter"]',
             'a.chapter-item',
             'a.chapter-item.txt-dec',
@@ -1361,6 +1367,68 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
             window_data_found,
         )
     return chapters
+
+
+def extract_window_data_object(page_html: str) -> Optional[str]:
+    assign_match = WINDOW_DATA_ASSIGN_PATTERN.search(page_html)
+    if not assign_match:
+        return None
+
+    idx = assign_match.end()
+    while idx < len(page_html) and page_html[idx].isspace():
+        idx += 1
+    if idx >= len(page_html) or page_html[idx] != "{":
+        return None
+
+    start = idx
+    depth = 0
+    in_string: Optional[str] = None
+    escaped = False
+
+    while idx < len(page_html):
+        ch = page_html[idx]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+        else:
+            if ch in ('"', "'"):
+                in_string = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return page_html[start:idx + 1]
+        idx += 1
+    return None
+
+
+def parse_window_data_payload(raw_payload: str) -> Dict[str, Any]:
+    try:
+        return json.loads(raw_payload)
+    except json.JSONDecodeError as strict_error:
+        relaxed_payload = re.sub(r",\s*([}\]])", r"\1", raw_payload)
+        relaxed_payload = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', relaxed_payload)
+        relaxed_payload = re.sub(r"\bundefined\b", "null", relaxed_payload)
+        try:
+            return json.loads(relaxed_payload)
+        except json.JSONDecodeError:
+            python_literal = relaxed_payload
+            python_literal = re.sub(r"\btrue\b", "True", python_literal, flags=re.IGNORECASE)
+            python_literal = re.sub(r"\bfalse\b", "False", python_literal, flags=re.IGNORECASE)
+            python_literal = re.sub(r"\bnull\b", "None", python_literal, flags=re.IGNORECASE)
+            try:
+                parsed = ast.literal_eval(python_literal)
+            except Exception as relaxed_error:
+                raise ValueError(f"strict={strict_error.msg}; relaxed={relaxed_error}") from relaxed_error
+            if not isinstance(parsed, dict):
+                raise ValueError("window.__DATA__ relaxed parse did not return dict")
+            return parsed
 
 
 @retry(**RETRY_WEB)
