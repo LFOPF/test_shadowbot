@@ -109,8 +109,8 @@ class ParserGuardrailsTests(unittest.IsolatedAsyncioTestCase):
           <div class='recent-comments'>
             <a href='/shadow-slave-v741610-1205249/3123434.html#comment-id-1'>4500 is what I'm hoping for</a>
           </div>
-          <a href='/chapters/1205249/2898.html'>Chapter 2898: Malign and Destructive</a>
-          <a href='/chapters/1205249/2899.html'>lol finally</a>
+          <a href='/shadow-slave-v741610-1205249/3132434.html'>Chapter 2898: Malign and Destructive</a>
+          <a href='/shadow-slave-v741610-1205249/3132500.html'>lol finally</a>
         </body></html>
         """
         chapters = bot.parse_chapters(html)
@@ -130,6 +130,7 @@ class ParserGuardrailsTests(unittest.IsolatedAsyncioTestCase):
             "https://ranobes.net/shadow-slave-v741610-1205249/3132434.html",
         )
         self.assertEqual(chapters[0]["source_id"], "3132434")
+        self.assertNotEqual(chapters[0]["id"], chapters[0]["source_id"])
 
     def test_parse_chapters_fallback_from_novel_page(self):
         fixture = Path(__file__).with_name("fixtures") / "Shadow Slave by Guiltythree.html"
@@ -137,6 +138,22 @@ class ParserGuardrailsTests(unittest.IsolatedAsyncioTestCase):
 
         chapters = bot.parse_chapters(html)
 
+        self.assertTrue(chapters)
+        self.assertEqual(chapters[0]["id"], "2898")
+        self.assertEqual(chapters[0]["source_id"], "3132434")
+
+    def test_parse_chapters_dom_fallback_when_window_data_decode_fails(self):
+        html = """
+        <html><body>
+          <script>window.__DATA__ = {broken: [};</script>
+          <div class='last-chapters'>
+            <a href='https://ranobes.net/shadow-slave-v741610-1205249/3132434.html' class='chapter-item txt-dec' rel='chapter'>
+              <span class='title'>Chapter 2898: Malign and Destructive</span>
+            </a>
+          </div>
+        </body></html>
+        """
+        chapters = bot.parse_chapters(html)
         self.assertTrue(chapters)
         self.assertEqual(chapters[0]["id"], "2898")
         self.assertEqual(chapters[0]["source_id"], "3132434")
