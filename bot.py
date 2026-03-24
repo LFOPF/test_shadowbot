@@ -6,6 +6,7 @@ import json
 import html
 import time
 import hashlib
+from difflib import SequenceMatcher
 from typing import Optional, Set, List, Dict, Any
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -63,6 +64,10 @@ ERROR_TTL = 5 * 60
 PLAYWRIGHT_CONCURRENCY = int(os.getenv("PLAYWRIGHT_CONCURRENCY", "2"))
 GLOSSARY_CACHE_TTL = int(os.getenv("GLOSSARY_CACHE_TTL", "300"))
 TRANSLATION_CACHE_VERSION = os.getenv("TRANSLATION_CACHE_VERSION", "v1")
+MIN_CHAPTER_BODY_LENGTH = int(os.getenv("MIN_CHAPTER_BODY_LENGTH", "400"))
+DUPLICATE_BODY_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_BODY_SIMILARITY_THRESHOLD", "0.97"))
+CHAPTER_TITLE_PATTERN = re.compile(r"^\s*Chapter\s+(\d{1,6})(?:\s*:\s*.+)?\s*$", re.IGNORECASE)
+CHAPTER_LINK_PATTERN = re.compile(rf"/chapters/{NOVEL_ID}/(\d+)\.html", re.IGNORECASE)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -145,6 +150,18 @@ class ChapterSelection(StatesGroup):
 
 class AdminActions(StatesGroup):
     waiting_for_user_id = State()
+
+
+@dataclass
+class ParsedChapterPage:
+    title: str
+    title_source: str
+    body: str
+    body_source: str
+    chapter_number: Optional[int]
+    valid_title: bool
+    valid_body: bool
+    reasons: List[str]
 
 # ======================== БРАУЗЕР + IDLE-ТАЙМЕР ========================
 async def launch_browser():
@@ -343,6 +360,98 @@ def clean_title_for_telegraph(title: str) -> str:
     if len(title) > TELEGRAPH_TITLE_MAX_LENGTH:
         title = title[:TELEGRAPH_TITLE_MAX_LENGTH - 3] + "..."
     return title
+
+
+def extract_chapter_number_from_title(title: str) -> Optional[int]:
+    if not title:
+        return None
+    match = CHAPTER_TITLE_PATTERN.match(title.strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def is_valid_chapter_title(title: str) -> bool:
+    return extract_chapter_number_from_title(title) is not None
+
+
+def similarity_ratio(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def parse_chapter_page_html(html_content: str) -> ParsedChapterPage:
+    soup = BeautifulSoup(html_content, 'html.parser')
+    reasons: List[str] = []
+    title = ""
+    title_source = ""
+
+    headline = soup.select_one('h1[itemprop="headline"]')
+    if headline:
+        title = headline.get_text(" ", strip=True)
+        title_source = 'h1[itemprop="headline"]'
+    else:
+        json_ld = soup.find('script', attrs={'type': 'application/ld+json'})
+        if json_ld and json_ld.string:
+            try:
+                payload = json.loads(json_ld.string)
+                if isinstance(payload, dict):
+                    structured_title = payload.get("headline") or payload.get("name")
+                    if isinstance(structured_title, str):
+                        title = structured_title.strip()
+                        title_source = "structured_data"
+            except json.JSONDecodeError:
+                logger.debug("Невалидный JSON-LD на странице главы")
+        if not title:
+            for selector in (
+                'meta[property="og:title"]',
+                'meta[name="title"]',
+                'meta[name="description"]',
+                'meta[property="og:description"]',
+            ):
+                tag = soup.select_one(selector)
+                if tag and tag.get("content"):
+                    title = tag.get("content", "").strip()
+                    title_source = selector
+                    break
+
+    title = clean_title(title) if title else ""
+    valid_title = is_valid_chapter_title(title)
+    if not valid_title:
+        reasons.append("invalid_title")
+
+    body_source = 'div.text#arrticle'
+    body = ""
+    article = soup.select_one('div.text#arrticle')
+    if article:
+        for selector in (
+            'script', 'style', 'noscript', 'blockquote',
+            '.comments', '.comment', '#comments',
+            '.sidebar', '.rightside', '.recent-comments',
+            'header', 'footer'
+        ):
+            for node in article.select(selector):
+                node.decompose()
+        parts = [p.get_text(" ", strip=True) for p in article.find_all('p')]
+        if not parts:
+            parts = [s.strip() for s in article.stripped_strings if s.strip()]
+        body = "\n\n".join(parts).strip()
+
+    valid_body = len(body) >= MIN_CHAPTER_BODY_LENGTH
+    if not valid_body:
+        reasons.append("invalid_body")
+
+    return ParsedChapterPage(
+        title=title,
+        title_source=title_source or "missing",
+        body=body,
+        body_source=body_source if body else "missing",
+        chapter_number=extract_chapter_number_from_title(title),
+        valid_title=valid_title,
+        valid_body=valid_body,
+        reasons=reasons,
+    )
 
 async def load_glossary_to_redis(force: bool = False):
     """
@@ -1109,32 +1218,28 @@ async def fetch_html(url: str) -> str:
 
 
 @retry(**RETRY_WEB)
-async def fetch_chapter_text(url: str) -> str:
+async def fetch_chapter_page_data(url: str) -> ParsedChapterPage:
     async with playwright_semaphore:
         page = await create_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             await page.wait_for_selector('div.text#arrticle', timeout=60000)
-
-            paragraphs = await page.evaluate("""() => {
-                const c = document.querySelector('div.text#arrticle');
-                if (!c) return [];
-                return Array.from(c.querySelectorAll('p'))
-                    .map(p => p.innerText.trim())
-                    .filter(t => t.length > 0);
-            }""")
-
-            if paragraphs:
-                return "\n\n".join(paragraphs)
-
-            content = await page.text_content('div.text#arrticle')
-            return content.strip() if content else "[Текст не найден]"
+            parsed = parse_chapter_page_html(await page.content())
+            return parsed
         except Exception as e:
-            logger.error(f"Ошибка в fetch_chapter_text на {url}: {e}")
+            logger.error(f"Ошибка в fetch_chapter_page_data на {url}: {e}")
             raise
         finally:
             if not page.is_closed():
                 await page.close()
+
+
+@retry(**RETRY_WEB)
+async def fetch_chapter_text(url: str) -> str:
+    parsed = await fetch_chapter_page_data(url)
+    if not parsed.valid_body:
+        raise ValueError(f"Body parsing failed for {url}")
+    return parsed.body
 
 
 def parse_chapters(html: str) -> List[Dict[str, str]]:
@@ -1143,17 +1248,30 @@ def parse_chapters(html: str) -> List[Dict[str, str]]:
     for a in soup.find_all('a', href=True):
         text = a.get_text(strip=True)
         href = a['href']
-        cid = extract_chapter_id(text)
-        if cid and cid.isdigit():
-            link = 'https://ranobes.net' + href if not href.startswith('http') else href
-            if NOVEL_ID not in link:
-                continue
-            chapters.append({
-                'id': cid,
-                'raw_title': text,
-                'title': clean_title(text),
-                'link': link
-            })
+        link = 'https://ranobes.net' + href if not href.startswith('http') else href
+        if NOVEL_ID not in link:
+            continue
+
+        parsed_url = urlparse(link)
+        chapter_match = CHAPTER_LINK_PATTERN.search(parsed_url.path)
+        if not chapter_match:
+            continue
+
+        if not is_valid_chapter_title(text):
+            continue
+
+        cid = chapter_match.group(1)
+        title_number = extract_chapter_number_from_title(text)
+        if title_number is None or int(cid) != title_number:
+            logger.warning("Пропущена запись из списка глав из-за mismatch id/title: id=%s title=%r", cid, text)
+            continue
+
+        chapters.append({
+            'id': cid,
+            'raw_title': text,
+            'title': clean_title(text),
+            'link': link
+        })
     chapters.sort(key=lambda x: int(x['id']), reverse=True)
 
     if chapters:
@@ -1476,10 +1594,42 @@ async def process_chapter_translation(ch: Dict[str, str]) -> tuple[Optional[str]
             await save_chapter_cache(cid, {"telegraph_url": url, "status": "ready", "error": ""})
             return url, True
 
+        cached_source_url = cache.get("source_url")
         original_text = await get_chapter_original_text(cid)
+        if cached_source_url and cached_source_url != source_url:
+            logger.warning(
+                "source_url сменился для главы %s: %s -> %s. Сбрасываем старый текст.",
+                cid,
+                cached_source_url,
+                source_url,
+            )
+            original_text = None
+            await redis_client.delete(f"chapter:original:{cid}")
+
         if not original_text:
             try:
-                original_text = await fetch_chapter_text(source_url)
+                parsed_page = await fetch_chapter_page_data(source_url)
+                if not parsed_page.valid_title or not parsed_page.valid_body:
+                    logger.warning(
+                        "Глава %s отклонена при загрузке: title_source=%s body_source=%s reasons=%s",
+                        cid,
+                        parsed_page.title_source,
+                        parsed_page.body_source,
+                        ",".join(parsed_page.reasons),
+                    )
+                    await set_chapter_status(cid, "failed", "fetch_failed")
+                    await save_translation_error(cid, "fetch_failed")
+                    return None, False
+                if parsed_page.chapter_number != int(cid):
+                    logger.warning(
+                        "Глава %s отклонена: номер в заголовке %s не совпадает",
+                        cid,
+                        parsed_page.chapter_number,
+                    )
+                    await set_chapter_status(cid, "failed", "fetch_failed")
+                    await save_translation_error(cid, "fetch_failed")
+                    return None, False
+                original_text = parsed_page.body
             except Exception:
                 logger.exception(f"Ошибка загрузки главы {cid}")
                 await set_chapter_status(cid, "failed", "fetch_failed")
@@ -2133,6 +2283,36 @@ async def force_monitor_run(msg: types.Message):
         await safe_edit_text(msg, f"❌ Ошибка: {e}", reply_markup=admin_status_buttons)
 
 
+async def validate_monitor_candidate(ch: Dict[str, str], previous_latest_id: int) -> tuple[bool, str]:
+    chapter_id = int(ch["id"])
+    if chapter_id <= previous_latest_id:
+        return False, "not_new"
+
+    parsed = await fetch_chapter_page_data(ch["link"])
+    similarity = 0.0
+    previous_text = await get_chapter_original_text(str(previous_latest_id)) if previous_latest_id > 0 else None
+    if previous_text and parsed.body:
+        similarity = similarity_ratio(parsed.body, previous_text)
+
+    logger.info(
+        "monitor_validation chapter=%s url=%s title_source=%s body_source=%s parsed_number=%s prev=%s similarity=%.4f",
+        ch["id"], ch["link"], parsed.title_source, parsed.body_source,
+        parsed.chapter_number, previous_latest_id, similarity,
+    )
+
+    if not parsed.valid_title:
+        return False, "invalid_title"
+    if not parsed.valid_body:
+        return False, "invalid_body"
+    if parsed.chapter_number is None:
+        return False, "missing_chapter_number"
+    if parsed.chapter_number != chapter_id:
+        return False, "number_mismatch"
+    if similarity >= DUPLICATE_BODY_SIMILARITY_THRESHOLD:
+        return False, "duplicate_body"
+    return True, "ok"
+
+
 async def monitor(check_once=False):
     logger.info("Мониторинг запущен")
     while True:
@@ -2159,11 +2339,23 @@ async def monitor(check_once=False):
                             failed.append(ch['id'])
                             continue
                         try:
+                            is_valid, reason = await validate_monitor_candidate(ch, last_successful_id)
+                            if not is_valid:
+                                logger.warning(
+                                    "monitor_decision=quarantined chapter=%s reason=%s url=%s",
+                                    ch["id"], reason, ch["link"],
+                                )
+                                failed.append(ch['id'])
+                                stop_on_first_failure = True
+                                continue
+
                             url, success = await process_chapter_translation(ch)
                             if success and url:
+                                logger.info("monitor_decision=published chapter=%s url=%s", ch["id"], ch["link"])
                                 translated_urls.append((ch['id'], url))
                                 last_successful_id = int(ch['id'])
                             else:
+                                logger.warning("monitor_decision=skipped chapter=%s reason=translation_failed", ch["id"])
                                 failed.append(ch['id'])
                                 stop_on_first_failure = True
                         except Exception:
