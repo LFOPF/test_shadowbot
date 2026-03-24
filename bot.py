@@ -127,6 +127,7 @@ PROMPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt.txt")
 USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt.txt")
 TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
+TRANSLATION_INPUT_CHAR_LIMIT = 120000
 
 
 def load_prompt_file(path: str, fallback: str = "") -> str:
@@ -1588,9 +1589,74 @@ async def translate_text(text: str) -> str:
     if not SYSTEM_PROMPT or not USER_PROMPT_TEMPLATE:
         raise RuntimeError("Не удалось загрузить system_prompt.txt или user_prompt.txt")
 
-    if len(text) > 120000:
-        logger.warning("Текст слишком длинный, обрезаем")
-        text = text[:120000] + "\n... [обрезано]"
+    def _split_text_into_chunks(source_text: str, max_chunk_size: int) -> list[str]:
+        if not source_text:
+            return []
+
+        paragraphs = [p for p in source_text.split("\n\n") if p and p.strip()]
+        chunks: list[str] = []
+        current_parts: list[str] = []
+        current_len = 0
+
+        def flush_current() -> None:
+            nonlocal current_parts, current_len
+            if not current_parts:
+                return
+            chunk_text = "\n\n".join(current_parts).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+            current_parts = []
+            current_len = 0
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+
+            paragraph_len = len(paragraph)
+            if paragraph_len > max_chunk_size:
+                flush_current()
+                words = re.split(r"(\s+)", paragraph)
+                overlong_parts: list[str] = []
+                overlong_len = 0
+                for word in words:
+                    if not word:
+                        continue
+                    word_len = len(word)
+                    if overlong_len + word_len > max_chunk_size and overlong_parts:
+                        long_chunk = "".join(overlong_parts).strip()
+                        if long_chunk:
+                            chunks.append(long_chunk)
+                        overlong_parts = [word]
+                        overlong_len = word_len
+                    else:
+                        overlong_parts.append(word)
+                        overlong_len += word_len
+                if overlong_parts:
+                    long_chunk = "".join(overlong_parts).strip()
+                    if long_chunk:
+                        chunks.append(long_chunk)
+                continue
+
+            add_len = paragraph_len if not current_parts else paragraph_len + 2
+            if current_len + add_len > max_chunk_size and current_parts:
+                flush_current()
+                add_len = paragraph_len
+
+            current_parts.append(paragraph)
+            current_len += add_len
+
+        flush_current()
+        return chunks
+
+    chunks = _split_text_into_chunks(text, TRANSLATION_INPUT_CHAR_LIMIT)
+    if not chunks:
+        logger.warning("Пустой текст перевода после разбиения на чанки")
+        return ""
+
+    logger.info("Разбивка текста на чанки завершена: chunks=%s", len(chunks))
+    for i, chunk in enumerate(chunks, start=1):
+        logger.info("Размер чанка %s: %s символов", i, len(chunk))
 
     glossary_section = await get_relevant_glossary(text)
 
@@ -1606,78 +1672,110 @@ async def translate_text(text: str) -> str:
     if glossary_section:
         system_prompt = f"{glossary_section}\n\n{SYSTEM_PROMPT}"
 
-    first_pass_user_prompt = USER_PROMPT_TEMPLATE.format(text=text, stage="translation", draft="", source_text=text)
-    logger.info("Старт первого прохода перевода: %s символов", len(text))
-    first_pass = await request_translation_completion(
-        session=session,
-        headers=headers,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": first_pass_user_prompt},
-        ],
-        stage_name="first_pass_translation",
-        temperature=0.8,
-        top_p=0.95,
-        presence_penalty=0.15,
-        frequency_penalty=0.08,
-    )
-
-    second_pass_user_prompt = (
-        "Ниже исходный английский фрагмент и его русский черновик.\n\n"
-        "Сделай ТОЛЬКО редактуру русского текста.\n"
-        "Ты — редактор художественного перевода.\n"
-        "Если оно звучит как перевод — перепиши полностью.\n"
-        "Особое внимание:\n"
-        "• длинные предложения → разбивать\n"
-        "• калька → уничтожать\n"
-        "• слабые формулировки → усиливать\n"
-        "Добавь:\n"
-        "• ритм\n"
-        "• паузы\n"
-        "• эмоциональные удары\n"
-        "Можно:\n"
-        "• сильно переписывать\n"
-        "• менять структуру\n"
-        "• сокращать\n"
-        "Нельзя:\n"
-        "• менять смысл\n"
-        "• добавлять новый сюжет\n"
-        "Цель:\n"
-        "текст должен звучать как книга, а не перевод.\n"
-        "Не добавляй комментарии, заголовки, markdown, пояснения или альтернативные версии.\n\n"
-        f"Исходник:\n{text}\n\n"
-        f"Черновой перевод:\n{first_pass}"
-    )
-
-    try:
-        logger.info("Старт второго прохода редактуры: %s символов", len(first_pass))
-        second_pass = await request_translation_completion(
+    async def _translate_chunk(chunk_text: str, chunk_index: int) -> str:
+        first_pass_user_prompt = USER_PROMPT_TEMPLATE.format(
+            text=chunk_text, stage="translation", draft="", source_text=chunk_text
+        )
+        logger.info("Старт первого прохода перевода чанка %s: %s символов", chunk_index, len(chunk_text))
+        first_pass = await request_translation_completion(
             session=session,
             headers=headers,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"{system_prompt}\n\n"
-                        "Ты выступаешь как финальный литературный редактор русского текста. "
-                        "Не пересказывай и не объясняй правки — верни только готовую отредактированную версию."
-
-                    ),
-                },
-                {"role": "user", "content": second_pass_user_prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": first_pass_user_prompt},
             ],
-            stage_name="second_pass_editing",
-            temperature=0.75,
-            top_p=0.9,
-            presence_penalty=0.05,
-            frequency_penalty=0.03,
+            stage_name=f"first_pass_translation_chunk_{chunk_index}",
+            temperature=0.8,
+            top_p=0.95,
+            presence_penalty=0.15,
+            frequency_penalty=0.08,
         )
-        return second_pass
-    except Exception:
-        logger.exception("Второй проход перевода не удался, возвращаем результат первого прохода")
-        if first_pass:
-            return first_pass
-        raise
+
+        second_pass_user_prompt = (
+            "Ниже исходный английский фрагмент и его русский черновик.\n\n"
+            "Сделай ТОЛЬКО редактуру русского текста.\n"
+            "Ты — редактор художественного перевода.\n"
+            "Если оно звучит как перевод — перепиши полностью.\n"
+            "Особое внимание:\n"
+            "• длинные предложения → разбивать\n"
+            "• калька → уничтожать\n"
+            "• слабые формулировки → усиливать\n"
+            "Добавь:\n"
+            "• ритм\n"
+            "• паузы\n"
+            "• эмоциональные удары\n"
+            "Можно:\n"
+            "• сильно переписывать\n"
+            "• менять структуру\n"
+            "• сокращать\n"
+            "Нельзя:\n"
+            "• менять смысл\n"
+            "• добавлять новый сюжет\n"
+            "Цель:\n"
+            "текст должен звучать как книга, а не перевод.\n"
+            "Не добавляй комментарии, заголовки, markdown, пояснения или альтернативные версии.\n\n"
+            f"Исходник:\n{chunk_text}\n\n"
+            f"Черновой перевод:\n{first_pass}"
+        )
+
+        try:
+            logger.info("Старт второго прохода редактуры чанка %s: %s символов", chunk_index, len(first_pass))
+            second_pass = await request_translation_completion(
+                session=session,
+                headers=headers,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"{system_prompt}\n\n"
+                            "Ты выступаешь как финальный литературный редактор русского текста. "
+                            "Не пересказывай и не объясняй правки — верни только готовую отредактированную версию."
+                        ),
+                    },
+                    {"role": "user", "content": second_pass_user_prompt},
+                ],
+                stage_name=f"second_pass_editing_chunk_{chunk_index}",
+                temperature=0.75,
+                top_p=0.9,
+                presence_penalty=0.05,
+                frequency_penalty=0.03,
+            )
+            return second_pass
+        except Exception:
+            logger.exception("Второй проход перевода чанка %s не удался, возвращаем результат первого прохода", chunk_index)
+            if first_pass:
+                return first_pass
+            raise
+
+    translated_chunks: list[str] = []
+    seen_chunk_hashes: Set[str] = set()
+    for idx, chunk in enumerate(chunks, start=1):
+        if not chunk.strip():
+            logger.warning("Пропускаем пустой чанк %s", idx)
+            continue
+
+        chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        if chunk_hash in seen_chunk_hashes:
+            logger.warning("Пропускаем дублирующийся чанк %s", idx)
+            continue
+        seen_chunk_hashes.add(chunk_hash)
+
+        try:
+            translated_chunk = await _translate_chunk(chunk, idx)
+        except Exception:
+            logger.exception("Какой чанк упал: %s", idx)
+            raise
+
+        if translated_chunk and translated_chunk.strip():
+            translated_chunks.append(translated_chunk.strip())
+        else:
+            logger.warning("Пустой перевод чанка %s после обработки", idx)
+
+    if not translated_chunks:
+        logger.warning("После пакетного перевода не получено ни одного чанка")
+        return ""
+
+    return "\n\n".join(translated_chunks)
 
 
 @retry(

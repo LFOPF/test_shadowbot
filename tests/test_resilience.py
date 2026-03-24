@@ -200,6 +200,82 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 'edited translation')
         self.assertEqual(completion_mock.call_count, 3)
 
+    async def test_translate_text_long_text_not_truncated_contains_start_and_end(self):
+        chunk_inputs = []
+
+        async def fake_completion(*, messages, stage_name, **kwargs):
+            content = messages[-1]['content']
+            if stage_name.startswith('first_pass_translation_chunk_'):
+                chunk_inputs.append(content)
+                return content
+            marker = "Черновой перевод:\n"
+            return content.split(marker, 1)[1] if marker in content else content
+
+        source_text = "START " + ("A" * 80) + "\n\n" + ("B" * 80) + " END"
+        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
+             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 90), \
+             patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
+             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
+             patch.object(bot, 'get_http_session', AsyncMock(return_value=object())):
+            result = await bot.translate_text(source_text)
+
+        self.assertIn("START", result)
+        self.assertIn("END", result)
+        self.assertGreater(len(chunk_inputs), 1)
+        self.assertNotIn("[обрезано]", result)
+
+    async def test_translate_text_chunking_by_paragraphs(self):
+        first_pass_chunks = []
+
+        async def fake_completion(*, messages, stage_name, **kwargs):
+            content = messages[-1]['content']
+            if stage_name.startswith('first_pass_translation_chunk_'):
+                first_pass_chunks.append(content)
+                return content
+            marker = "Черновой перевод:\n"
+            return content.split(marker, 1)[1] if marker in content else content
+
+        paragraphs = [
+            "P1 " + ("a" * 25),
+            "P2 " + ("b" * 25),
+            "P3 " + ("c" * 25),
+        ]
+        source_text = "\n\n".join(paragraphs)
+
+        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
+             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 40), \
+             patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
+             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
+             patch.object(bot, 'get_http_session', AsyncMock(return_value=object())):
+            await bot.translate_text(source_text)
+
+        self.assertEqual(first_pass_chunks, paragraphs)
+
+    async def test_translate_text_skips_empty_chunks(self):
+        first_pass_chunks = []
+
+        async def fake_completion(*, messages, stage_name, **kwargs):
+            content = messages[-1]['content']
+            if stage_name.startswith('first_pass_translation_chunk_'):
+                first_pass_chunks.append(content)
+                return content
+            marker = "Черновой перевод:\n"
+            return content.split(marker, 1)[1] if marker in content else content
+
+        source_text = " \n\n\n\n \n\nParagraph one\n\n\n\nParagraph two\n\n "
+        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
+             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 50), \
+             patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
+             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
+             patch.object(bot, 'get_http_session', AsyncMock(return_value=object())):
+            await bot.translate_text(source_text)
+
+        self.assertEqual(first_pass_chunks, ["Paragraph one\n\nParagraph two"])
+        self.assertTrue(all(chunk.strip() for chunk in first_pass_chunks))
+
 
 if __name__ == '__main__':
     unittest.main()
