@@ -49,7 +49,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
-IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "600"))  # 3 минуты по умолчанию для экономии RAM
+IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "180"))  # 3 минуты по умолчанию для экономии RAM
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
@@ -3106,3 +3106,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
