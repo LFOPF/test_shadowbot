@@ -49,7 +49,7 @@ if not all([BOT_TOKEN, OPENROUTER_API_KEY, TELEGRAPH_ACCESS_TOKEN, REDIS_URL]):
 
 TARGET_URL = "https://ranobes.net/chapters/1205249/"
 CHECK_INTERVAL = 10800          # 3 часа
-IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "180"))  # 3 минуты по умолчанию для экономии RAM
+IDLE_TIMEOUT = int(os.getenv("BROWSER_IDLE_TIMEOUT", "600"))  # 3 минуты по умолчанию для экономии RAM
 SITE_URL = "https://t.me/SHDSlaveBot"
 SITE_NAME = "ShadowSlaveTranslator"
 MAX_PAGES = 120
@@ -127,7 +127,7 @@ PROMPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt.txt")
 USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt.txt")
 GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
-TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
+TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "deepseek/deepseek-v3.2")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
 
 
@@ -2028,7 +2028,7 @@ async def translate_title(title: str) -> str:
     }
 
     payload = {
-        "model": "google/gemini-2.5-flash-lite",
+        "model": "deepseek/deepseek-v3.2",
         "messages": [
             {
                 "role": "system",
