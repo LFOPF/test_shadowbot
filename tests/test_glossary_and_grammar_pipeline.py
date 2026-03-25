@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+import json
 
 os.environ.setdefault('BOT_TOKEN', 'test')
 os.environ.setdefault('OPENROUTER_API_KEY', 'test')
@@ -54,6 +55,15 @@ class GlossaryAndGrammarPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.classify_glossary_term('Saint'), 'generic')
         self.assertEqual(bot.classify_glossary_term('Jade Saint'), 'specific')
 
+    def test_build_glossary_constraints_extracts_entity_fields(self):
+        constraints = bot.build_glossary_constraints(
+            {"Saint Mordret": "Святой Мордрет", "Saint": "Святой"},
+            {"Saint Mordret": "мужской, locked", "Saint": "плавающий род"},
+        )
+        self.assertEqual(constraints["entries"][0]["source"], "Saint Mordret")
+        self.assertEqual(constraints["entries"][0]["entity_gender"], "male")
+        self.assertTrue(constraints["entries"][0]["locked_entity"])
+
     async def test_glossary_keeps_specific_priority_and_gender_notes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             glossary_file = Path(tmpdir) / 'glossary.txt'
@@ -102,6 +112,7 @@ class GlossaryAndGrammarPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bot.should_run_grammar_fix(clean))
 
     async def test_translate_text_runs_conditional_grammar_fix(self):
+        entity_map = '{"entities":[],"quoted_blocks":[],"pronoun_bindings":[]}'
         first = 'Черновик'
         second = 'Пламя горевшее в большом жаровне, почти погасло.'
         fixed = 'Пламя в большой жаровне почти погасло.'
@@ -109,26 +120,83 @@ class GlossaryAndGrammarPipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
              patch.object(bot, 'USER_PROMPT_TEMPLATE', '{text}'), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
+             patch.object(bot, 'get_relevant_glossary_constraints', AsyncMock(return_value={"entries": []})), \
              patch.object(bot, 'get_http_session', AsyncMock(return_value=object())), \
-             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[first, second, fixed])) as mocked:
+             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[entity_map, first, second, fixed])) as mocked:
             translated = await bot.translate_text('Source text for translation.')
 
         self.assertEqual(translated, fixed)
-        self.assertEqual(mocked.await_count, 3)
+        self.assertEqual(mocked.await_count, 4)
 
     async def test_translate_text_skips_grammar_fix_for_clean_chunk(self):
+        entity_map = '{"entities":[],"quoted_blocks":[],"pronoun_bindings":[]}'
         first = 'Черновик'
         second = 'Пламя в большой жаровне почти погасло.'
 
         with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
              patch.object(bot, 'USER_PROMPT_TEMPLATE', '{text}'), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
+             patch.object(bot, 'get_relevant_glossary_constraints', AsyncMock(return_value={"entries": []})), \
              patch.object(bot, 'get_http_session', AsyncMock(return_value=object())), \
-             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[first, second])) as mocked:
+             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[entity_map, first, second])) as mocked:
             translated = await bot.translate_text('Source text for translation.')
 
         self.assertEqual(translated, second)
-        self.assertEqual(mocked.await_count, 2)
+        self.assertEqual(mocked.await_count, 3)
+
+    def test_detect_reference_conflict_on_mordret_case(self):
+        fixtures = Path(__file__).parent / 'fixtures'
+        source = (fixtures / 'mordret_regression_source.txt').read_text(encoding='utf-8')
+        bad_translation = (fixtures / 'mordret_regression_bad_ru.txt').read_text(encoding='utf-8')
+        entity_map = {
+            "entities": [
+                {
+                    "canonical_name": "Saint Mordret",
+                    "grammatical_gender": "male",
+                    "aliases": ["Мордрет", "Святой Мордрет"],
+                    "mentions": ["him", "he"],
+                }
+            ],
+            "quoted_blocks": [{"quote_excerpt": "You'd smile blissfully at him too", "addressee_gender": "male"}],
+            "pronoun_bindings": [{"pronoun": "you", "entity": "Saint Mordret", "confidence": "high"}],
+        }
+        conflicts = bot.detect_reference_conflicts(
+            source_text=source,
+            translated_text=bad_translation,
+            entity_map=entity_map,
+        )
+        self.assertIn('second_person_feminine_in_male_addressee_context', conflicts)
+
+    def test_mordret_expected_behavior_fixture(self):
+        fixtures = Path(__file__).parent / 'fixtures'
+        expected = (fixtures / 'mordret_regression_expected_ru.txt').read_text(encoding='utf-8')
+        self.assertIn('улыбался', expected)
+        self.assertIn('не смог', expected)
+        self.assertIn('Святой Мордрет', expected)
+        self.assertNotIn('улыбалась', expected)
+        self.assertNotIn('не смогла', expected)
+
+    async def test_translate_text_triggers_reference_fix_even_without_grammar_suspicion(self):
+        source = 'You would smile blissfully at him too.'
+        entity_map = {
+            "entities": [{"canonical_name": "Saint Mordret", "grammatical_gender": "male", "aliases": ["Мордрет"]}],
+            "quoted_blocks": [{"quote_excerpt": source, "addressee_gender": "male"}],
+            "pronoun_bindings": [{"pronoun": "you", "entity": "Saint Mordret", "confidence": "high"}],
+        }
+        first = 'Черновик'
+        second = 'Ты бы блаженно улыбалась ему.'
+        fixed = 'Ты бы блаженно улыбался ему.'
+        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
+             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{text}'), \
+             patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
+             patch.object(bot, 'get_relevant_glossary_constraints', AsyncMock(return_value={"entries": []})), \
+             patch.object(bot, 'get_http_session', AsyncMock(return_value=object())), \
+             patch.object(bot, 'should_run_grammar_fix', return_value=False), \
+             patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[json.dumps(entity_map, ensure_ascii=False), first, second, fixed])) as mocked:
+            translated = await bot.translate_text(source)
+
+        self.assertEqual(translated, fixed)
+        self.assertEqual(mocked.await_count, 4)
 
 
 if __name__ == '__main__':
