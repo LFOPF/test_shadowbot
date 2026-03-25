@@ -1,18 +1,13 @@
-Сделай PASS 2 — полный литературный rewrite.
-
-Глоссарий:
+Glossary:
 {glossary_section}
 
-Оригинал:
-{source_text}
+Improve the following Russian translation.
 
-Черновик:
+Requirements:
+- Natural Russian prose
+- Preserve full meaning
+- STRICT glossary compliance
+- Do NOT shorten or simplify
+
+Text:
 {pass1_draft}
-
-Требования:
-
-* переписать текст полностью
-* не сохранять структуру оригинала
-* сделать живой художественный русский текст
-
-Выведи только результат.
