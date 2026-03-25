@@ -1,0 +1,13 @@
+Glossary:
+{glossary_section}
+
+Improve the following Russian translation.
+
+Requirements:
+- Natural Russian prose
+- Preserve full meaning
+- STRICT glossary compliance
+- Do NOT shorten or simplify
+
+Text:
+{pass1_draft}

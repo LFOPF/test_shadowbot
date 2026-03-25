@@ -1,0 +1,13 @@
+Glossary:
+{glossary_section}
+
+Edit the following Russian text to make it publication-ready.
+
+Requirements:
+- Fix grammar and style
+- Preserve meaning exactly
+- STRICT glossary compliance
+- Do NOT rewrite unnecessarily
+
+Text:
+{pass2_rewrite}

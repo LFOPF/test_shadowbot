@@ -1,0 +1,12 @@
+Glossary:
+{glossary_section}
+
+Translate the following text from English to Russian.
+
+Requirements:
+- Maximum accuracy
+- No omissions
+- STRICT glossary compliance
+
+Text:
+{source_text}
