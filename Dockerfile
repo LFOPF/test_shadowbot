@@ -23,8 +23,6 @@ COPY system_prompt_pass1.txt .
 COPY user_prompt_pass1.txt .
 COPY system_prompt_pass2.txt .
 COPY user_prompt_pass2.txt .
-COPY system_prompt_pass3.txt .
-COPY user_prompt_pass3.txt .
 COPY bot.py .
 
 CMD ["python", "bot.py"]
