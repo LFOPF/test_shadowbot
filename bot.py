@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from contextlib import asynccontextmanager
 import uuid
 from urllib.parse import urlparse
+from urllib.parse import urljoin
 from collections import deque
 from tenacity import (
     retry,
@@ -69,7 +70,11 @@ MIN_CHAPTER_BODY_LENGTH = int(os.getenv("MIN_CHAPTER_BODY_LENGTH", "400"))
 DUPLICATE_BODY_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_BODY_SIMILARITY_THRESHOLD", "0.97"))
 GRAMMAR_FIX_SUSPICION_THRESHOLD = int(os.getenv("GRAMMAR_FIX_SUSPICION_THRESHOLD", "2"))
 CHAPTER_TITLE_PATTERN = re.compile(r"^\s*Chapter\s+(\d{1,6})(?:\s*:\s*.+)?\s*$", re.IGNORECASE)
-CHAPTER_LINK_PATTERN = re.compile(rf"/[^/]*-{NOVEL_ID}/(\d+)\.html$", re.IGNORECASE)
+CHAPTER_LINK_PATTERN = re.compile(
+    rf"^/(?P<slug>[a-z0-9][a-z0-9-]*)-{NOVEL_ID}/(?P<source_id>\d+)\.html$",
+    re.IGNORECASE,
+)
+CHAPTER_URL_CANDIDATE_PATTERN = re.compile(r"^/[^/]+-\d+/\d+\.html$", re.IGNORECASE)
 WINDOW_DATA_ASSIGN_PATTERN = re.compile(r"window\.__DATA__\s*=", re.IGNORECASE)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -171,6 +176,13 @@ class ParsedChapterPage:
     valid_title: bool
     valid_body: bool
     reasons: List[str]
+
+
+@dataclass
+class ChaptersParseResult:
+    chapters: List[Dict[str, str]]
+    parse_ok: bool
+    diagnostics: List[str]
 
 
 class TelegraphRetriableError(Exception):
@@ -1511,9 +1523,13 @@ async def fetch_html_playwright(url: str) -> str:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             try:
-                await page.wait_for_selector('a:has-text("Chapter")', timeout=40000)
+                await page.wait_for_load_state("networkidle", timeout=20000)
             except PlaywrightError:
-                logger.warning(f"Селектор 'a:has-text(\"Chapter\")' не найден на {url}, продолжаем")
+                logger.debug("networkidle timeout на %s, продолжаем с текущим DOM", url)
+            await page.wait_for_selector("body", timeout=15000)
+            links_count = await page.locator("a[href]").count()
+            if links_count < 5:
+                await page.wait_for_timeout(1500)
             await page.wait_for_timeout(1500)
             return await page.content()
         except Exception as e:
@@ -1584,129 +1600,143 @@ async def fetch_chapter_text(url: str) -> str:
     return parsed.body
 
 
-def parse_chapters(html: str) -> List[Dict[str, str]]:
+def _normalize_chapter_link(href: str) -> str:
+    return urljoin("https://ranobes.net", href)
+
+
+def _extract_anchor_title(a: Any) -> str:
+    text = a.get_text(" ", strip=True)
+    if text:
+        return text
+    for attr in ("title", "aria-label", "data-title"):
+        value = (a.get(attr) or "").strip()
+        if value:
+            return value
+    title_node = a.select_one(".title, [title]")
+    if title_node:
+        node_title = title_node.get_text(" ", strip=True)
+        if node_title:
+            return node_title
+    return ""
+
+
+def _append_chapter(chapters: List[Dict[str, str]], seen_ids: set[str], *, raw_title: str, link: str, source_id: str) -> bool:
+    chapter_number = extract_chapter_number_from_title(raw_title)
+    if chapter_number is None:
+        return False
+    cid = str(chapter_number)
+    if cid in seen_ids:
+        return False
+    seen_ids.add(cid)
+    chapters.append({
+        'id': cid,
+        'source_id': source_id,
+        'raw_title': raw_title,
+        'title': clean_title(raw_title),
+        'link': link,
+    })
+    return True
+
+
+def _build_chapters_empty_diagnostics(soup: BeautifulSoup, diagnostics: List[str], candidate_hrefs: List[str]) -> None:
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical = ""
+    canonical_node = soup.select_one('link[rel="canonical"]')
+    if canonical_node:
+        canonical = (canonical_node.get("href") or "").strip()
+    all_links_count = len(soup.select("a[href]"))
+    diagnostics.insert(0, f"title={page_title or 'n/a'}")
+    diagnostics.insert(1, f"canonical={canonical or 'n/a'}")
+    diagnostics.append(f"all_links={all_links_count}")
+    diagnostics.append(f"chapter_url_candidates={len(candidate_hrefs)}")
+    if candidate_hrefs:
+        preview = ", ".join(candidate_hrefs[:5])
+        diagnostics.append(f"chapter_href_preview={preview}")
+
+
+def parse_chapters_with_diagnostics(html: str) -> ChaptersParseResult:
     soup = BeautifulSoup(html, 'html.parser')
     chapters: List[Dict[str, str]] = []
     seen_ids: set[str] = set()
     diagnostics: List[str] = []
-    window_data_found = False
+    candidate_hrefs: List[str] = []
+    window_data_status = "not_found"
 
     data_raw = extract_window_data_object(html)
     if data_raw:
-        window_data_found = True
+        window_data_status = "found"
         try:
             payload = parse_window_data_payload(data_raw)
             if not isinstance(payload, dict):
                 raise ValueError("window.__DATA__ is not an object")
-            payload_chapters = payload.get("chapters", []) if isinstance(payload, dict) else []
-            diagnostics.append(f"window.__DATA__.chapters={len(payload_chapters)}")
+            payload_chapters = payload.get("chapters", [])
+            diagnostics.append(f"window_data_chapters={len(payload_chapters)}")
             for item in payload_chapters:
                 if not isinstance(item, dict):
                     continue
                 raw_title = (item.get("title") or "").strip()
-                chapter_number = extract_chapter_number_from_title(raw_title)
-                link = (item.get("link") or "").strip()
+                link = _normalize_chapter_link((item.get("link") or "").strip())
                 source_id = str(item.get("id", "")).strip()
-                if chapter_number is None or not link:
+                if not link:
                     continue
-                cid = str(chapter_number)
-                if cid in seen_ids:
-                    continue
-                seen_ids.add(cid)
-                chapters.append({
-                    'id': cid,
-                    'source_id': source_id,
-                    'raw_title': raw_title,
-                    'title': clean_title(raw_title),
-                    'link': link if link.startswith('http') else f"https://ranobes.net{link}"
-                })
+                _append_chapter(chapters, seen_ids, raw_title=raw_title, link=link, source_id=source_id)
         except ValueError as e:
-            diagnostics.append(f"window.__DATA__ decode failed: {e}")
+            window_data_status = "decode_failed"
+            diagnostics.append(f"window_data_error={e}")
         except Exception as e:
-            diagnostics.append(f"window.__DATA__ parse error: {e}")
-    else:
-        diagnostics.append("window.__DATA__ not found")
+            window_data_status = "parse_failed"
+            diagnostics.append(f"window_data_error={e}")
+    diagnostics.append(f"window_data_status={window_data_status}")
 
-    if not chapters:
-        fallback_selectors = (
-            f'.last-chapters a[href*="-{NOVEL_ID}/"][href$=".html"]',
-            f'.chapters a[href*="-{NOVEL_ID}/"][href$=".html"]',
-            f'.chapter-list a[href*="-{NOVEL_ID}/"][href$=".html"]',
-            'a[rel="chapter"]',
-            'a.chapter-item',
-            'a.chapter-item.txt-dec',
+    anchors = soup.select("a[href]")
+    for a in anchors:
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        link = _normalize_chapter_link(href)
+        parsed_url = urlparse(link)
+        chapter_match = CHAPTER_LINK_PATTERN.match(parsed_url.path)
+        if not chapter_match:
+            continue
+        candidate_hrefs.append(href)
+        raw_title = _extract_anchor_title(a)
+        _append_chapter(
+            chapters,
+            seen_ids,
+            raw_title=raw_title,
+            link=link,
+            source_id=chapter_match.group("source_id"),
         )
-        for selector in fallback_selectors:
-            matched = soup.select(selector)
-            diagnostics.append(f"fallback {selector}={len(matched)}")
-            for a in matched:
-                raw_title = a.get_text(" ", strip=True)
-                chapter_number = extract_chapter_number_from_title(raw_title)
-                if chapter_number is None:
-                    title_node = a.select_one('.title')
-                    if title_node:
-                        raw_title = title_node.get_text(" ", strip=True)
-                        chapter_number = extract_chapter_number_from_title(raw_title)
-                href = (a.get('href') or "").strip()
-                if chapter_number is None or not href:
-                    continue
-                link = href if href.startswith('http') else f"https://ranobes.net{href}"
-                if NOVEL_ID not in link:
-                    continue
-                cid = str(chapter_number)
-                if cid in seen_ids:
-                    continue
-                seen_ids.add(cid)
-                parsed_url = urlparse(link)
-                source_match = re.search(r"/(\d+)\.html$", parsed_url.path)
-                chapters.append({
-                    'id': cid,
-                    'source_id': source_match.group(1) if source_match else "",
-                    'raw_title': raw_title,
-                    'title': clean_title(raw_title),
-                    'link': link
-                })
 
-    if not chapters:
-        legacy_count = 0
-        for a in soup.find_all('a', href=True):
-            href = (a.get('href') or "").strip()
-            if not href:
-                continue
-            link = href if href.startswith('http') else f"https://ranobes.net{href}"
-            parsed_url = urlparse(link)
-            chapter_match = CHAPTER_LINK_PATTERN.search(parsed_url.path)
-            if not chapter_match:
-                continue
-            legacy_count += 1
-            raw_title = a.get_text(" ", strip=True)
-            chapter_number = extract_chapter_number_from_title(raw_title)
-            if chapter_number is None:
-                continue
-            cid = str(chapter_number)
-            if cid in seen_ids:
-                continue
-            seen_ids.add(cid)
-            chapters.append({
-                'id': cid,
-                'source_id': chapter_match.group(1),
-                'raw_title': raw_title,
-                'title': clean_title(raw_title),
-                'link': link
-            })
-        diagnostics.append(f"legacy /chapters links={legacy_count}")
+    raw_url_pattern = re.compile(r"(https?://[^\s\"'<>]+|/[^\s\"'<>]+)")
+    raw_url_candidates = 0
+    for match in raw_url_pattern.finditer(html):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        if candidate.startswith("http"):
+            parsed_url = urlparse(candidate)
+            path = parsed_url.path
+        else:
+            path = candidate
+        if not CHAPTER_URL_CANDIDATE_PATTERN.match(path):
+            continue
+        raw_url_candidates += 1
+    diagnostics.append(f"raw_url_candidates={raw_url_candidates}")
 
     chapters.sort(key=lambda x: int(x['id']), reverse=True)
 
     if chapters:
         logger.info(f"Найдено глав: {len(chapters)} | Самая новая: {chapters[0]['id']} — {chapters[0]['raw_title']!r}")
-    else:
-        logger.error(
-            "Не найдено ни одной главы. diagnostics=%s | window_data_found=%s",
-            "; ".join(diagnostics),
-            window_data_found,
-        )
-    return chapters
+        return ChaptersParseResult(chapters=chapters, parse_ok=True, diagnostics=diagnostics)
+
+    _build_chapters_empty_diagnostics(soup, diagnostics, candidate_hrefs)
+    logger.error("Не найдено ни одной главы. diagnostics=%s", "; ".join(diagnostics))
+    return ChaptersParseResult(chapters=[], parse_ok=False, diagnostics=diagnostics)
+
+
+def parse_chapters(html: str) -> List[Dict[str, str]]:
+    return parse_chapters_with_diagnostics(html).chapters
 
 
 def extract_window_data_object(page_html: str) -> Optional[str]:
@@ -3026,7 +3056,17 @@ async def monitor(check_once=False):
         try:
             async with monitor_lock:
                 html = await fetch_html(TARGET_URL)
-                chapters = parse_chapters(html)
+                chapters_result = parse_chapters_with_diagnostics(html)
+                chapters = chapters_result.chapters
+                if not chapters_result.parse_ok:
+                    logger.error(
+                        "Мониторинг: не удалось извлечь список глав, цикл пропущен. diagnostics=%s",
+                        "; ".join(chapters_result.diagnostics),
+                    )
+                    if check_once:
+                        break
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
                 for ch in chapters:
                     await save_chapter_meta(ch)
                 last_str = await get_last_chapter()

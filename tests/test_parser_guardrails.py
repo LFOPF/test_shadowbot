@@ -142,6 +142,17 @@ class ParserGuardrailsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chapters[0]["id"], "2898")
         self.assertEqual(chapters[0]["source_id"], "3132434")
 
+    def test_parse_chapters_with_diagnostics_from_chapters_fixture(self):
+        fixture = Path(__file__).with_name("fixtures") / "Shadow Slave _ Chapters_2.html"
+        html = fixture.read_text(encoding="utf-8")
+
+        result = bot.parse_chapters_with_diagnostics(html)
+
+        self.assertTrue(result.parse_ok)
+        self.assertGreater(len(result.chapters), 10)
+        self.assertEqual(result.chapters[0]["id"], "2900")
+        self.assertEqual(result.chapters[0]["source_id"], "3132944")
+
     def test_parse_chapters_dom_fallback_when_window_data_decode_fails(self):
         html = """
         <html><body>
@@ -157,6 +168,35 @@ class ParserGuardrailsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(chapters)
         self.assertEqual(chapters[0]["id"], "2898")
         self.assertEqual(chapters[0]["source_id"], "3132434")
+
+    def test_parse_chapters_html_fallback_without_window_data(self):
+        html = """
+        <html><body>
+          <a href="/shadow-slave-v741610-1205249/3132944.html"><span>Chapter 2900: Janus</span></a>
+          <a href="https://ranobes.net/shadow-slave-v741610-1205249/3132943.html" title="Chapter 2899: Last Battlefield"></a>
+        </body></html>
+        """
+        chapters = bot.parse_chapters(html)
+        self.assertEqual([c["id"] for c in chapters], ["2900", "2899"])
+
+    def test_parse_chapters_broken_page_returns_parse_error(self):
+        html = "<html><head><title>Broken</title></head><body><div>No chapter links</div></body></html>"
+        result = bot.parse_chapters_with_diagnostics(html)
+        self.assertFalse(result.parse_ok)
+        self.assertEqual(result.chapters, [])
+        self.assertTrue(any(item.startswith("title=Broken") for item in result.diagnostics))
+
+    def test_parse_chapter_page_from_fixture(self):
+        fixture = Path(__file__).with_name("fixtures") / "Chapter 2900_ Janus _ Shadow Slave.html"
+        html = fixture.read_text(encoding="utf-8")
+
+        parsed = bot.parse_chapter_page_html(html)
+
+        self.assertTrue(parsed.valid_title)
+        self.assertTrue(parsed.valid_body)
+        self.assertEqual(parsed.title_source, 'h1[itemprop="headline"]')
+        self.assertEqual(parsed.body_source, 'div.text#arrticle')
+        self.assertEqual(parsed.chapter_number, 2900)
 
     async def test_no_stale_body_fallback_when_source_url_changes(self):
         chapter = {'id': '2898', 'title': 'Chapter 2898: Malign and Destructive', 'link': 'https://example/new'}

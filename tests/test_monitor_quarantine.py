@@ -24,7 +24,7 @@ class MonitorQuarantineTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {'MONITOR_STRICT_ORDER': 'false'}), \
              patch.object(bot, 'fetch_html', AsyncMock(return_value='<html/>')), \
-             patch.object(bot, 'parse_chapters', return_value=chapters), \
+             patch.object(bot, 'parse_chapters_with_diagnostics', return_value=bot.ChaptersParseResult(chapters=chapters, parse_ok=True, diagnostics=[])), \
              patch.object(bot, 'save_chapter_meta', AsyncMock()), \
              patch.object(bot, 'get_last_chapter', AsyncMock(return_value='1')), \
              patch.object(bot, 'validate_monitor_candidate', AsyncMock(side_effect=[(False, 'invalid_body'), (True, 'ok')])), \
@@ -51,7 +51,7 @@ class MonitorQuarantineTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {'MONITOR_STRICT_ORDER': 'false'}), \
              patch.object(bot, 'fetch_html', AsyncMock(return_value='<html/>')), \
-             patch.object(bot, 'parse_chapters', return_value=chapters), \
+             patch.object(bot, 'parse_chapters_with_diagnostics', return_value=bot.ChaptersParseResult(chapters=chapters, parse_ok=True, diagnostics=[])), \
              patch.object(bot, 'save_chapter_meta', AsyncMock()), \
              patch.object(bot, 'get_last_chapter', AsyncMock(return_value='1')), \
              patch.object(bot, 'validate_monitor_candidate', AsyncMock(return_value=(True, 'ok'))), \
@@ -77,7 +77,7 @@ class MonitorQuarantineTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {'MONITOR_STRICT_ORDER': 'true'}), \
              patch.object(bot, 'fetch_html', AsyncMock(return_value='<html/>')), \
-             patch.object(bot, 'parse_chapters', return_value=chapters), \
+             patch.object(bot, 'parse_chapters_with_diagnostics', return_value=bot.ChaptersParseResult(chapters=chapters, parse_ok=True, diagnostics=[])), \
              patch.object(bot, 'save_chapter_meta', AsyncMock()), \
              patch.object(bot, 'get_last_chapter', AsyncMock(return_value='1')), \
              patch.object(bot, 'validate_monitor_candidate', AsyncMock(return_value=(True, 'ok'))), \
@@ -103,7 +103,7 @@ class MonitorQuarantineTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {'MONITOR_STRICT_ORDER': 'false'}), \
              patch.object(bot, 'fetch_html', AsyncMock(return_value='<html/>')), \
-             patch.object(bot, 'parse_chapters', return_value=chapters), \
+             patch.object(bot, 'parse_chapters_with_diagnostics', return_value=bot.ChaptersParseResult(chapters=chapters, parse_ok=True, diagnostics=[])), \
              patch.object(bot, 'save_chapter_meta', AsyncMock()), \
              patch.object(bot, 'get_last_chapter', AsyncMock(return_value='1')), \
              patch.object(bot, 'validate_monitor_candidate', AsyncMock(return_value=(True, 'ok'))), \
@@ -120,6 +120,24 @@ class MonitorQuarantineTests(unittest.IsolatedAsyncioTestCase):
             await bot.monitor(check_once=True)
 
         save_last_mock.assert_awaited_once_with('3')
+
+    async def test_empty_parse_result_is_not_treated_as_no_new_chapters(self):
+        with patch.object(bot, 'fetch_html', AsyncMock(return_value='<html/>')), \
+             patch.object(bot, 'parse_chapters_with_diagnostics', return_value=bot.ChaptersParseResult(
+                 chapters=[],
+                 parse_ok=False,
+                 diagnostics=['title=Shadow Slave | Chapters', 'all_links=0'],
+             )), \
+             patch.object(bot, 'save_chapter_meta', AsyncMock()) as save_meta_mock, \
+             patch.object(bot, 'get_last_chapter', AsyncMock()) as get_last_mock, \
+             patch.object(bot, 'save_last_chapter', AsyncMock()) as save_last_mock, \
+             patch.object(bot, 'ADMIN_ID', None), \
+             patch('asyncio.sleep', AsyncMock()):
+            await bot.monitor(check_once=True)
+
+        save_meta_mock.assert_not_called()
+        get_last_mock.assert_not_called()
+        save_last_mock.assert_not_called()
 
 
 if __name__ == '__main__':
