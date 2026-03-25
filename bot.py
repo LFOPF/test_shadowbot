@@ -69,6 +69,7 @@ TRANSLATION_CACHE_VERSION = os.getenv("TRANSLATION_CACHE_VERSION", "v1")
 MIN_CHAPTER_BODY_LENGTH = int(os.getenv("MIN_CHAPTER_BODY_LENGTH", "400"))
 DUPLICATE_BODY_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_BODY_SIMILARITY_THRESHOLD", "0.97"))
 GRAMMAR_FIX_SUSPICION_THRESHOLD = int(os.getenv("GRAMMAR_FIX_SUSPICION_THRESHOLD", "2"))
+DIALOGUE_CHUNK_CONTEXT_WINDOW = int(os.getenv("DIALOGUE_CHUNK_CONTEXT_WINDOW", "1"))
 CHAPTER_TITLE_PATTERN = re.compile(r"^\s*Chapter\s+(\d{1,6})(?:\s*:\s*.+)?\s*$", re.IGNORECASE)
 CHAPTER_LINK_PATTERN = re.compile(
     rf"^/(?P<slug>[a-z0-9][a-z0-9-]*)-{NOVEL_ID}/(?P<source_id>\d+)\.html$",
@@ -716,6 +717,48 @@ def classify_glossary_term(term: str) -> str:
     return "generic"
 
 
+def parse_gender_from_note(note: Optional[str]) -> Optional[str]:
+    if not note:
+        return None
+    lowered = note.lower()
+    if "муж" in lowered or "male" in lowered:
+        return "male"
+    if "жен" in lowered or "female" in lowered:
+        return "female"
+    return None
+
+
+def parse_locked_entity_from_note(note: Optional[str]) -> bool:
+    if not note:
+        return False
+    lowered = note.lower()
+    return any(marker in lowered for marker in ("locked", "фиксир", "строго", "не менять", "only this"))
+
+
+def build_glossary_constraints(raw_terms: Dict[str, str], notes_map: Dict[str, str]) -> Dict[str, Any]:
+    constraints: List[Dict[str, Any]] = []
+    for eng, rus in raw_terms.items():
+        term_type = classify_glossary_term(eng)
+        note = notes_map.get(eng)
+        constraints.append({
+            "source": eng,
+            "translation": rus,
+            "term_type": term_type,
+            "grammatical_note": note,
+            "entity_gender": parse_gender_from_note(note),
+            "locked_entity": parse_locked_entity_from_note(note),
+        })
+
+    constraints.sort(
+        key=lambda item: (
+            0 if item["term_type"] == "specific" else 1,
+            -len(item["source"]),
+            item["source"].lower(),
+        )
+    )
+    return {"entries": constraints}
+
+
 async def get_glossary_terms(force_refresh: bool = False) -> Dict[str, str]:
     global _glossary_cache, _glossary_cache_expires_at
 
@@ -796,6 +839,102 @@ async def get_relevant_glossary(text: str) -> str:
         + "\n".join(relevant)
         + "\n\nНе придумывай другие варианты перевода для этих слов."
     )
+
+
+async def get_relevant_glossary_constraints(text: str) -> Dict[str, Any]:
+    all_terms = await get_glossary_terms()
+    if not all_terms:
+        return {"entries": []}
+    all_notes = await get_glossary_notes()
+    text_lower = text.lower()
+    relevant_terms: Dict[str, str] = {}
+    for eng, rus in all_terms.items():
+        pattern = re.compile(r"(?i)\b" + re.escape(eng) + r"\b")
+        if pattern.search(text) or eng.lower() in text_lower:
+            relevant_terms[eng] = rus
+    return build_glossary_constraints(relevant_terms, all_notes)
+
+
+def parse_json_payload(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    cleaned = sanitize_model_output(text)
+    if not cleaned:
+        return {}
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(cleaned[start:end + 1])
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+
+def _is_dialogue_paragraph(paragraph: str) -> bool:
+    stripped = paragraph.strip()
+    if not stripped:
+        return False
+    return bool(re.match(r'^(?:["«„“]|[-—])', stripped))
+
+
+def detect_reference_conflicts(
+    *,
+    source_text: str,
+    translated_text: str,
+    entity_map: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    if not translated_text or not translated_text.strip():
+        return []
+
+    issues: List[str] = []
+    normalized = translated_text.lower()
+    source_lower = source_text.lower()
+    entity_map = entity_map or {}
+
+    if re.search(r"\bты\b[^\n.!?]{0,40}\b\w+(?:ла|лась)\b", normalized) and (
+        " him" in source_lower or " he " in f" {source_lower} "
+    ):
+        issues.append("second_person_feminine_in_male_addressee_context")
+
+    female_hits = len(re.findall(r"\b\w+(?:ла|лась)\b", normalized))
+    male_hits = len(re.findall(r"\b\w+(?:л|лся)\b", normalized))
+    if female_hits and male_hits and re.search(r"[\"«].+[\"»]", translated_text, flags=re.DOTALL):
+        issues.append("sudden_gender_switch_inside_dialogue")
+
+    for entity in entity_map.get("entities", []):
+        entity_gender = entity.get("grammatical_gender")
+        aliases = entity.get("aliases") or []
+        if entity_gender not in {"male", "female"}:
+            continue
+        for alias in aliases:
+            alias_lower = str(alias).lower().strip()
+            if not alias_lower:
+                continue
+            alias_pattern = re.compile(rf"{re.escape(alias_lower)}[^\n.!?]{{0,50}}", re.IGNORECASE)
+            for window in alias_pattern.findall(normalized):
+                if entity_gender == "male" and re.search(r"\b\w+(?:ла|лась)\b", window):
+                    issues.append(f"female_form_near_male_entity:{alias_lower}")
+                if entity_gender == "female" and re.search(r"\b\w+(?:л|лся)\b", window):
+                    issues.append(f"male_form_near_female_entity:{alias_lower}")
+
+    return sorted(set(issues))
+
+
+def looks_like_english_leak(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", text)
+    if len(letters) < 20:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cyrillic = len(re.findall(r"[А-Яа-яЁё]", text))
+    if cyrillic == 0 and latin > 0:
+        return True
+    return latin > cyrillic * 1.2
 
 
 def detect_grammar_suspicion(text: str) -> List[str]:
@@ -1909,8 +2048,11 @@ async def translate_text(text: str) -> str:
 
             add_len = paragraph_len if not current_parts else paragraph_len + 2
             if current_len + add_len > max_chunk_size and current_parts:
-                flush_current()
-                add_len = paragraph_len
+                prev_paragraph = current_parts[-1] if current_parts else ""
+                dialogue_coupling = _is_dialogue_paragraph(prev_paragraph) and _is_dialogue_paragraph(paragraph)
+                if not dialogue_coupling:
+                    flush_current()
+                    add_len = paragraph_len
 
             current_parts.append(paragraph)
             current_len += add_len
@@ -1941,9 +2083,77 @@ async def translate_text(text: str) -> str:
     if glossary_section:
         system_prompt = f"{glossary_section}\n\n{SYSTEM_PROMPT}"
 
-    async def _translate_chunk(chunk_text: str, chunk_index: int) -> str:
+    async def _translate_chunk(chunk_text: str, chunk_index: int, context_window_text: str) -> str:
+        async def _force_russian_text(draft_text: str, stage_label: str) -> str:
+            force_prompt = (
+                "Ниже текст, который мог частично остаться на английском.\n"
+                "Верни ТОЛЬКО русский литературный перевод без комментариев.\n"
+                "Сохрани смысл и ритм, не добавляй новый сюжет.\n\n"
+                f"Исходник:\n{chunk_text}\n\n"
+                f"Текущий текст:\n{draft_text}"
+            )
+            repaired = await request_translation_completion(
+                session=session,
+                headers=headers,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"{system_prompt}\n\n"
+                            "Ты устраняешь языковую утечку: итог должен быть полностью на русском."
+                        ),
+                    },
+                    {"role": "user", "content": force_prompt},
+                ],
+                stage_name=f"{stage_label}_russian_leak_fix_chunk_{chunk_index}",
+                temperature=0.25,
+                top_p=0.8,
+                max_tokens=4096,
+            )
+            return sanitize_model_output(repaired)
+
+        chunk_glossary_constraints = await get_relevant_glossary_constraints(context_window_text or chunk_text)
+        entity_analysis_prompt = (
+            "Сделай pre-translation entity analysis. Верни ТОЛЬКО валидный JSON без пояснений.\n"
+            "Схема JSON:\n"
+            "{\n"
+            '  "entities":[{"canonical_name":"...", "grammatical_gender":"male|female|neuter|unknown", "aliases":["..."], "mentions":["..."], "locked_entity":false}],\n'
+            '  "quoted_blocks":[{"quote_excerpt":"...", "speaker":"...", "addressee":"...", "addressee_gender":"male|female|unknown"}],\n'
+            '  "pronoun_bindings":[{"pronoun":"he|she|him|her|you", "entity":"...", "confidence":"high|medium|low"}]\n'
+            "}\n"
+            "Используй исходный английский текст + ограничения глоссария. Не добавляй художественный перевод.\n\n"
+            f"English chunk:\n{context_window_text or chunk_text}\n\n"
+            f"Glossary constraints JSON:\n{json.dumps(chunk_glossary_constraints, ensure_ascii=False)}"
+        )
+        entity_map_raw = await request_translation_completion(
+            session=session,
+            headers=headers,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты делаешь только извлечение сущностей и кореференции для переводческого пайплайна. "
+                        "Вывод — строго JSON."
+                    ),
+                },
+                {"role": "user", "content": entity_analysis_prompt},
+            ],
+            stage_name=f"entity_analysis_chunk_{chunk_index}",
+            temperature=0.0,
+            top_p=0.2,
+            max_tokens=2048,
+        )
+        entity_map = parse_json_payload(entity_map_raw)
+
         first_pass_user_prompt = USER_PROMPT_TEMPLATE.format(
             text=chunk_text, stage="translation", draft="", source_text=chunk_text
+        )
+        first_pass_user_prompt = (
+            f"{first_pass_user_prompt}\n\n"
+            "ENTITY MAP (опирайся на неё при выборе рода/референта):\n"
+            f"{json.dumps(entity_map, ensure_ascii=False)}\n\n"
+            "GLOSSARY CONSTRAINTS JSON:\n"
+            f"{json.dumps(chunk_glossary_constraints, ensure_ascii=False)}"
         )
         logger.info("Старт первого прохода перевода чанка %s: %s символов", chunk_index, len(chunk_text))
         first_pass = await request_translation_completion(
@@ -1959,6 +2169,10 @@ async def translate_text(text: str) -> str:
             presence_penalty=0.15,
             frequency_penalty=0.08,
         )
+        first_pass = sanitize_model_output(first_pass)
+        if looks_like_english_leak(first_pass):
+            logger.warning("Обнаружена утечка английского после first pass, чанк %s", chunk_index)
+            first_pass = await _force_russian_text(first_pass, "first_pass")
 
         second_pass_user_prompt = (
             "Ниже исходный английский фрагмент и его русский черновик.\n\n"
@@ -1983,8 +2197,13 @@ async def translate_text(text: str) -> str:
             "Цель:\n"
             "текст должен звучать как книга, а не перевод.\n"
             "Не добавляй комментарии, заголовки, markdown, пояснения или альтернативные версии.\n\n"
+            "Критично: сначала опирайся на entity map; не меняй род персонажа без явного основания.\n"
+            "Если в начале реплики пересказывается женская фраза, это не означает женский род адресата в следующих фразах.\n"
+            "При конфликте между локальной фразой и entity map — приоритет у entity map и исходной структуры референтов.\n\n"
             f"Исходник:\n{chunk_text}\n\n"
-            f"Черновой перевод:\n{first_pass}"
+            f"Черновой перевод:\n{first_pass}\n\n"
+            f"Entity map JSON:\n{json.dumps(entity_map, ensure_ascii=False)}\n\n"
+            f"Glossary constraints JSON:\n{json.dumps(chunk_glossary_constraints, ensure_ascii=False)}"
         )
 
         try:
@@ -2009,20 +2228,35 @@ async def translate_text(text: str) -> str:
                 presence_penalty=0.05,
                 frequency_penalty=0.03,
             )
-            if should_run_grammar_fix(second_pass):
+            second_pass = sanitize_model_output(second_pass)
+            if looks_like_english_leak(second_pass):
+                logger.warning("Обнаружена утечка английского после second pass, чанк %s", chunk_index)
+                second_pass = await _force_russian_text(second_pass, "second_pass")
+            conflicts_before_final = detect_reference_conflicts(
+                source_text=chunk_text,
+                translated_text=second_pass,
+                entity_map=entity_map,
+            )
+            if should_run_grammar_fix(second_pass) or conflicts_before_final:
                 logger.info(
-                    "Запускаем grammar-fix для чанка %s (эвристики=%s)",
+                    "Запускаем reference-consistency fix для чанка %s (эвристики=%s, конфликты=%s)",
                     chunk_index,
                     ",".join(detect_grammar_suspicion(second_pass)),
+                    ",".join(conflicts_before_final),
                 )
                 grammar_fix_prompt = (
-                    "Ниже русский текст после литературной редактуры.\n"
-                    "Исправь только грамматику, согласование рода/числа/падежа, явные синтаксические шероховатости.\n"
+                    "Ниже исходный английский текст и русский текст после second pass.\n"
+                    "Сделай reference-consistency fix: исправь кореференцию, род/число/адресата, явную грамматику.\n"
                     "Критично: не меняй стиль, ритм, тон и смысл без необходимости.\n"
                     "Не переписывай сцену заново, не сокращай и не расширяй текст.\n"
                     "Не меняй термины/имена из глоссария и не добавляй пометки рода в скобках.\n"
+                    "Особенно проверь: ты/вы, прошедшее время, краткие формы и местоименные отсылки в диалоге.\n"
                     "Верни только исправленный текст.\n\n"
-                    f"Текст:\n{second_pass}"
+                    f"Исходник:\n{chunk_text}\n\n"
+                    f"Текст:\n{second_pass}\n\n"
+                    f"Entity map JSON:\n{json.dumps(entity_map, ensure_ascii=False)}\n\n"
+                    f"Glossary constraints JSON:\n{json.dumps(chunk_glossary_constraints, ensure_ascii=False)}\n\n"
+                    f"Detected conflicts:\n{', '.join(conflicts_before_final) if conflicts_before_final else 'none'}"
                 )
                 third_pass = await request_translation_completion(
                     session=session,
@@ -2032,18 +2266,22 @@ async def translate_text(text: str) -> str:
                             "role": "system",
                             "content": (
                                 f"{system_prompt}\n\n"
-                                "Ты языковой корректор. Выполняй только точечную грамматическую правку."
+                                "Ты корректор консистентности референтов и грамматики. Выполняй только точечную правку."
                             ),
                         },
                         {"role": "user", "content": grammar_fix_prompt},
                     ],
-                    stage_name=f"third_pass_grammar_fix_chunk_{chunk_index}",
+                    stage_name=f"third_pass_reference_consistency_fix_chunk_{chunk_index}",
                     temperature=0.2,
                     top_p=0.7,
                     max_tokens=4096,
                     presence_penalty=0.0,
                     frequency_penalty=0.0,
                 )
+                third_pass = sanitize_model_output(third_pass)
+                if looks_like_english_leak(third_pass):
+                    logger.warning("Обнаружена утечка английского после final pass, чанк %s", chunk_index)
+                    third_pass = await _force_russian_text(third_pass, "final_pass")
                 return third_pass
 
             return second_pass
@@ -2067,7 +2305,10 @@ async def translate_text(text: str) -> str:
         seen_chunk_hashes.add(chunk_hash)
 
         try:
-            translated_chunk = await _translate_chunk(chunk, idx)
+            context_start = max(0, idx - 1 - DIALOGUE_CHUNK_CONTEXT_WINDOW)
+            context_end = min(len(chunks), idx + DIALOGUE_CHUNK_CONTEXT_WINDOW)
+            context_window_text = "\n\n".join(chunks[context_start:context_end])
+            translated_chunk = await _translate_chunk(chunk, idx, context_window_text)
         except Exception:
             logger.exception("Какой чанк упал: %s", idx)
             raise
