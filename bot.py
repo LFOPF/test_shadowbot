@@ -8,7 +8,7 @@ import html
 import time
 import hashlib
 from difflib import SequenceMatcher
-from typing import Optional, Set, List, Dict, Any
+from typing import Optional, Set, List, Dict, Any, Tuple
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 import uuid
@@ -67,6 +67,7 @@ GLOSSARY_CACHE_TTL = int(os.getenv("GLOSSARY_CACHE_TTL", "300"))
 TRANSLATION_CACHE_VERSION = os.getenv("TRANSLATION_CACHE_VERSION", "v1")
 MIN_CHAPTER_BODY_LENGTH = int(os.getenv("MIN_CHAPTER_BODY_LENGTH", "400"))
 DUPLICATE_BODY_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_BODY_SIMILARITY_THRESHOLD", "0.97"))
+GRAMMAR_FIX_SUSPICION_THRESHOLD = int(os.getenv("GRAMMAR_FIX_SUSPICION_THRESHOLD", "2"))
 CHAPTER_TITLE_PATTERN = re.compile(r"^\s*Chapter\s+(\d{1,6})(?:\s*:\s*.+)?\s*$", re.IGNORECASE)
 CHAPTER_LINK_PATTERN = re.compile(rf"/[^/]*-{NOVEL_ID}/(\d+)\.html$", re.IGNORECASE)
 WINDOW_DATA_ASSIGN_PATTERN = re.compile(r"window\.__DATA__\s*=", re.IGNORECASE)
@@ -694,6 +695,15 @@ def parse_glossary_value(value: str) -> tuple[str, Optional[str]]:
     return match.group("clean").strip(), match.group("note").strip()
 
 
+def classify_glossary_term(term: str) -> str:
+    normalized = term.strip()
+    if not normalized:
+        return "generic"
+    if re.search(r"[\s\-']", normalized):
+        return "specific"
+    return "generic"
+
+
 async def get_glossary_terms(force_refresh: bool = False) -> Dict[str, str]:
     global _glossary_cache, _glossary_cache_expires_at
 
@@ -755,10 +765,11 @@ async def get_relevant_glossary(text: str) -> str:
         pattern = re.compile(r"(?i)\b" + re.escape(eng) + r"\b")
         if pattern.search(text) or eng.lower() in text_lower:
             note = all_notes.get(eng)
+            term_type = classify_glossary_term(eng)
             if note:
-                relevant.append(f"{eng} → {rus} | note={note}")
+                relevant.append(f"{eng} → {rus} | type={term_type} | note={note}")
             else:
-                relevant.append(f"{eng} → {rus}")
+                relevant.append(f"{eng} → {rus} | type={term_type}")
 
     if not relevant:
         return ""
@@ -766,12 +777,47 @@ async def get_relevant_glossary(text: str) -> str:
     return (
         "=== ГЛОССАРИЙ ===\n"
         "Используй ТОЛЬКО следующие переводы имён, терминов и названий (строго!):\n"
-        "Пометки рода вроде \"(мужской)\" или \"(женский)\" — это не часть имени/титула.\n"
-        "Это только грамматические подсказки для местоимений и согласования.\n"
+        "Правило приоритета: более специфичные сущности (type=specific) важнее общих (type=generic).\n"
+        "Пометки рода вроде \"(мужской)\", \"(женский)\" или \"(плавающий род...)\" — это не часть имени/титула.\n"
+        "Это грамматические подсказки для местоимений и согласования, а не буквальная подстановка.\n"
         "Никогда не выводи эти пометки в итоговом переводе.\n\n"
         + "\n".join(relevant)
         + "\n\nНе придумывай другие варианты перевода для этих слов."
     )
+
+
+def detect_grammar_suspicion(text: str) -> List[str]:
+    if not text or not text.strip():
+        return []
+
+    reasons: List[str] = []
+    normalized = text.lower()
+
+    suspicious_patterns: List[Tuple[str, str]] = [
+        (r"\b(?:в|на|о|об|при|по)\s+[а-яё-]+(?:ом|ем)\s+[а-яё-]+(?:а|я|е|ь)\b", "prep_adj_noun_agreement"),
+        (r"\b(?:было|был|была|были)\s+[а-яё-]{2,}(?:вший|вшая|вшее|вшие)\b", "predicate_participle_fragility"),
+        (r"\b[а-яё-]+\s+[а-яё-]+\s+[а-яё-]+\s+[а-яё-]+\s+[а-яё-]+,\s*(?:и|но|а)\s*$", "unfinished_sentence_tail"),
+        (r"[,:;]\s*[.!?]", "punctuation_artifact"),
+        (r"\b(?:который|которая|которое|которые)\s*,\s*(?:что|чтобы|как)\b", "broken_clause_transition"),
+    ]
+
+    for pattern, reason in suspicious_patterns:
+        if re.search(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE):
+            reasons.append(reason)
+
+    if normalized.count("(") != normalized.count(")"):
+        reasons.append("unbalanced_parentheses")
+    if normalized.count("«") != normalized.count("»"):
+        reasons.append("unbalanced_quotes")
+    if re.search(r"\b(?:в|на|о|об|по|при)\s+[а-яё-]+(?:ом|ем)\s+[а-яё-]+(?:не|ке|ре|ле)\b", normalized):
+        reasons.append("locative_feminine_mismatch")
+
+    return reasons
+
+
+def should_run_grammar_fix(text: str) -> bool:
+    reasons = detect_grammar_suspicion(text)
+    return len(set(reasons)) >= GRAMMAR_FIX_SUSPICION_THRESHOLD
 
 
 def sanitize_model_output(text: str) -> str:
@@ -1933,6 +1979,43 @@ async def translate_text(text: str) -> str:
                 presence_penalty=0.05,
                 frequency_penalty=0.03,
             )
+            if should_run_grammar_fix(second_pass):
+                logger.info(
+                    "Запускаем grammar-fix для чанка %s (эвристики=%s)",
+                    chunk_index,
+                    ",".join(detect_grammar_suspicion(second_pass)),
+                )
+                grammar_fix_prompt = (
+                    "Ниже русский текст после литературной редактуры.\n"
+                    "Исправь только грамматику, согласование рода/числа/падежа, явные синтаксические шероховатости.\n"
+                    "Критично: не меняй стиль, ритм, тон и смысл без необходимости.\n"
+                    "Не переписывай сцену заново, не сокращай и не расширяй текст.\n"
+                    "Не меняй термины/имена из глоссария и не добавляй пометки рода в скобках.\n"
+                    "Верни только исправленный текст.\n\n"
+                    f"Текст:\n{second_pass}"
+                )
+                third_pass = await request_translation_completion(
+                    session=session,
+                    headers=headers,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                f"{system_prompt}\n\n"
+                                "Ты языковой корректор. Выполняй только точечную грамматическую правку."
+                            ),
+                        },
+                        {"role": "user", "content": grammar_fix_prompt},
+                    ],
+                    stage_name=f"third_pass_grammar_fix_chunk_{chunk_index}",
+                    temperature=0.2,
+                    top_p=0.7,
+                    max_tokens=4096,
+                    presence_penalty=0.0,
+                    frequency_penalty=0.0,
+                )
+                return third_pass
+
             return second_pass
         except Exception:
             logger.exception("Второй проход перевода чанка %s не удался, возвращаем результат первого прохода", chunk_index)
