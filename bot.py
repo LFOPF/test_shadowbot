@@ -129,7 +129,7 @@ PASS1_USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt_pass1.txt")
 PASS2_SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt_pass2.txt")
 PASS2_USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt_pass2.txt")
 GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
-TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "qwen/qwen3.5-flash-02-23")
+TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
 PASS1_TEMPERATURE = float(os.getenv("PASS1_TEMPERATURE", "0.4"))
 PASS2_TEMPERATURE = float(os.getenv("PASS2_TEMPERATURE", "0.75"))
@@ -2054,7 +2054,7 @@ async def translate_title(title: str) -> str:
     }
 
     payload = {
-        "model": "qwen/qwen3.5-flash-02-23",
+        "model": "google/gemini-2.5-flash",
         "messages": [
             {
                 "role": "system",
