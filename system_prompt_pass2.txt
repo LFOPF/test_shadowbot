@@ -14,6 +14,12 @@ STRICT RULES:
 - Do NOT compress the text.
 - Every idea must remain present.
 
+CRITICAL:
+- Do NOT alter speech structure.
+- Direct speech must remain direct speech.
+- Do NOT convert quotes into paraphrasing.
+- Preserve who said what and about whom.
+
 ALLOWED:
 - Improve phrasing for natural Russian flow
 - Adjust word order
