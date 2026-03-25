@@ -88,24 +88,24 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         bot.redis_client = FakeRedis()
 
     async def test_startup_check_fails_when_system_prompt_missing(self):
-        with patch.object(bot, '_is_prompt_file_ready', side_effect=[False, True]):
+        with patch.object(bot, '_is_prompt_file_ready', side_effect=[False, True, True, True, True, True]):
             with self.assertRaises(RuntimeError):
                 await bot.run_startup_checks()
 
     async def test_startup_check_fails_when_user_prompt_missing(self):
-        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, False]):
+        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, False, True, True, True, True]):
             with self.assertRaises(RuntimeError):
                 await bot.run_startup_checks()
 
     async def test_startup_check_fails_when_glossary_is_broken(self):
-        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, True]), \
+        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, True, True, True, True, True]), \
              patch('builtins.open', side_effect=OSError('broken glossary')):
             with self.assertRaises(RuntimeError):
                 await bot.run_startup_checks()
 
     async def test_startup_check_glossary_missing_has_clear_path(self):
         missing_path = '/tmp/definitely_missing_glossary_test.txt'
-        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, True]), \
+        with patch.object(bot, '_is_prompt_file_ready', side_effect=[True, True, True, True, True, True]), \
              patch.object(bot, 'GLOSSARY_PATH', missing_path):
             with self.assertRaises(RuntimeError) as cm:
                 await bot.run_startup_checks()
@@ -217,34 +217,44 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_translate_text_retries_on_temporary_openrouter_error(self):
-        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
-             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{text}'), \
+        with patch.object(bot, 'PASS1_SYSTEM_PROMPT', 'sys1'), \
+             patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
+             patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
+             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
+             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[
                  aiohttp.ClientError('temp'),
                  'draft translation',
+                 'literary rewrite',
                  'edited translation',
              ])) as completion_mock, \
              patch.object(bot, 'get_http_session', AsyncMock(return_value=object())):
             result = await bot.translate_text('hello')
 
         self.assertEqual(result, 'edited translation')
-        self.assertEqual(completion_mock.call_count, 3)
+        self.assertEqual(completion_mock.call_count, 4)
 
     async def test_translate_text_long_text_not_truncated_contains_start_and_end(self):
         chunk_inputs = []
 
         async def fake_completion(*, messages, stage_name, **kwargs):
             content = messages[-1]['content']
-            if stage_name.startswith('first_pass_translation_chunk_'):
+            if stage_name.startswith('pass1_translation_chunk_'):
                 chunk_inputs.append(content)
                 return content
-            marker = "Черновой перевод:\n"
-            return content.split(marker, 1)[1] if marker in content else content
+            if stage_name.startswith('pass2_rewrite_chunk_'):
+                return content
+            return content
 
         source_text = "START " + ("A" * 80) + "\n\n" + ("B" * 80) + " END"
-        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
-             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{source_text}'), \
+        with patch.object(bot, 'PASS1_SYSTEM_PROMPT', 'sys1'), \
+             patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
+             patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
+             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
+             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 90), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
@@ -261,11 +271,10 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_completion(*, messages, stage_name, **kwargs):
             content = messages[-1]['content']
-            if stage_name.startswith('first_pass_translation_chunk_'):
+            if stage_name.startswith('pass1_translation_chunk_'):
                 first_pass_chunks.append(content)
                 return content
-            marker = "Черновой перевод:\n"
-            return content.split(marker, 1)[1] if marker in content else content
+            return content
 
         paragraphs = [
             "P1 " + ("a" * 25),
@@ -274,8 +283,12 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         ]
         source_text = "\n\n".join(paragraphs)
 
-        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
-             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{source_text}'), \
+        with patch.object(bot, 'PASS1_SYSTEM_PROMPT', 'sys1'), \
+             patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
+             patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
+             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
+             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 40), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
@@ -289,15 +302,18 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_completion(*, messages, stage_name, **kwargs):
             content = messages[-1]['content']
-            if stage_name.startswith('first_pass_translation_chunk_'):
+            if stage_name.startswith('pass1_translation_chunk_'):
                 first_pass_chunks.append(content)
                 return content
-            marker = "Черновой перевод:\n"
-            return content.split(marker, 1)[1] if marker in content else content
+            return content
 
         source_text = " \n\n\n\n \n\nParagraph one\n\n\n\nParagraph two\n\n "
-        with patch.object(bot, 'SYSTEM_PROMPT', 'sys'), \
-             patch.object(bot, 'USER_PROMPT_TEMPLATE', '{source_text}'), \
+        with patch.object(bot, 'PASS1_SYSTEM_PROMPT', 'sys1'), \
+             patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
+             patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
+             patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
+             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
+             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 50), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \

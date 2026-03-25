@@ -19,8 +19,12 @@ RUN pip install --no-cache-dir --upgrade pip \
     && playwright install chromium-headless-shell
 
 COPY glossary.txt .
-COPY system_prompt.txt .
-COPY user_prompt.txt .
+COPY system_prompt_pass1.txt .
+COPY user_prompt_pass1.txt .
+COPY system_prompt_pass2.txt .
+COPY user_prompt_pass2.txt .
+COPY system_prompt_pass3.txt .
+COPY user_prompt_pass3.txt .
 COPY bot.py .
 
 CMD ["python", "bot.py"]
