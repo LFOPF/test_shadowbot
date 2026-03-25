@@ -86,6 +86,10 @@ class FakeSession:
 class ResilienceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         bot.redis_client = FakeRedis()
+        bot._glossary_cache = None
+        bot._glossary_cache_expires_at = 0.0
+        bot._glossary_notes_cache = None
+        bot._glossary_notes_cache_expires_at = 0.0
 
     async def test_startup_check_fails_when_system_prompt_missing(self):
         with patch.object(bot, '_is_prompt_file_ready', side_effect=[False, True]):
@@ -136,6 +140,45 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         await bot.redis_client.hset('glossary:terms', mapping={'Existing': 'Существующий'})
         with patch('builtins.open', side_effect=AssertionError('must not read file when cache exists')):
             await bot.load_glossary_to_redis(force=False)
+
+    def test_parse_glossary_value_with_male_note(self):
+        clean_translation, gender_note = bot.parse_glossary_value('Осквернённый Искатель Истины (мужской)')
+        self.assertEqual(clean_translation, 'Осквернённый Искатель Истины')
+        self.assertEqual(gender_note, 'мужской')
+
+    def test_parse_glossary_value_with_female_note(self):
+        clean_translation, gender_note = bot.parse_glossary_value('Джет (женский)')
+        self.assertEqual(clean_translation, 'Джет')
+        self.assertEqual(gender_note, 'женский')
+
+    def test_parse_glossary_value_without_note(self):
+        clean_translation, gender_note = bot.parse_glossary_value('Теневой Легион')
+        self.assertEqual(clean_translation, 'Теневой Легион')
+        self.assertIsNone(gender_note)
+
+    async def test_glossary_load_stores_clean_terms_and_notes_separately(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            glossary_file = Path(tmpdir) / 'glossary.txt'
+            glossary_file.write_text(
+                'Defiled Seeker of Truth=Осквернённый Искатель Истины (мужской)\n'
+                'Jet=Джет (женский)\n'
+                'Shadow Legion=Теневой Легион\n',
+                encoding='utf-8',
+            )
+            with patch.object(bot, 'GLOSSARY_PATH', str(glossary_file)):
+                await bot.load_glossary_to_redis(force=True)
+
+        terms = await bot.redis_client.hgetall('glossary:terms')
+        notes = await bot.redis_client.hgetall('glossary:notes')
+
+        self.assertEqual(terms[b'Defiled Seeker of Truth'].decode('utf-8'), 'Осквернённый Искатель Истины')
+        self.assertEqual(terms[b'Jet'].decode('utf-8'), 'Джет')
+        self.assertEqual(terms[b'Shadow Legion'].decode('utf-8'), 'Теневой Легион')
+        self.assertNotIn('(', terms[b'Defiled Seeker of Truth'].decode('utf-8'))
+        self.assertNotIn('(', terms[b'Jet'].decode('utf-8'))
+        self.assertEqual(notes[b'Defiled Seeker of Truth'].decode('utf-8'), 'мужской')
+        self.assertEqual(notes[b'Jet'].decode('utf-8'), 'женский')
+        self.assertNotIn(b'Shadow Legion', notes)
 
     async def test_create_telegraph_page_retries_on_temporary_error(self):
         session = FakeSession([

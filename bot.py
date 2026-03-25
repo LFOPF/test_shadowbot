@@ -122,11 +122,15 @@ playwright_semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
 _glossary_cache: Optional[Dict[str, str]] = None
 _glossary_cache_expires_at = 0.0
 _glossary_cache_lock = asyncio.Lock()
+_glossary_notes_cache: Optional[Dict[str, str]] = None
+_glossary_notes_cache_expires_at = 0.0
+_glossary_notes_cache_lock = asyncio.Lock()
 # glossary_dict: Dict[str, str] = {}  трайнем через хэш
 PROMPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt.txt")
 USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt.txt")
 GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
+GLOSSARY_NOTES_REDIS_KEY = "glossary:notes"
 TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
 
@@ -643,6 +647,7 @@ async def load_glossary_to_redis(force: bool = False):
     
     try:
         terms = {}
+        notes = {}
         with open(GLOSSARY_PATH, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
@@ -657,7 +662,10 @@ async def load_glossary_to_redis(force: bool = False):
                 value = value.strip()
                 
                 if key and value:
-                    terms[key] = value
+                    clean_translation, gender_note = parse_glossary_value(value)
+                    terms[key] = clean_translation
+                    if gender_note:
+                        notes[key] = gender_note
         
         if not terms:
             logger.warning("Глоссарий пустой или невалидный: %s", GLOSSARY_PATH)
@@ -667,6 +675,8 @@ async def load_glossary_to_redis(force: bool = False):
         sorted_terms = dict(sorted(terms.items(), key=lambda x: len(x[0]), reverse=True))
         
         await redis_client.hset(redis_key, mapping=sorted_terms)
+        if notes:
+            await redis_client.hset(GLOSSARY_NOTES_REDIS_KEY, mapping=notes)
         
         logger.info(f"Глоссарий успешно загружен в Redis → {len(sorted_terms)} терминов")
         
@@ -674,6 +684,14 @@ async def load_glossary_to_redis(force: bool = False):
         logger.error("Файл глоссария не найден: %s", GLOSSARY_PATH)
     except Exception as e:
         logger.exception("Ошибка при загрузке глоссария в Redis из %s", GLOSSARY_PATH)
+
+
+def parse_glossary_value(value: str) -> tuple[str, Optional[str]]:
+    cleaned = value.strip()
+    match = re.match(r"^(?P<clean>.+?)\s*\((?P<note>[^()]+)\)\s*$", cleaned)
+    if not match:
+        return cleaned, None
+    return match.group("clean").strip(), match.group("note").strip()
 
 
 async def get_glossary_terms(force_refresh: bool = False) -> Dict[str, str]:
@@ -703,10 +721,32 @@ async def get_glossary_terms(force_refresh: bool = False) -> Dict[str, str]:
         return _glossary_cache
 
 
+async def get_glossary_notes(force_refresh: bool = False) -> Dict[str, str]:
+    global _glossary_notes_cache, _glossary_notes_cache_expires_at
+
+    now = time.time()
+    if not force_refresh and _glossary_notes_cache is not None and now < _glossary_notes_cache_expires_at:
+        return _glossary_notes_cache
+
+    async with _glossary_notes_cache_lock:
+        now = time.time()
+        if not force_refresh and _glossary_notes_cache is not None and now < _glossary_notes_cache_expires_at:
+            return _glossary_notes_cache
+
+        all_notes = await redis_client.hgetall(GLOSSARY_NOTES_REDIS_KEY)
+        _glossary_notes_cache = {
+            eng.decode('utf-8'): note.decode('utf-8')
+            for eng, note in all_notes.items()
+        }
+        _glossary_notes_cache_expires_at = now + GLOSSARY_CACHE_TTL
+        return _glossary_notes_cache
+
+
 async def get_relevant_glossary(text: str) -> str:
     all_terms = await get_glossary_terms()
     if not all_terms:
         return ""
+    all_notes = await get_glossary_notes()
 
     relevant = []
     text_lower = text.lower()
@@ -714,14 +754,21 @@ async def get_relevant_glossary(text: str) -> str:
     for eng, rus in all_terms.items():
         pattern = re.compile(r"(?i)\b" + re.escape(eng) + r"\b")
         if pattern.search(text) or eng.lower() in text_lower:
-            relevant.append(f"{eng} → {rus}")
+            note = all_notes.get(eng)
+            if note:
+                relevant.append(f"{eng} → {rus} | note={note}")
+            else:
+                relevant.append(f"{eng} → {rus}")
 
     if not relevant:
         return ""
 
     return (
         "=== ГЛОССАРИЙ ===\n"
-        "Используй ТОЛЬКО следующие переводы имён, терминов и названий (строго!):\n\n"
+        "Используй ТОЛЬКО следующие переводы имён, терминов и названий (строго!):\n"
+        "Пометки рода вроде \"(мужской)\" или \"(женский)\" — это не часть имени/титула.\n"
+        "Это только грамматические подсказки для местоимений и согласования.\n"
+        "Никогда не выводи эти пометки в итоговом переводе.\n\n"
         + "\n".join(relevant)
         + "\n\nНе придумывай другие варианты перевода для этих слов."
     )
