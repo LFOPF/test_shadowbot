@@ -133,9 +133,9 @@ PASS3_USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt_pass3.txt")
 GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
 TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
-PASS1_TEMPERATURE = float(os.getenv("PASS1_TEMPERATURE", "0.25"))
-PASS2_TEMPERATURE = float(os.getenv("PASS2_TEMPERATURE", "0.82"))
-PASS3_TEMPERATURE = float(os.getenv("PASS3_TEMPERATURE", "0.48"))
+PASS1_TEMPERATURE = float(os.getenv("PASS1_TEMPERATURE", "0.4"))
+PASS2_TEMPERATURE = float(os.getenv("PASS2_TEMPERATURE", "0.75"))
+PASS3_TEMPERATURE = float(os.getenv("PASS3_TEMPERATURE", "0.5"))
 
 
 def load_prompt_file(path: str, fallback: str = "") -> str:
