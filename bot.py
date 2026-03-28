@@ -127,6 +127,7 @@ PROMPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt.txt")
 USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt.txt")
 GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
+FEW_SHOT_PATH = os.path.join(PROMPTS_DIR, "few_shot_examples.json")
 TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
 
@@ -147,6 +148,71 @@ def load_prompt_file(path: str, fallback: str = "") -> str:
 
 SYSTEM_PROMPT = load_prompt_file(SYSTEM_PROMPT_PATH)
 USER_PROMPT_TEMPLATE = load_prompt_file(USER_PROMPT_PATH)
+
+
+def load_few_shot_examples() -> List[Dict[str, str]]:
+    try:
+        with open(FEW_SHOT_PATH, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except FileNotFoundError:
+        logger.warning("Few-shot файл не найден, продолжаем без примеров: %s", FEW_SHOT_PATH)
+        return []
+    except json.JSONDecodeError as exc:
+        logger.error("Few-shot JSON битый (%s): %s", FEW_SHOT_PATH, exc)
+        return []
+    except Exception:
+        logger.exception("Не удалось загрузить few-shot файл: %s", FEW_SHOT_PATH)
+        return []
+
+    if not isinstance(raw_data, list):
+        logger.error("Few-shot файл должен содержать JSON-массив: %s", FEW_SHOT_PATH)
+        return []
+
+    if not raw_data:
+        logger.warning("Few-shot файл пустой: %s", FEW_SHOT_PATH)
+        return []
+
+    valid_examples: List[Dict[str, str]] = []
+    for idx, item in enumerate(raw_data, start=1):
+        if not isinstance(item, dict):
+            logger.warning("Few-shot элемент #%s пропущен: ожидается объект", idx)
+            continue
+
+        user_text = item.get("user")
+        assistant_text = item.get("assistant")
+        if not isinstance(user_text, str) or not user_text.strip():
+            logger.warning("Few-shot элемент #%s пропущен: поле user пустое или не строка", idx)
+            continue
+        if not isinstance(assistant_text, str) or not assistant_text.strip():
+            logger.warning("Few-shot элемент #%s пропущен: поле assistant пустое или не строка", idx)
+            continue
+
+        valid_examples.append({
+            "user": user_text.strip(),
+            "assistant": assistant_text.strip(),
+        })
+
+    if not valid_examples:
+        logger.warning("Few-shot файл не содержит валидных примеров: %s", FEW_SHOT_PATH)
+        return []
+
+    logger.info("Загружено few-shot примеров: %s", len(valid_examples))
+    return valid_examples
+
+
+def build_few_shot_messages(examples: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
+    for example in examples:
+        user_text = example.get("user", "").strip()
+        assistant_text = example.get("assistant", "").strip()
+        if not user_text or not assistant_text:
+            continue
+        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "assistant", "content": assistant_text})
+    return messages
+
+
+FEW_SHOT_EXAMPLES = load_few_shot_examples()
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -249,6 +315,7 @@ def prefer_http_first_enabled() -> bool:
 
 
 async def run_startup_checks() -> None:
+    global FEW_SHOT_EXAMPLES
     required_prompt_files = [
         ("system_prompt", SYSTEM_PROMPT_PATH),
         ("user_prompt", USER_PROMPT_PATH),
@@ -271,6 +338,7 @@ async def run_startup_checks() -> None:
     except Exception as exc:
         raise RuntimeError(f"startup_check_failed: glossary_unreadable path={GLOSSARY_PATH}") from exc
 
+    FEW_SHOT_EXAMPLES = load_few_shot_examples()
     await redis_client.ping()
     logger.info("startup_check_passed")
 
@@ -895,10 +963,14 @@ async def save_chapter_original_text(chapter_id: str, text: str) -> None:
 
 
 def build_translation_signature(original_text: str) -> str:
+    few_shot_hash = hashlib.sha256(
+        json.dumps(FEW_SHOT_EXAMPLES, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     payload = json.dumps({
         "cache_version": TRANSLATION_CACHE_VERSION,
         "system_prompt": SYSTEM_PROMPT,
         "user_prompt": USER_PROMPT_TEMPLATE,
+        "few_shot_sha256": few_shot_hash,
         "text_sha256": hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
     }, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -1817,19 +1889,22 @@ async def translate_text(text: str) -> str:
     system_prompt = SYSTEM_PROMPT
     if glossary_section:
         system_prompt = f"{glossary_section}\n\n{SYSTEM_PROMPT}"
+    few_shot_messages = build_few_shot_messages(FEW_SHOT_EXAMPLES)
 
     async def _translate_chunk(chunk_text: str, chunk_index: int) -> str:
         first_pass_user_prompt = USER_PROMPT_TEMPLATE.format(
             text=chunk_text, stage="translation", draft="", source_text=chunk_text
         )
+        first_pass_messages = [
+            {"role": "system", "content": system_prompt},
+            *few_shot_messages,
+            {"role": "user", "content": first_pass_user_prompt},
+        ]
         logger.info("Старт первого прохода перевода чанка %s: %s символов", chunk_index, len(chunk_text))
         first_pass = await request_translation_completion(
             session=session,
             headers=headers,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": first_pass_user_prompt},
-            ],
+            messages=first_pass_messages,
             stage_name=f"first_pass_translation_chunk_{chunk_index}",
             temperature=0.8,
             top_p=0.95,
@@ -3106,4 +3181,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
