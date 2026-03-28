@@ -128,14 +128,11 @@ PASS1_SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt_pass1.txt")
 PASS1_USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt_pass1.txt")
 PASS2_SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt_pass2.txt")
 PASS2_USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt_pass2.txt")
-PASS3_SYSTEM_PROMPT_PATH = os.path.join(PROMPTS_DIR, "system_prompt_pass3.txt")
-PASS3_USER_PROMPT_PATH = os.path.join(PROMPTS_DIR, "user_prompt_pass3.txt")
 GLOSSARY_PATH = os.path.join(PROMPTS_DIR, "glossary.txt")
-TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "qwen/qwen3.5-flash-02-23")
+TRANSLATION_MODEL = os.getenv("OPENROUTER_TRANSLATION_MODEL", "google/gemini-2.5-flash-lite")
 TRANSLATION_INPUT_CHAR_LIMIT = 120000
-PASS1_TEMPERATURE = float(os.getenv("PASS1_TEMPERATURE", "0.4"))
-PASS2_TEMPERATURE = float(os.getenv("PASS2_TEMPERATURE", "0.75"))
-PASS3_TEMPERATURE = float(os.getenv("PASS3_TEMPERATURE", "0.5"))
+PASS1_TEMPERATURE = float(os.getenv("PASS1_TEMPERATURE", "0.35"))
+PASS2_TEMPERATURE = float(os.getenv("PASS2_TEMPERATURE", "0.55"))
 
 
 def load_prompt_file(path: str, fallback: str = "") -> str:
@@ -156,8 +153,6 @@ PASS1_SYSTEM_PROMPT = load_prompt_file(PASS1_SYSTEM_PROMPT_PATH)
 PASS1_USER_PROMPT_TEMPLATE = load_prompt_file(PASS1_USER_PROMPT_PATH)
 PASS2_SYSTEM_PROMPT = load_prompt_file(PASS2_SYSTEM_PROMPT_PATH)
 PASS2_USER_PROMPT_TEMPLATE = load_prompt_file(PASS2_USER_PROMPT_PATH)
-PASS3_SYSTEM_PROMPT = load_prompt_file(PASS3_SYSTEM_PROMPT_PATH)
-PASS3_USER_PROMPT_TEMPLATE = load_prompt_file(PASS3_USER_PROMPT_PATH)
 
 # ======================== FSM СОСТОЯНИЯ ========================
 class ChapterSelection(StatesGroup):
@@ -265,8 +260,6 @@ async def run_startup_checks() -> None:
         ("pass1_user_prompt", PASS1_USER_PROMPT_PATH),
         ("pass2_system_prompt", PASS2_SYSTEM_PROMPT_PATH),
         ("pass2_user_prompt", PASS2_USER_PROMPT_PATH),
-        ("pass3_system_prompt", PASS3_SYSTEM_PROMPT_PATH),
-        ("pass3_user_prompt", PASS3_USER_PROMPT_PATH),
     ]
 
     for label, path in required_prompt_files:
@@ -916,11 +909,8 @@ def build_translation_signature(original_text: str) -> str:
         "pass1_user_prompt": PASS1_USER_PROMPT_TEMPLATE,
         "pass2_system_prompt": PASS2_SYSTEM_PROMPT,
         "pass2_user_prompt": PASS2_USER_PROMPT_TEMPLATE,
-        "pass3_system_prompt": PASS3_SYSTEM_PROMPT,
-        "pass3_user_prompt": PASS3_USER_PROMPT_TEMPLATE,
         "pass1_temperature": PASS1_TEMPERATURE,
         "pass2_temperature": PASS2_TEMPERATURE,
-        "pass3_temperature": PASS3_TEMPERATURE,
         "text_sha256": hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
     }, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -1759,8 +1749,6 @@ async def translate_text(text: str) -> str:
         ("PASS1_USER_PROMPT_TEMPLATE", PASS1_USER_PROMPT_TEMPLATE),
         ("PASS2_SYSTEM_PROMPT", PASS2_SYSTEM_PROMPT),
         ("PASS2_USER_PROMPT_TEMPLATE", PASS2_USER_PROMPT_TEMPLATE),
-        ("PASS3_SYSTEM_PROMPT", PASS3_SYSTEM_PROMPT),
-        ("PASS3_USER_PROMPT_TEMPLATE", PASS3_USER_PROMPT_TEMPLATE),
     ]
     missing = [name for name, value in required_templates if not value]
     if missing:
@@ -1871,17 +1859,6 @@ async def translate_text(text: str) -> str:
             {"role": "user", "content": user_prompt},
         ]
 
-    def build_pass3_messages(chunk_text: str, pass2_text: str, glossary: str) -> List[Dict[str, str]]:
-        user_prompt = PASS3_USER_PROMPT_TEMPLATE.format(
-            source_text=chunk_text,
-            pass2_rewrite=pass2_text,
-            glossary_section=glossary or "Глоссарий не найден.",
-        )
-        return [
-            {"role": "system", "content": _build_system_prompt(PASS3_SYSTEM_PROMPT, glossary)},
-            {"role": "user", "content": user_prompt},
-        ]
-
     async def run_pass1(chunk_text: str, chunk_index: int, glossary: str) -> str:
         messages = build_pass1_messages(chunk_text, glossary)
         logger.info(
@@ -1927,29 +1904,6 @@ async def translate_text(text: str) -> str:
         logger.info("pass2 done chunk=%s output_len=%s", chunk_index, len(result))
         return result
 
-    async def run_pass3(chunk_text: str, pass2_text: str, chunk_index: int, glossary: str) -> str:
-        messages = build_pass3_messages(chunk_text, pass2_text, glossary)
-        logger.info(
-            "pass3 start chunk=%s source_len=%s pass2_len=%s prompt=%s/%s",
-            chunk_index,
-            len(chunk_text),
-            len(pass2_text),
-            PASS3_SYSTEM_PROMPT_PATH,
-            PASS3_USER_PROMPT_PATH,
-        )
-        result = await request_translation_completion(
-            session=session,
-            headers=headers,
-            messages=messages,
-            stage_name=f"pass3_editor_chunk_{chunk_index}",
-            temperature=PASS3_TEMPERATURE,
-            top_p=0.9,
-            presence_penalty=0.04,
-            frequency_penalty=0.03,
-        )
-        logger.info("pass3 done chunk=%s output_len=%s", chunk_index, len(result))
-        return result
-
     async def _translate_chunk(chunk_text: str, chunk_index: int) -> str:
         pass1_text = await run_pass1(chunk_text, chunk_index, glossary_section)
         try:
@@ -1961,17 +1915,7 @@ async def translate_text(text: str) -> str:
                 exc,
             )
             return pass1_text
-
-        try:
-            pass3_text = await run_pass3(chunk_text, pass2_text, chunk_index, glossary_section)
-        except Exception as exc:
-            logger.exception(
-                "Fallback to pass2 for chunk=%s reason=%s",
-                chunk_index,
-                exc,
-            )
-            return pass2_text
-        return pass3_text
+        return pass2_text
 
     translated_chunks: list[str] = []
     seen_chunk_hashes: Set[str] = set()
@@ -2110,7 +2054,7 @@ async def translate_title(title: str) -> str:
     }
 
     payload = {
-        "model": "qwen/qwen3.5-flash-02-23",
+        "model": "google/gemini-2.5-flash-lite",
         "messages": [
             {
                 "role": "system",

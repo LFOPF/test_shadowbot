@@ -1,13 +1,26 @@
 Glossary:
 {glossary_section}
 
-Improve the following Russian translation.
+Ниже дан ЧЕРНОВОЙ ПЕРЕВОД. Отредактируй его бережно.
 
-Requirements:
-- Natural Russian prose
-- Preserve full meaning
-- STRICT glossary compliance
-- Do NOT shorten or simplify
+Требования:
+- Естественный русский язык
+- Полное сохранение смысла
+- Никаких сокращений
+- Строгое соблюдение глоссария
+- Не менять субъект, род, число и референты
+- Если фраза двусмысленна, сохраняй смысл черновика, а не перепридумывай сцену
 
-Text:
+Особо проверь реплики с:
+- one / other / another
+- he / she
+- nice / horror show
+- better version
+- brother
+- captive / captor
+
+Если речь о двух версиях одного мужского персонажа,
+не используй женский род из-за слов вроде «версия».
+
+Черновой перевод:
 {pass1_draft}

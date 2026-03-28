@@ -221,20 +221,17 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
              patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
              patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
-             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
-             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=[
                  aiohttp.ClientError('temp'),
                  'draft translation',
                  'literary rewrite',
-                 'edited translation',
              ])) as completion_mock, \
              patch.object(bot, 'get_http_session', AsyncMock(return_value=object())):
             result = await bot.translate_text('hello')
 
-        self.assertEqual(result, 'edited translation')
-        self.assertEqual(completion_mock.call_count, 4)
+        self.assertEqual(result, 'literary rewrite')
+        self.assertEqual(completion_mock.call_count, 3)
 
     async def test_translate_text_long_text_not_truncated_contains_start_and_end(self):
         chunk_inputs = []
@@ -253,8 +250,6 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
              patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
              patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
-             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
-             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 90), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
@@ -287,8 +282,6 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
              patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
              patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
-             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
-             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 40), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
@@ -312,8 +305,6 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, 'PASS1_USER_PROMPT_TEMPLATE', '{source_text}'), \
              patch.object(bot, 'PASS2_SYSTEM_PROMPT', 'sys2'), \
              patch.object(bot, 'PASS2_USER_PROMPT_TEMPLATE', '{pass1_draft}'), \
-             patch.object(bot, 'PASS3_SYSTEM_PROMPT', 'sys3'), \
-             patch.object(bot, 'PASS3_USER_PROMPT_TEMPLATE', '{pass2_rewrite}'), \
              patch.object(bot, 'TRANSLATION_INPUT_CHAR_LIMIT', 50), \
              patch.object(bot, 'get_relevant_glossary', AsyncMock(return_value='')), \
              patch.object(bot, 'request_translation_completion', AsyncMock(side_effect=fake_completion)), \
